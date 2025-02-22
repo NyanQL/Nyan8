@@ -138,7 +138,7 @@ console.log(getAPI( apiURL,apiUser,apiPass));
 ```
 
 jsonでの取得
-```
+```javascript
 //apiのURL  apiURL
 //basic認証のID  apiUser
 //basic認証のパスワード apiPass
