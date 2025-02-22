@@ -125,3 +125,37 @@ result.Stderr; // 失敗した時のエラーメッセージが格納されて�
 ```javascript
 console.log(allParams.id);
 ```
+
+## Nyan8のjavascriptから外部のAPIへのリクエストについて
+getとjson形式でのリクエストを用意しています。
+
+getパラメータでの取得
+```javascript
+//apiのURL  apiURL
+//basic認証のID  apiUser
+//basic認証のパスワード apiPass
+console.log(getAPI( apiURL,apiUser,apiPass));
+```
+
+jsonでの取得
+```
+//apiのURL  apiURL
+//basic認証のID  apiUser
+//basic認証のパスワード apiPass
+const data = {
+            api: "create_user",
+            username: allParams.username,
+            password: allParams.password,
+            email: allParams.email,
+            salt: saltKey,
+            salt2: saltKey
+        };
+const result = jsonAPI(
+        apiURL,
+        JSON.stringify(data),
+        apiUser,
+        apiPass
+    );
+
+```
+
