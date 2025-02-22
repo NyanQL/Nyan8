@@ -1,0 +1,19 @@
+{
+  "name": "にゃんぱち",
+  "profile": "にゃんぱちの説明です。",
+  "version": "0.0.1",
+  "Port": 8889,
+  "certPath": "./ssl/localhost.crt",
+  "keyPath": "./ssl/localhost.key",
+  "javascript_include": [
+    "./javascript/base.js"
+  ],
+  "log": {
+    "Filename": "./logs/nyan8.log",
+    "MaxSize": 5,
+    "MaxBackups": 3,
+    "MaxAge": 7,
+    "Compress": true,
+    "EnableLogging": false
+  }
+}
