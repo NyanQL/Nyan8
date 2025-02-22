@@ -147,8 +147,7 @@ const data = {
             username: allParams.username,
             password: allParams.password,
             email: allParams.email,
-            salt: saltKey,
-            salt2: saltKey
+            salt: saltKey
         };
 const result = jsonAPI(
         apiURL,
