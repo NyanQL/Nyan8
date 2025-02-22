@@ -1,0 +1,11 @@
+{
+  "add": {
+    "script": "./javascript/add.js",
+    "description": "2に対して足し算した結果を返します。",
+    "push": "hello"
+  },
+  "hello": {
+    "script": "./javascript/hello.js",
+    "description": "挨拶をしてくれるAPIです。/helloにwebsocketで接続するとaddにリクエストがあるとpush通知を受信できます。"
+  }
+}
