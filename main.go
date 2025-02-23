@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 )
 
@@ -254,7 +255,7 @@ func handleAPIRequest(c *gin.Context) {
 	allParams["api"] = c.Request.URL.Path[1:]
 
 	// POSTの場合、フォームデータをパースする
-	if c.Request.Method == http.MethodPost && c.ContentType() == "application/x-www-form-urlencoded" {
+	if c.Request.Method == http.MethodPost && strings.HasPrefix(c.ContentType(), "application/x-www-form-urlencoded") {
 		if err := c.Request.ParseForm(); err != nil {
 			respondWithError(c, http.StatusBadRequest, "Failed to parse form data", err)
 			return
@@ -361,7 +362,7 @@ func handleWebSocket(c *gin.Context) {
 		logger.Printf("Failed to upgrade WebSocket: %v", err)
 		return
 	}
-	// クローズする（後続で pushConnections から削除するだけ）
+	// 接続終了時に登録を解除
 	defer conn.Close()
 
 	// API 名の取得（ルートパラメータがなければ URL から取得）
@@ -369,9 +370,8 @@ func handleWebSocket(c *gin.Context) {
 	if apiName == "" {
 		apiName = c.Request.URL.Path[1:]
 	}
-	// push 受信用として、この接続を登録する
+	// push受信用にこの接続を登録
 	pushConnections.Store(apiName, conn)
-	// 後続で削除する（conn.Close() は上記の defer で実施済み）
 	defer pushConnections.Delete(apiName)
 
 	// 実行ファイルのディレクトリ取得
@@ -388,14 +388,14 @@ func handleWebSocket(c *gin.Context) {
 	execDir := execPath
 
 	for {
-		// WebSocket からメッセージを読み取り
+		// WebSocket からメッセージを読み取る
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
 			logger.Printf("WebSocket read error: %v", err)
 			break
 		}
 
-		// 受信したメッセージの JSON パース
+		// 受信メッセージをJSONとしてパース
 		var receivedData map[string]interface{}
 		if err := json.Unmarshal(message, &receivedData); err != nil {
 			logger.Printf("Invalid JSON data: %v", err)
@@ -403,7 +403,7 @@ func handleWebSocket(c *gin.Context) {
 			continue
 		}
 
-		// "api" キーからメイン API の識別子を取得
+		// "api" キーからメインAPIの識別子を取得
 		scriptValue, ok := receivedData["api"].(string)
 		if !ok {
 			logger.Printf("Script value is not a string")
@@ -411,7 +411,7 @@ func handleWebSocket(c *gin.Context) {
 			continue
 		}
 
-		// api.json の設定ファイルを読み込み
+		// api.json を読み込む
 		apiJsonPath := filepath.Join(execDir, "api.json")
 		scriptListData, err := loadJSONFile(apiJsonPath)
 		if err != nil {
@@ -420,7 +420,7 @@ func handleWebSocket(c *gin.Context) {
 			continue
 		}
 
-		// メイン API の設定取得
+		// メインAPIの設定を取得
 		scriptInfo, ok := scriptListData[scriptValue].(map[string]interface{})
 		if !ok {
 			logger.Printf("Script info not found for key: %s", scriptValue)
@@ -435,10 +435,10 @@ func handleWebSocket(c *gin.Context) {
 			continue
 		}
 
-		// メイン API の JavaScript ファイルの絶対パス作成
+		// メインAPIのスクリプトの絶対パス作成
 		javascriptPath := filepath.Join(execDir, scriptPath)
 
-		// WebSocket 用なので、gin.Context は nil を渡す
+		// WebSocket 用なので gin.Context は nil を渡す
 		result, err := runJavaScript(javascriptPath, receivedData, nil)
 		if err != nil {
 			logger.Printf("Failed to run JavaScript: %v", err)
@@ -446,37 +446,49 @@ func handleWebSocket(c *gin.Context) {
 			continue
 		}
 
-		// メイン API の結果をクライアントへ送信
+		// メインAPIの結果をクライアントへ送信
 		if err := conn.WriteMessage(messageType, []byte(result)); err != nil {
 			logger.Printf("Failed to send message to WebSocket: %v", err)
 			break
 		}
 
-		// push 項目が設定されている場合、push 対象 API の処理を実行
+		// push 項目が設定されている場合、push 対象APIの処理を実行
 		if pushTargetRaw, exists := scriptInfo["push"]; exists {
 			if pushTarget, ok := pushTargetRaw.(string); ok && pushTarget != "" {
-				// push 対象 API の設定を取得
+				// push 対象APIの設定を取得
 				if pushConfigRaw, exists := scriptListData[pushTarget]; exists {
 					if pushConfig, ok := pushConfigRaw.(map[string]interface{}); ok {
 						pushScript, ok := pushConfig["script"].(string)
 						if ok && pushScript != "" {
 							pushScriptPath := filepath.Join(execDir, pushScript)
-							// push API の実行（同じパラメータを渡すか必要に応じて変更）
+							// push API を実行
 							pushResult, err := runJavaScript(pushScriptPath, receivedData, nil)
 							if err != nil {
 								logger.Printf("Push API execution failed for key %s: %v", pushTarget, err)
 							} else {
-								// push 対象の WebSocket 接続が登録されていれば、push 結果を送信
+								// 先頭の "Push: " を取り除く
+								pushResult = strings.TrimPrefix(pushResult, "Push: ")
+								// push対象のWebSocket接続があれば、push結果を送信
 								if pushConnRaw, ok := pushConnections.Load(pushTarget); ok {
 									if pushConn, ok := pushConnRaw.(*websocket.Conn); ok {
 										if err := pushConn.WriteMessage(messageType, []byte(pushResult)); err != nil {
 											logger.Printf("Failed to push message to %s: %v", pushTarget, err)
+										} else {
+											logger.Printf("Push message sent successfully to %s", pushTarget)
 										}
+									} else {
+										logger.Printf("pushConnections entry for %s is not *websocket.Conn", pushTarget)
 									}
+								} else {
+									logger.Printf("No WebSocket connection registered for push target: %s", pushTarget)
 								}
 							}
+						} else {
+							logger.Printf("Push script not found for key: %s", pushTarget)
 						}
 					}
+				} else {
+					logger.Printf("API config not found for push target: %s", pushTarget)
 				}
 			}
 		}
@@ -783,7 +795,8 @@ func performPush(scriptInfo map[string]interface{}, scriptListData map[string]in
 							// pushConnections から対象の WebSocket 接続を取得し、pushResult を送信
 							if pushConnRaw, ok := pushConnections.Load(pushTarget); ok {
 								if pushConn, ok := pushConnRaw.(*websocket.Conn); ok {
-									pushMessage := []byte("Push: " + pushResult)
+									pushMessage := []byte(pushResult)
+
 									logger.Printf("Sending push message: %s", string(pushMessage))
 									if err := pushConn.WriteMessage(websocket.TextMessage, pushMessage); err != nil {
 										logger.Printf("Failed to push message to %s: %v", pushTarget, err)
