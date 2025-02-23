@@ -134,7 +134,8 @@ getパラメータでの取得
 //apiのURL  apiURL
 //basic認証のID  apiUser
 //basic認証のパスワード apiPass
-console.log(getAPI( apiURL,apiUser,apiPass));
+//javascript内でデータとして扱う場合、JSON.parse()で文字列から変換をする必要があります。
+console.log(getAPI(JSON.parse(apiURL,apiUser,apiPass)));
 ```
 
 jsonでの取得
@@ -142,6 +143,7 @@ jsonでの取得
 //apiのURL  apiURL
 //basic認証のID  apiUser
 //basic認証のパスワード apiPass
+//javascript内でデータとして扱う場合、JSON.parse()で文字列から変換をする必要があります。
 const data = {
             api: "create_user",
             username: allParams.username,
@@ -155,6 +157,7 @@ const result = jsonAPI(
         apiUser,
         apiPass
     );
+const resultData = JSON.parse(result);
 
 ```
 
