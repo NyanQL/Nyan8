@@ -135,7 +135,7 @@ getパラメータでの取得
 //basic認証のID  apiUser
 //basic認証のパスワード apiPass
 //javascript内でデータとして扱う場合、JSON.parse()で文字列から変換をする必要があります。
-console.log(getAPI(JSON.parse(apiURL,apiUser,apiPass)));
+console.log(getAPI(apiURL,apiUser,apiPass));
 ```
 
 jsonでの取得
