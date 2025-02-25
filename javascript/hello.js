@@ -2,9 +2,10 @@
 function main(){
 
     let name = "Nyan8";
-    if(typeof allParams.name !== "undefined")
+    console.log(nyanAllParams);
+    if(typeof nyanAllParams.name !== "undefined")
     {
-        name = allParams.name;
+        name = nyanAllParams.name;
     }
     return JSON.stringify({
         "success": true,

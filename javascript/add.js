@@ -1,6 +1,17 @@
 function main(){
-    if (isDecimalNumber(allParams.addNumber)) {
-        let result = parseFloat(2) + parseFloat(allParams.addNumber);
+
+    console.log(nyanAllParams);
+    console.log("console.log:" + typeof console.log);
+    console.log("nyanHostExec:" + typeof nyanHostExec);
+    console.log("nyanGetAPI:" + typeof nyanGetAPI);
+    console.log("nyanJsonAPI:" + typeof nyanJsonAPI);
+    console.log("nyanGetItem:" + typeof nyanGetItem);
+    console.log("nyanSetItem:" + typeof nyanSetItem);
+    console.log("nyanSetCookie:" + typeof nyanSetCookie);
+    console.log("nyanGetCookie:" + typeof nyanGetCookie);
+
+    if (isDecimalNumber(nyanAllParams.addNumber)) {
+        let result = parseFloat(2) + parseFloat(nyanAllParams.addNumber);
         return JSON.stringify({
             "success": true,
             "status": 200,

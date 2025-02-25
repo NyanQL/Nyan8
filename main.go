@@ -928,7 +928,7 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 	})
 
 	// execCommand を JavaScript から呼び出すためのラッパー関数を登録
-	vm.Set("nyanExec", func(call goja.FunctionCall) goja.Value {
+	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
 			// 引数がない場合はエラーをスローする例
 			panic(vm.ToValue("exec: No command provided"))
