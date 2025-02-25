@@ -84,61 +84,65 @@ Nyan8_Macをダブルクリックするか、ターミナルで以下のコマ�
 # ライセンスについて
 Nyan8はMITライセンスで提供されています。詳細は[LICENSE.md](LICENSE.md)を参照してください。
 
-# Javascriptの書き方について
-## console.log によるログ出力
-実行中のjavascriptファイル内でログを出力する場合は、console.log を使用してください。
-ターミナルにログが出力されます。
+# GojaでうごくJavascriptのサンプル
+## postやgetやjsonなどで受信されたパラメータの取得
+nyanAllParamsに格納されています。
 
 ```javascript
-console.log("ログ出力内容");
+console.log(nyanAllParams);
 ```
 
-## Cookieを取得する例
-```javascript
-let cookie = getCookie("cookie_name");
-```
-## Cookieを設定する例
-```javascript
-setCookie("cookie_name", "cookie_value");
-```
-## localStorageを取得する例
-```javascript
-let value = getItem("key");
-```
-## localStorageを設定する例
-```javascript
-let value = setItem("key", "value");
-```
-## hostへのコマンドを実行し結果を取得する例
-```javascript
-let result = exec("実行する予定のコマンド");
-result.Success; // 成功・失敗が boolean で戻ります
-result.Stdout; // 成功した時の結果が格納されています
-result.Stderr; // 失敗した時のエラーメッセージが格納されています
-```
-
-
-## 受信したパラメータについて
-`allParams` に格納されています。
-?id=12345の場合、allParams.id で 12345 を取得できます。
+## console.log が使えます
+ログファイルの設定を有効にしている場合はログファイルに出力されます。
+無効にしている場合はターミナルに出力されます。
 
 ```javascript
-console.log(allParams.id);
+console.log("Hello, NyanPUI!");
 ```
 
-## Nyan8のjavascriptから外部のAPIへのリクエストについて
-getとjson形式でのリクエストを用意しています。
+## Cookieの操作
+cookieの設定が可能です。
 
-getパラメータでの取得
+```javascript
+nyanSetCookie("nyanpui", "kawaii");
+```
+
+cookieの取得が可能です。
+
+```javascript
+console.log(nyanGetCookie("nyanpui"));
+```
+
+## localStorageの操作
+localStorageの設定が可能です。
+
+```javascript
+nyanSetItem("nyanpui", "kawaii");
+```
+
+localStorageの取得が可能です。
+
+```javascript
+nyanGetItem("nyanpui");
+```
+
+## Ajaxの操作
+Ajaxの操作が可能です。
+取得したデータはJSON.parseでパースしてください。
+
+getでの取得の場合
+
+
 ```javascript
 //apiのURL  apiURL
 //basic認証のID  apiUser
 //basic認証のパスワード apiPass
 //javascript内でデータとして扱う場合、JSON.parse()で文字列から変換をする必要があります。
-console.log(getAPI(apiURL,apiUser,apiPass));
+console.log(nyanGetAPI(apiURL,apiUser,apiPass));
 ```
 
-jsonでの取得
+jsonでの取得の場合
+
 ```javascript
 //apiのURL  apiURL
 //basic認証のID  apiUser
@@ -146,24 +150,45 @@ jsonでの取得
 //javascript内でデータとして扱う場合、JSON.parse()で文字列から変換をする必要があります。
 const data = {
             api: "create_user",
-            username: allParams.username,
-            password: allParams.password,
-            email: allParams.email,
+            username: nyanAllParams.username,
+            password: nyanAllParams.password,
+            email: nyanAllParams.email,
             salt: saltKey
         };
-const result = jsonAPI(
+const result = nyanJsonAPI(
         apiURL,
         JSON.stringify(data),
         apiUser,
         apiPass
     );
 const resultData = JSON.parse(result);
-
 ```
 
-# 予約語について
+## hostでのコマンド実行と結果の取得
+hostでのコマンド実行が可能です。
 
-リクエストの値は`allParams`に格納されていますので、上書きしないようにしてください。
+```javascript
+console.log(nyanHostExec("ls"));
+```
+
+実行結果は次のような構成になって取得できます。
+
+```json
+{"success":true,"exitCode":0,"stdout":"コマンドの実行結果","stderr":""}
+```
+
+* success : コマンドの実行が成功したかどうか
+* exitCode : コマンドの終了コード
+* stdout : 標準出力
+* stderr : 標準エラー出力
+
+
+
+# このAPIサーバの情報を取得する場合
+http(s)://{hostname}:{port}/nyan にアクセスすると、このAPIサーバの情報を取得することができます。
+
+
+# 予約語について
 apiとnyanから始まるものは予約語となります。 
 パラメータなどで使用しないようご注意ください。 
 NyanQLとその仲間の共通ルールです。
