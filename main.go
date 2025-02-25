@@ -512,10 +512,6 @@ func runJavaScript(scriptPath string, allParams map[string]interface{}, ginCtx *
 	// 必要なグローバル関数等を登録する
 	setupGojaVM(vm, ginCtx)
 
-	// getAPI が正しく登録されているか確認
-	val := vm.Get("getAPI")
-	logger.Print(val)
-
 	// globalConfig.JavaScriptInclude にある各ファイルを読み込み、連結する
 	var jsCode string
 	for _, includePath := range globalConfig.JavaScriptInclude {
@@ -539,7 +535,7 @@ func runJavaScript(scriptPath string, allParams map[string]interface{}, ginCtx *
 	if err != nil {
 		return "", err
 	}
-	_, err = vm.RunString(fmt.Sprintf("var allParams = %s;", string(allParamsJSON)))
+	_, err = vm.RunString(fmt.Sprintf("let nyanAllParams = %s;", string(allParamsJSON)))
 	if err != nil {
 		return "", err
 	}
@@ -865,7 +861,7 @@ func handleNyan(c *gin.Context) {
 func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 	// 既存の関数登録（getCookie, setCookie, setItem, getItem, console.log）はそのまま
 
-	vm.Set("getAPI", func(call goja.FunctionCall) goja.Value {
+	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
 		username := call.Argument(1).String()
 		password := call.Argument(2).String()
@@ -878,7 +874,7 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		return v
 	})
 
-	vm.Set("getCookie", func(name string) string {
+	vm.Set("nyanGetCookie", func(name string) string {
 		if ginCtx != nil {
 			cookieValue, err := ginCtx.Cookie(name)
 			if err != nil {
@@ -891,7 +887,7 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		return ""
 	})
 
-	vm.Set("setCookie", func(name, value string) {
+	vm.Set("nyanSetCookie", func(name, value string) {
 		if ginCtx != nil {
 			ginCtx.SetCookie(name, value, 3600, "/", "", false, true)
 			logger.Printf("Set-Cookie: %s=%s", name, value)
@@ -900,10 +896,10 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		}
 	})
 
-	vm.Set("setItem", func(key, value string) {
+	vm.Set("nyanSetItem", func(key, value string) {
 		storage.Store(key, value)
 	})
-	vm.Set("getItem", func(key string) string {
+	vm.Set("nyanGetItem", func(key string) string {
 		if v, ok := storage.Load(key); ok {
 			if s, ok := v.(string); ok {
 				return s
@@ -918,7 +914,7 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		},
 	})
 
-	vm.Set("jsonAPI", func(call goja.FunctionCall) goja.Value {
+	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
 		jsonData := call.Argument(1).String()
 		username := call.Argument(2).String()
@@ -932,7 +928,7 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 	})
 
 	// execCommand を JavaScript から呼び出すためのラッパー関数を登録
-	vm.Set("exec", func(call goja.FunctionCall) goja.Value {
+	vm.Set("nyanExec", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
 			// 引数がない場合はエラーをスローする例
 			panic(vm.ToValue("exec: No command provided"))
