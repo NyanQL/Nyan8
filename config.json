@@ -3,8 +3,8 @@
   "profile": "にゃんぱちの説明です。",
   "version": "0.0.1",
   "Port": 8889,
-  "certPath": "./ssl/localhost.crt",
-  "keyPath": "./ssl/localhost.key",
+  "certPath": "",
+  "keyPath": "",
   "javascript_include": [
     "./javascript/base.js"
   ],
