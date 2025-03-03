@@ -67,7 +67,7 @@ type NyanResponse struct {
 
 type ExecResult struct {
 	Success  bool   `json:"success"`
-	ExitCode int    `json:"exitCode"`
+	ExitCode int    `json:"exit_code"`
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
 }
@@ -1014,6 +1014,7 @@ func execCommand(commandLine string) (*ExecResult, error) {
 		} else {
 			result.ExitCode = -1
 		}
+
 		return result, fmt.Errorf("failed to exec: %w", err)
 	}
 
