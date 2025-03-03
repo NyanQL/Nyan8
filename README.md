@@ -174,11 +174,11 @@ console.log(nyanHostExec("ls"));
 実行結果は次のような構成になって取得できます。
 
 ```json
-{"success":true,"exitCode":0,"stdout":"コマンドの実行結果","stderr":""}
+{"success":true,"exit_code":0,"stdout":"コマンドの実行結果","stderr":""}
 ```
 
 * success : コマンドの実行が成功したかどうか
-* exitCode : コマンドの終了コード
+* exit_code : コマンドの終了コード
 * stdout : 標準出力
 * stderr : 標準エラー出力
 
