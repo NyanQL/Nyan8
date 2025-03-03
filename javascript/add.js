@@ -9,7 +9,10 @@ function main(){
     console.log("nyanSetItem:" + typeof nyanSetItem);
     console.log("nyanSetCookie:" + typeof nyanSetCookie);
     console.log("nyanGetCookie:" + typeof nyanGetCookie);
+    console.log("nyanGetFile:" + typeof nyanGetFile);
     //console.log("nyanHostExec result:" , nyanHostExec("echo 'test'; "));
+    //let result = nyanGetFile("./README.md");
+    console.log(result);
 
     if (isDecimalNumber(nyanAllParams.addNumber)) {
         let result = parseFloat(2) + parseFloat(nyanAllParams.addNumber);
