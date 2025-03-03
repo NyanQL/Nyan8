@@ -9,6 +9,7 @@ function main(){
     console.log("nyanSetItem:" + typeof nyanSetItem);
     console.log("nyanSetCookie:" + typeof nyanSetCookie);
     console.log("nyanGetCookie:" + typeof nyanGetCookie);
+    //console.log("nyanHostExec result:" , nyanHostExec("echo 'test'; "));
 
     if (isDecimalNumber(nyanAllParams.addNumber)) {
         let result = parseFloat(2) + parseFloat(nyanAllParams.addNumber);
