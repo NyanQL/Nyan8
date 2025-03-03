@@ -164,6 +164,17 @@ const result = nyanJsonAPI(
 const resultData = JSON.parse(result);
 ```
 
+ヘッダー情報をJSON文字列で渡す例
+
+```js
+// ヘッダー情報をJSON文字列で渡す例
+let headers = JSON.stringify({
+    "X-Custom-Header": "myValue",
+    "X-Another-Header": "anotherValue"
+});
+let result = nyanJsonAPI("https://example.com/api", '{"key":"value"}', "user", "pass", headers);
+```
+
 ## hostでのコマンド実行と結果の取得
 hostでのコマンド実行が可能です。
 
