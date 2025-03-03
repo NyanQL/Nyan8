@@ -930,22 +930,23 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 	// execCommand を JavaScript から呼び出すためのラッパー関数を登録
 	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
-			// 引数がない場合はエラーをスローする例
 			panic(vm.ToValue("exec: No command provided"))
 		}
-
-		// コマンドライン文字列を取得
 		commandLine := call.Argument(0).String()
-
-		// 実行
 		result, err := execCommand(commandLine)
 		if err != nil {
-			// エラーをパニックとして goja 側に投げる例
 			panic(vm.ToValue(err.Error()))
 		}
-
-		// 結果を goja.Value に変換して返す
-		return vm.ToValue(result)
+		// ExecResult を JSON に変換してから、マップに戻すことで json タグが反映される
+		b, err := json.Marshal(result)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		var m map[string]interface{}
+		if err := json.Unmarshal(b, &m); err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(m)
 	})
 }
 
