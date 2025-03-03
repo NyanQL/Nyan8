@@ -611,17 +611,27 @@ func getAPI(url, username, password string) (string, error) {
 }
 
 // POSTリクエストを行うGo関数
-func jsonAPI(url string, jsonData []byte, username, password string) (string, error) {
+func jsonAPI(url string, jsonData []byte, username, password string, headers map[string]string) (string, error) {
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", err
 	}
 
-	// Basic認証のセットアップ
-	basicAuth := username + ":" + password
-	basicAuthEncoded := base64.StdEncoding.EncodeToString([]byte(basicAuth))
-	req.Header.Set("Authorization", "Basic "+basicAuthEncoded)
+	// BASIC認証のセットアップ（usernameが空でなければ）
+	if username != "" {
+		basicAuth := username + ":" + password
+		basicAuthEncoded := base64.StdEncoding.EncodeToString([]byte(basicAuth))
+		req.Header.Set("Authorization", "Basic "+basicAuthEncoded)
+	}
+
 	req.Header.Set("Content-Type", "application/json")
+
+	// 追加のヘッダーが指定されていれば設定（複数指定可能）
+	if headers != nil {
+		for key, value := range headers {
+			req.Header.Set(key, value)
+		}
+	}
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -919,12 +929,35 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		jsonData := call.Argument(1).String()
 		username := call.Argument(2).String()
 		password := call.Argument(3).String()
-		result, err := jsonAPI(url, []byte(jsonData), username, password)
+
+		// 第5引数：ヘッダー情報（オブジェクトまたはJSON文字列）
+		var headers map[string]string
+		if len(call.Arguments) >= 5 {
+			// まずは、GojaのExportを使って直接オブジェクトとして取り出す
+			if obj, ok := call.Argument(4).Export().(map[string]interface{}); ok {
+				headers = make(map[string]string)
+				for key, value := range obj {
+					if s, ok := value.(string); ok {
+						headers[key] = s
+					} else {
+						// 文字列以外なら fmt.Sprintで文字列化
+						headers[key] = fmt.Sprint(value)
+					}
+				}
+			} else {
+				// オブジェクトとして取得できなければ、JSON文字列として処理する
+				headerJSON := call.Argument(4).String()
+				if err := json.Unmarshal([]byte(headerJSON), &headers); err != nil {
+					panic(vm.ToValue("Invalid header JSON: " + err.Error()))
+				}
+			}
+		}
+
+		result, err := jsonAPI(url, []byte(jsonData), username, password, headers)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
-		v := vm.ToValue(result)
-		return v
+		return vm.ToValue(result)
 	})
 
 	// execCommand を JavaScript から呼び出すためのラッパー関数を登録
