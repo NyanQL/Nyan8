@@ -193,6 +193,14 @@ console.log(nyanHostExec("ls"));
 * stdout : 標準出力
 * stderr : 標準エラー出力
 
+## ファイルの読み込み
+
+ファイルの読み込みができます。
+
+```js
+let text = nyanGetFile("ファイルのパス");
+let data = JSON.parse(text);
+```
 
 
 # このAPIサーバの情報を取得する場合
