@@ -611,17 +611,27 @@ func getAPI(url, username, password string) (string, error) {
 }
 
 // POSTリクエストを行うGo関数
-func jsonAPI(url string, jsonData []byte, username, password string) (string, error) {
+func jsonAPI(url string, jsonData []byte, username, password string, headers map[string]string) (string, error) {
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", err
 	}
 
-	// Basic認証のセットアップ
-	basicAuth := username + ":" + password
-	basicAuthEncoded := base64.StdEncoding.EncodeToString([]byte(basicAuth))
-	req.Header.Set("Authorization", "Basic "+basicAuthEncoded)
+	// BASIC認証のセットアップ（usernameが空でなければ）
+	if username != "" {
+		basicAuth := username + ":" + password
+		basicAuthEncoded := base64.StdEncoding.EncodeToString([]byte(basicAuth))
+		req.Header.Set("Authorization", "Basic "+basicAuthEncoded)
+	}
+
 	req.Header.Set("Content-Type", "application/json")
+
+	// 追加のヘッダーが指定されていれば設定（複数指定可能）
+	if headers != nil {
+		for key, value := range headers {
+			req.Header.Set(key, value)
+		}
+	}
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -919,12 +929,35 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		jsonData := call.Argument(1).String()
 		username := call.Argument(2).String()
 		password := call.Argument(3).String()
-		result, err := jsonAPI(url, []byte(jsonData), username, password)
+
+		// 第5引数：ヘッダー情報（オブジェクトまたはJSON文字列）
+		var headers map[string]string
+		if len(call.Arguments) >= 5 {
+			// まずは、GojaのExportを使って直接オブジェクトとして取り出す
+			if obj, ok := call.Argument(4).Export().(map[string]interface{}); ok {
+				headers = make(map[string]string)
+				for key, value := range obj {
+					if s, ok := value.(string); ok {
+						headers[key] = s
+					} else {
+						// 文字列以外なら fmt.Sprintで文字列化
+						headers[key] = fmt.Sprint(value)
+					}
+				}
+			} else {
+				// オブジェクトとして取得できなければ、JSON文字列として処理する
+				headerJSON := call.Argument(4).String()
+				if err := json.Unmarshal([]byte(headerJSON), &headers); err != nil {
+					panic(vm.ToValue("Invalid header JSON: " + err.Error()))
+				}
+			}
+		}
+
+		result, err := jsonAPI(url, []byte(jsonData), username, password, headers)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
-		v := vm.ToValue(result)
-		return v
+		return vm.ToValue(result)
 	})
 
 	// execCommand を JavaScript から呼び出すためのラッパー関数を登録
@@ -948,6 +981,8 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		}
 		return vm.ToValue(m)
 	})
+
+	vm.Set("nyanGetFile", newNyanGetFile(vm))
 }
 
 // convertShiftJISToUTF8 は、与えられたバイト列をShift-JIS(CP932)としてUTF-8文字列に変換する
@@ -1021,4 +1056,34 @@ func execCommand(commandLine string) (*ExecResult, error) {
 
 	result.Success = true
 	return result, nil
+}
+
+func newNyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		// 引数のチェック
+		if len(call.Arguments) < 1 {
+			// vm を使ってエラーオブジェクトを生成する
+			panic(vm.NewTypeError("nyanGetFileには1つの引数（ファイルパス）が必要です"))
+		}
+		relativePath := call.Arguments[0].String()
+
+		// 実行中のバイナリのパスを取得し、ディレクトリ部分を取得
+		exePath, err := os.Executable()
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		exeDir := filepath.Dir(exePath)
+
+		// バイナリディレクトリからの相対パスを結合してフルパスを作成
+		fullPath := filepath.Join(exeDir, relativePath)
+
+		// ファイルを読み込み
+		content, err := ioutil.ReadFile(fullPath)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+
+		// 読み込んだ内容を文字列として返す
+		return vm.ToValue(string(content))
+	}
 }
