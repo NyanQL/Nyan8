@@ -66,20 +66,11 @@ pushをする必要がないapiの設定では、pushの項目を省略してく
 # アプリケーションの実行方法
 config.jsonとapi.jsonを編集してください。
 
-## Windowsの場合
-Nyan8_Win.exe をダブルクリックして起動します。
-
-## Macの場合
-Nyan8_Macをダブルクリックするか、ターミナルで以下のコマンドを実行して起動します。
-```
-./Nyan8_Mac
-```
-
-## Linuxの場合
-ターミナルで以下のコマンドを実行して起動します。
-```
-./Nyan8_Linux_x64
-```
+以下のOSで動きます。
+https://github.com/NyanQL/Nyan8/releases から利用したいOS用のzipファイルをダウンロードし利用ください。
+* Windows
+* Mac
+* Linux
 
 # ライセンスについて
 Nyan8はMITライセンスで提供されています。詳細は[LICENSE.md](LICENSE.md)を参照してください。
