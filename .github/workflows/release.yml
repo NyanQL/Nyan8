@@ -43,8 +43,8 @@ jobs:
 
           mkdir release_package
           cp "${binary_name}" release_package/
-          cp README.md LICENSE.md config.json api.json stamps.db release_package/
-          cp -r javascript logs sql ssl release_package/
+          cp README.md LICENSE.md config.json api.json release_package/
+          cp -r javascript logs ssl release_package/
 
           zip -r "Nyan8_${{ matrix.os }}.zip" release_package
 
