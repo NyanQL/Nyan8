@@ -66,20 +66,11 @@ pushをする必要がないapiの設定では、pushの項目を省略してく
 # アプリケーションの実行方法
 config.jsonとapi.jsonを編集してください。
 
-## Windowsの場合
-Nyan8_Win.exe をダブルクリックして起動します。
-
-## Macの場合
-Nyan8_Macをダブルクリックするか、ターミナルで以下のコマンドを実行して起動します。
-```
-./Nyan8_Mac
-```
-
-## Linuxの場合
-ターミナルで以下のコマンドを実行して起動します。
-```
-./Nyan8_Linux_x64
-```
+以下のOSで動きます。
+https://github.com/NyanQL/Nyan8/releases から利用したいOS用のzipファイルをダウンロードし利用ください。
+* Windows
+* Mac
+* Linux
 
 # ライセンスについて
 Nyan8はMITライセンスで提供されています。詳細は[LICENSE.md](LICENSE.md)を参照してください。
@@ -202,10 +193,34 @@ let text = nyanGetFile("ファイルのパス");
 let data = JSON.parse(text);
 ```
 
+## APIの情報に対して、受け入れ項目、出力項目を出力について
+
+APIの情報に対して、受け入れ項目、出力項目を出力できます。
+例
+
+``` js
+const nyanAcceptedParams = {"addNumber": 2};
+const nyanOutputColumns =  ["result"];
+```
+
+出力例　http://localhost:8889/nyan/add
+```json
+{
+  "api": "add",
+  "description": "2に対して足し算した結果を返します。",
+  "nyanAcceptedParams": {
+    "addNumber": 2
+  },
+  "nyanOutputColumns": [
+    "result"
+  ]
+}
+```
+
 
 # このAPIサーバの情報を取得する場合
 http(s)://{hostname}:{port}/nyan にアクセスすると、このAPIサーバの情報を取得することができます。
-
+http(s)://{hostname}:{port}/nyan/API名 にアクセスすると、そのAPIの情報を取得することができます。
 
 # 予約語について
 apiとnyanから始まるものは予約語となります。 
