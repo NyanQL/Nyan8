@@ -193,6 +193,30 @@ let text = nyanGetFile("ファイルのパス");
 let data = JSON.parse(text);
 ```
 
+## APIの情報に対して、受け入れ項目、出力項目を出力について
+
+APIの情報に対して、受け入れ項目、出力項目を出力できます。
+例
+
+``` js
+const nyanAcceptedParams = {"addNumber": 2};
+const nyanOutputColumns =  ["result"];
+```
+
+出力例　http://localhost:8889/nyan/add
+```json
+{
+  "api": "add",
+  "description": "2に対して足し算した結果を返します。",
+  "nyanAcceptedParams": {
+    "addNumber": 2
+  },
+  "nyanOutputColumns": [
+    "result"
+  ]
+}
+```
+
 
 # このAPIサーバの情報を取得する場合
 http(s)://{hostname}:{port}/nyan にアクセスすると、このAPIサーバの情報を取得することができます。
