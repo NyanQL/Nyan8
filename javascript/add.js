@@ -1,3 +1,7 @@
+const nyanAcceptedParams = {"addNumber": 2};
+const nyanOutputColumns =  ["result"];
+
+
 function main(){
 
     console.log(nyanAllParams);
@@ -16,9 +20,7 @@ function main(){
         return JSON.stringify({
             "success": true,
             "status": 200,
-            "data": {
-                "result": result
-            },
+            "result": result
         });
     } else {
         return JSON.stringify({
