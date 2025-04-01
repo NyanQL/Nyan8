@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -140,6 +141,7 @@ func main() {
 	})
 
 	r.Any("/nyan", handleNyan)
+	r.Any("/nyan/:apiName", handleNyanDetail)
 
 	r.Any("/", handleRequest) // HTTPとWebSocketリクエストを同じエンドポイントで処理
 
@@ -835,6 +837,7 @@ func handleNyan(c *gin.Context) {
 		respondWithError(c, http.StatusInternalServerError, "Failed to get working directory", err)
 		return
 	}
+
 	// api.json を読み込み
 	apiJsonPath := filepath.Join(execDir, "api.json")
 	apiConf, err := loadJSONFile(apiJsonPath)
@@ -843,7 +846,7 @@ func handleNyan(c *gin.Context) {
 		return
 	}
 
-	// 各API設定から "script" キーを削除する
+	// 各API設定から "script" キーを削除する（スクリプトパスは見せない）
 	for key, api := range apiConf {
 		if apiMap, ok := api.(map[string]interface{}); ok {
 			delete(apiMap, "script")
@@ -851,20 +854,127 @@ func handleNyan(c *gin.Context) {
 		}
 	}
 
-	// config.json の値は globalConfig に保持されている前提
+	// config.json の値は globalConfig に保持されている想定
 	nyanInfo := map[string]interface{}{
 		"name":    globalConfig.Name,
 		"profile": globalConfig.Profile,
 		"version": globalConfig.Version,
 	}
 
-	// 構造体に詰め替えることで、出力順序を固定する
 	response := NyanResponse{
 		Nyan: nyanInfo,
 		Apis: apiConf,
 	}
-
 	c.JSON(http.StatusOK, response)
+}
+
+// /nyan/:apiName で特定APIの詳細を返す
+func handleNyanDetail(c *gin.Context) {
+	// パスパラメータの取得
+	apiName := c.Param("apiName")
+	if apiName == "" {
+		respondWithError(c, http.StatusBadRequest, "No apiName provided", nil)
+		return
+	}
+
+	// カレントディレクトリ(または実行ディレクトリ)取得
+	execDir, err := os.Getwd()
+	if err != nil {
+		respondWithError(c, http.StatusInternalServerError, "Failed to get working directory", err)
+		return
+	}
+
+	// api.json を読み込み
+	apiJsonPath := filepath.Join(execDir, "api.json")
+	apiConf, err := loadJSONFile(apiJsonPath)
+	if err != nil {
+		respondWithError(c, http.StatusInternalServerError, "Failed to load API configuration", err)
+		return
+	}
+
+	// 指定の API があるか確認
+	apiDataRaw, exists := apiConf[apiName]
+	if !exists {
+		respondWithError(c, http.StatusNotFound, fmt.Sprintf("API not found: %s", apiName), nil)
+		return
+	}
+
+	// apiDataを map[string]interface{} として扱う
+	apiData, ok := apiDataRaw.(map[string]interface{})
+	if !ok {
+		respondWithError(c, http.StatusInternalServerError, "Invalid API data format in api.json", nil)
+		return
+	}
+
+	// api.json に記載された description を取得（なければ空文字）
+	description, _ := apiData["description"].(string)
+
+	// JavaScriptのパスを取得（なければ空文字のまま）
+	scriptPath, _ := apiData["script"].(string)
+	nyanAcceptedParams := map[string]interface{}{}
+	nyanOutputColumns := []interface{}{}
+
+	if scriptPath != "" {
+		fullScriptPath := filepath.Join(execDir, scriptPath)
+		scriptContent, err := ioutil.ReadFile(fullScriptPath)
+		if err == nil {
+			// スクリプト内から const nyanAcceptedParams, nyanOutputColumns をパース
+			nyanAcceptedParams = parseConstObject(scriptContent, "nyanAcceptedParams")
+			nyanOutputColumns = parseConstArray(scriptContent, "nyanOutputColumns")
+		}
+	}
+
+	// 結果JSONを作成
+	result := map[string]interface{}{
+		"api":               apiName,
+		"description":       description,
+		"nyanAcceptedParams": nyanAcceptedParams, // スクリプトに無ければ空のまま
+		"nyanOutputColumns":  nyanOutputColumns,  // スクリプトに無ければ空のまま
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// parseConstObject は、scriptContent から「const XXX = {...};」形式のオブジェクトを抜き出してパースします
+func parseConstObject(scriptContent []byte, constName string) map[string]interface{} {
+	re := regexp.MustCompile(fmt.Sprintf(`(?m)const\s+%s\s*=\s*(\{[^;]*\});`, constName))
+	matches := re.FindSubmatch(scriptContent)
+	if len(matches) < 2 {
+		// 見つからなければ空オブジェクト
+		return map[string]interface{}{}
+	}
+
+	// matches[1] に { ... } の部分が入る想定
+	jsonStr := matches[1]
+	// 末尾のセミコロン(;)があれば除去（正規表現で「};」まで取れてる場合を想定）
+	jsonStr = bytes.TrimSuffix(jsonStr, []byte(";"))
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(jsonStr, &result); err != nil {
+		return map[string]interface{}{} // パースできなければ空
+	}
+	return result
+}
+
+// parseConstArray は、scriptContent から「const XXX = [...];」形式の配列を抜き出してパースします
+func parseConstArray(scriptContent []byte, constName string) []interface{} {
+	re := regexp.MustCompile(fmt.Sprintf(`(?m)const\s+%s\s*=\s*(\[[^;]*\]);`, constName))
+	matches := re.FindSubmatch(scriptContent)
+	if len(matches) < 2 {
+		// 見つからなければ空配列
+		return []interface{}{}
+	}
+
+	// matches[1] に [ ... ] の部分が入る想定
+	jsonStr := matches[1]
+	// 末尾のセミコロン(;)があれば除去
+	jsonStr = bytes.TrimSuffix(jsonStr, []byte(";"))
+
+	var result []interface{}
+	if err := json.Unmarshal(jsonStr, &result); err != nil {
+		return []interface{}{} // パースできなければ空
+	}
+	return result
 }
 
 // gojaのVMのセットアップ
