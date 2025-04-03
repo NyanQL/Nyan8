@@ -73,6 +73,26 @@ type ExecResult struct {
 	Stderr   string `json:"stderr"`
 }
 
+type JSONRPCResponse struct {
+	JSONRPC string           `json:"jsonrpc"`
+	Result  interface{}      `json:"result,omitempty"`
+	Error   *JSONRPCError    `json:"error,omitempty"`
+	ID      interface{}      `json:"id,omitempty"`
+}
+
+type JSONRPCRequest struct {
+	JSONRPC string                 `json:"jsonrpc"`
+	Method  string                 `json:"method"`
+	Params  map[string]interface{} `json:"params"`
+	ID      interface{}            `json:"id"`
+}
+
+type JSONRPCError struct {
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
+}
+
 // config格納場所
 var globalConfig Config
 
@@ -140,9 +160,9 @@ func main() {
 		respondWithError(c, http.StatusNotFound, "Endpoint not found", nil)
 	})
 
+	r.POST("/nyanmcp", handleJSONRPC)
 	r.Any("/nyan", handleNyan)
 	r.Any("/nyan/:apiName", handleNyanDetail)
-
 	r.Any("/", handleRequest) // HTTPとWebSocketリクエストを同じエンドポイントで処理
 
 	// 動的エンドポイントの登録
@@ -1196,4 +1216,182 @@ func newNyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 		// 読み込んだ内容を文字列として返す
 		return vm.ToValue(string(content))
 	}
+}
+
+func handleJSONRPC(c *gin.Context) {
+	var rpcReq JSONRPCRequest
+
+	// JSONのパース
+	if err := c.ShouldBindJSON(&rpcReq); err != nil {
+		rpcResp := JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &JSONRPCError{
+				Code:    -32700,
+				Message: "Parse error",
+				Data:    err.Error(),
+			},
+			ID: nil, // パース失敗時はIDが取得できないためnull
+		}
+		c.JSON(http.StatusBadRequest, rpcResp)
+		return
+	}
+
+	// jsonrpcフィールドのチェック
+	if rpcReq.JSONRPC != "2.0" {
+		rpcResp := JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &JSONRPCError{
+				Code:    -32600,
+				Message: "Invalid Request: jsonrpc must be '2.0'",
+			},
+			ID: rpcReq.ID,
+		}
+		c.JSON(http.StatusBadRequest, rpcResp)
+		return
+	}
+
+	// methodフィールドの存在チェック
+	if rpcReq.Method == "" {
+		rpcResp := JSONRPCResponse{
+			JSONRPC: "2.0",
+			Error: &JSONRPCError{
+				Code:    -32601,
+				Message: "Method not found",
+			},
+			ID: rpcReq.ID,
+		}
+		c.JSON(http.StatusNotFound, rpcResp)
+		return
+	}
+
+	// 実行ディレクトリの取得
+	execDir, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	if err != nil {
+		respondJSONRPCError(c, rpcReq.ID, -32603, "Internal error: cannot get execPath", err)
+		return
+	}
+	if isTemporaryDirectory(execDir) {
+		if execDir, err = os.Getwd(); err != nil {
+			respondJSONRPCError(c, rpcReq.ID, -32603, "Internal error: cannot get working directory", err)
+			return
+		}
+	}
+
+	// api.jsonの読み込み
+	apiJsonPath := filepath.Join(execDir, "api.json")
+	scriptListData, err := loadJSONFile(apiJsonPath)
+	if err != nil {
+		respondJSONRPCError(c, rpcReq.ID, -32603, "Failed to read api.json", err)
+		return
+	}
+
+	// method名（rpcReq.Method）からスクリプト情報を取得
+	scriptInfoRaw, ok := scriptListData[rpcReq.Method]
+	if !ok {
+		respondJSONRPCError(c, rpcReq.ID, -32601, fmt.Sprintf("Method not found: %s", rpcReq.Method), nil)
+		return
+	}
+	scriptInfo, ok := scriptInfoRaw.(map[string]interface{})
+	if !ok {
+		respondJSONRPCError(c, rpcReq.ID, -32603, "Invalid script info format in api.json", nil)
+		return
+	}
+
+	// スクリプトファイルのパス取得
+	scriptPathRaw, ok := scriptInfo["script"]
+	if !ok {
+		respondJSONRPCError(c, rpcReq.ID, -32603, fmt.Sprintf("No script path for method: %s", rpcReq.Method), nil)
+		return
+	}
+	scriptPath, _ := scriptPathRaw.(string)
+	fullPath := filepath.Join(execDir, scriptPath)
+
+	// JSON-RPCのparamsを元にパラメータマップを構築
+	allParams := make(map[string]interface{})
+	for k, v := range rpcReq.Params {
+		allParams[k] = v
+	}
+	// 既存ロジックが「api」パラメータを参照するために設定
+	allParams["api"] = rpcReq.Method
+
+	// JavaScriptの実行
+	resultStr, err := runJavaScript(fullPath, allParams, c)
+	if err != nil {
+		respondJSONRPCError(c, rpcReq.ID, -32603, "Script execution failed", err)
+		return
+	}
+
+	// JavaScriptの返却結果をJSONとしてパース
+	var jsResult map[string]interface{}
+	if err := json.Unmarshal([]byte(resultStr), &jsResult); err != nil {
+		respondJSONRPCError(c, rpcReq.ID, -32603, "Failed to parse script response", err)
+		return
+	}
+
+	// (1) success=false の場合に status を見てエラーを振り分ける
+	if successVal, ok := jsResult["success"].(bool); ok {
+		if !successVal {
+			// "success": false の時
+			if statusVal, ok := jsResult["status"].(float64); ok {
+				status := int(statusVal)
+				switch status {
+				case 400:
+					respondJSONRPCError(c, rpcReq.ID, -32602, "Invalid params", jsResult)
+					return
+				case 401:
+					respondJSONRPCError(c, rpcReq.ID, -32001, "Unauthorized", jsResult)
+					return
+				case 404:
+					respondJSONRPCError(c, rpcReq.ID, -32601, "Resource not found", jsResult)
+					return
+				case 500:
+					respondJSONRPCError(c, rpcReq.ID, -32603, "Internal error", jsResult)
+					return
+				default:
+					// その他のステータスは一旦すべてInternal error扱いなど、運用ポリシーによる
+					respondJSONRPCError(c, rpcReq.ID, -32603, "Unknown error", jsResult)
+					return
+				}
+			} else {
+				// statusが数値でない or 存在しない場合もエラーにするならここで対応
+				respondJSONRPCError(c, rpcReq.ID, -32603, "Missing or invalid status", jsResult)
+				return
+			}
+		}
+	}
+
+	// JSON-RPC用に resultフィールドを作る（"status"は除くなどはお好みで）
+	rpcResponseData := make(map[string]interface{})
+	for k, v := range jsResult {
+		if k != "status" {
+			rpcResponseData[k] = v
+		}
+	}
+
+	// 必要に応じてpush処理の実行
+	performPush(scriptInfo, scriptListData, allParams, execDir)
+
+	// JSON-RPC成功レスポンスの生成
+	rpcResp := JSONRPCResponse{
+		JSONRPC: "2.0",
+		Result:  rpcResponseData,
+		ID:      rpcReq.ID,
+	}
+
+	// statusCode に従ってレスポンスを返す（通常は200のままでOK）
+	c.JSON(http.StatusOK, rpcResp)
+}
+
+
+func respondJSONRPCError(c *gin.Context, id interface{}, code int, message string, data interface{}) {
+	rpcErr := &JSONRPCError{
+		Code:    code,
+		Message: message,
+		Data:    data,
+	}
+	c.JSON(http.StatusOK, JSONRPCResponse{
+		JSONRPC: "2.0",
+		Error:   rpcErr,
+		ID:      id,
+	})
 }
