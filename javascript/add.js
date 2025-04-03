@@ -4,7 +4,7 @@ const nyanOutputColumns =  ["result"];
 
 function main(){
 
-    console.log(nyanAllParams);
+    console.log(nyanAllParams.addNumber);
     console.log("console.log:" + typeof console.log);
     console.log("nyanHostExec:" + typeof nyanHostExec);
     console.log("nyanGetAPI:" + typeof nyanGetAPI);
@@ -19,7 +19,7 @@ function main(){
         let result = parseFloat(2) + parseFloat(nyanAllParams.addNumber);
         return JSON.stringify({
             "success": true,
-            "status": 200,
+            "status": 201,
             "result": result
         });
     } else {
@@ -34,6 +34,7 @@ function main(){
 }
 
 function isDecimalNumber(value) {
+    if (typeof value === "number") return true; // 数値型ならそのまま許容
     if (typeof value !== "string") return false; // 文字列でなければ false
 
     // 数字のみ（先頭の `0` を除外しない）で、小数点が1つまで
