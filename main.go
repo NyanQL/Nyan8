@@ -160,7 +160,7 @@ func main() {
 		respondWithError(c, http.StatusNotFound, "Endpoint not found", nil)
 	})
 
-	r.POST("/nyan-mcp", handleJSONRPC)
+	r.POST("/nyan-rpc", handleJSONRPC)
 	r.Any("/nyan", handleNyan)
 	r.Any("/nyan/:apiName", handleNyanDetail)
 	r.Any("/", handleRequest) // HTTPとWebSocketリクエストを同じエンドポイントで処理
