@@ -217,6 +217,25 @@ const nyanOutputColumns =  ["result"];
 }
 ```
 
+# JSON-RPC対応
+http(s)://{hostname}:{port}/nyan-rpc にアクセスすると、JSON-RPCのAPIを利用することができます。
+Nyan8はJSON-RPC 2.0に準拠したAPIを提供しています。
+ただし、現在 6.Batch については未実装です。
+JSON-RPC 2.0の仕様については、[こちら](https://www.jsonrpc.org/specification)を参照してください。
+以下のようなJSON-RPCリクエストを送信することで、APIを呼び出すことができます。
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "api名",
+  "params": {
+    "param1": "value1",
+    "param2": "value2"
+  },
+  "id": 1
+}
+```
+
 
 # このAPIサーバの情報を取得する場合
 http(s)://{hostname}:{port}/nyan にアクセスすると、このAPIサーバの情報を取得することができます。
