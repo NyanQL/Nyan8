@@ -120,6 +120,8 @@ nyanGetItem("nyanpui");
 ## Ajaxの操作
 Ajaxの操作が可能です。
 取得したデータはJSON.parseでパースしてください。
+getでの取得の場合は、nyanGetAPI を使用します。
+jsonでの取得の場合は、nyanJsonAPI を使用します。
 
 getでの取得の場合
 
