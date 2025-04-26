@@ -1246,7 +1246,7 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		return base64.StdEncoding.EncodeToString(data) // 改行無し／バイナリ OK
 	})
 	// --------------------------------------------------------------
-	vm.Set("nyanFileAttachment", func(path string) map[string]interface{} {
+	vm.Set("nyanSendMailAttachment", func(path string) map[string]interface{} {
 		abs := path
 		if !filepath.IsAbs(path) {
 			wd, _ := os.Getwd()
