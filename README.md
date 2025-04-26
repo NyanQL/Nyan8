@@ -117,9 +117,9 @@ localStorageの取得が可能です。
 nyanGetItem("nyanpui");
 ```
 
-## Ajaxの操作
-Ajaxの操作が可能です。
-取得したデータはJSON.parseでパースしてください。
+## 外部APIの利用
+外部APIの利用が可能です。
+取得したデータがjsonの場合はJSON.parseでパースしてください。
 getでの取得の場合は、nyanGetAPI を使用します。
 jsonでの取得の場合は、nyanJsonAPI を使用します。
 
@@ -237,6 +237,165 @@ JSON-RPC 2.0の仕様については、[こちら](https://www.jsonrpc.org/speci
   "id": 1
 }
 ```
+
+# メール送信 & Base64 ユーティリティについて
+
+**`nyanSendMail`**（添付ファイル送信対応）および **`nyanFileToBase64`**（ファイル → Base64 変換）を用いた開発手順をまとめたものです。
+
+---
+
+## 事前準備
+| 手順 | 内容 |
+|------|------|
+|①|`config.json` に SMTP 情報を設定する <br>（`host`, `port`, `username`, `password`, `from_email`, `from_name`, `tls`, `default_bcc`）|
+|②|`main.go` をビルド／実行し、サーバーを起動する|
+|③|JavaScript ファイルを作成し、`api.json` にエンドポイントを登録する|
+
+> **メモ**: SMTP 認証方式は PLAIN を想定しています。別方式を使う場合は `sendMail()` 内で調整してください。
+
+---
+
+## nyanSendMail の使い方
+### 1. 最小構成
+```javascript
+nyanSendMail({
+  to: ["user@example.com"],
+  subject: "テストメール",
+  body: "こんにちは！",
+  html: false
+});
+```
+
+### 2. CC / BCC / デフォルト BCC
+```javascript
+nyanSendMail({
+  to:   ["to1@example.com", "to2@example.com"],
+  cc:   ["cc@example.com"],
+  bcc:  ["bcc@example.com"], // config.json の default_bcc と自動マージされる
+  subject: "CC/BCC テスト",
+  body:    "本文です",
+});
+```
+
+### 3. 添付ファイル（パス指定 & Base64 指定併用）
+```javascript
+// 文字列を Base64 化する簡易関数（UTF‑8 前提）
+function base64Encode(str) {
+  var tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+  var out="", i=0, c1, c2, c3;
+  while(i < str.length){
+    c1 = str.charCodeAt(i++) & 0xff;
+    if(i === str.length){out += tbl.charAt(c1>>2)+tbl.charAt((c1&3)<<4)+"=="; break;}
+    c2 = str.charCodeAt(i++);
+    if(i === str.length){out += tbl.charAt(c1>>2)+tbl.charAt(((c1&3)<<4)|((c2&0xF0)>>4))+tbl.charAt((c2&0xF)<<2)+"="; break;}
+    c3 = str.charCodeAt(i++);
+    out += tbl.charAt(c1>>2)+tbl.charAt(((c1&3)<<4)|((c2&0xF0)>>4))+tbl.charAt(((c2&0xF)<<2)|((c3&0xC0)>>6))+tbl.charAt(c3&0x3F);
+  }
+  return out;
+}
+
+var msg = "これは Base64 でエンコードした添付テキストです。";
+
+nyanSendMail({
+  to: ["dest@example.com"],
+  subject: "添付テスト",
+  body: "<p>こんにちは！</p>",
+  html: true,
+  attachments: [
+    { path: "./README.md" },                  // ローカルファイルを添付
+    {                                         // 文字列 → Base64 で添付
+      filename: "hello.txt",
+      contentType: "text/plain",
+      dataBase64: base64Encode(msg)
+    }
+  ]
+});
+```
+
+---
+
+## 4. nyanFileToBase64 の使い方
+Go 側に追加されたユーティリティを呼び出し、ファイルを Base64 文字列として取得できます。
+
+### 4‑1. 例：画像をメール添付
+```javascript
+// PNG を Base64 で読み取り、コンテンツタイプを自動判定
+var pngInfo = nyanFileToBase64("./images/cat.png");
+/* 返り値例
+{
+  base64: "iVBORw0KGgoAAAANSUhEUgA...",  // 改行なし
+  contentType: "image/png"
+}
+*/
+
+nyanSendMail({
+  to: ["dest@example.com"],
+  subject: "画像添付テスト",
+  body: "<p>ネコ画像を送ります！</p>",
+  html: true,
+  attachments: [
+    {
+      filename: "cat.png",
+      contentType: pngInfo.contentType, // 自動判定された MIME タイプ
+      dataBase64: pngInfo.base64
+    }
+  ]
+});
+```
+
+### 4‑2. 返却オブジェクト仕様
+| フィールド | 型 | 説明 |
+|-----------|----|------|
+| `base64` | `string` | 改行を含まない Base64 文字列 |
+| `contentType` | `string` | 拡張子から推測した `image/png` などの MIME タイプ（不明時は `application/octet-stream`） |
+| `size` *(optional)* | `number` | バイトサイズ（実装例によっては追加可） |
+
+---
+
+## 5. トラブルシューティング
+| 症状 | 原因 / 対処 |
+|------|-------------|
+| **添付ファイルが文字化け** | UTF‑8 で `base64Encode` しているか確認。Shift‑JIS など別エンコーディングのファイルは Go 側で読み取って `nyanFileToBase64` を利用するのがおすすめ。|
+| **`attachments=0` とログに出る** | `attachments` 配列の中身が `path` / `dataBase64` いずれも空。キー名のスペルも確認する。|
+| **SMTP 認証失敗** | `config.json` の `username` / `password`、`tls` フラグを確認。STARTTLS が必要な場合は Go 側 `sendMail` を修正。|
+
+
+## 7. `config.json` のサンプルと各項目の説明
+
+以下はーるを送信する際に必要な `config.json` の一例です。ご利用の環境に合わせて編集してください。
+
+```json
+{
+  ...省略
+  "smtp": {
+    "host": "smtp.example.com",
+    "port": 465,               // SMTPS の場合は 465、STARTTLS は 587 など
+    "username": "user@example.com",
+    "password": "passw0rd",
+    "from_email": "noreply@example.com",
+    "from_name":  "にゃん送信係",
+    "tls": true,               // true=SMTPS/STARTTLS で暗号化接続
+    "default_bcc": [           // すべてのメールに自動で BCC 追加（任意）
+      "archive@example.com"
+    ]
+  }
+}
+```
+
+### 項目解説
+| キー | 必須 | 説明 |
+|------|------|------|
+| `host` / `port` | ○ | SMTP サーバーのホスト名とポート番号 |
+| `username` / `password` | △ | 認証が必要な場合に設定。不要なら空文字で可 |
+| `from_email` | ○ | 送信元メールアドレス（エンベロープ & ヘッダー） |
+| `from_name`  | △ | 送信者名。UTF‑8 を想定（自動でエンコードされる） |
+| `tls` | ○ | `true`: 暗号化接続（SMTPS/STARTTLS）を利用<br>`false`: 平文 SMTP |
+| `default_bcc` | △ | ここに設定したアドレスは **nyanSendMail** 実行時に指定しなくても自動で BCC 追加されます。重複は `sendMail()` 内で除去されるため安心です。 |
+
+> **ヒント:** STARTTLS が必要な SMTP でポート 587 を使う場合も `tls` を `true` にしておけば、自動でネゴシエーションされます（ライブラリ依存）。問題がある場合は `sendMail()` の TLS ハンドリングを調整してください。
+
+---
+
 
 
 # このAPIサーバの情報を取得する場合
