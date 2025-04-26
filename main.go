@@ -106,7 +106,8 @@ type SMTPConfig struct {
 	Password  string `json:"password"`
 	FromEmail string `json:"from_email"`
 	FromName  string `json:"from_name"`
-	TLS       bool   `json:"tls"`
+	TLS       bool   `json:"tls"`,
+	DefaultBCC []string `json:"default_bcc"`
 }
 
 
@@ -1489,21 +1490,40 @@ func respondJSONRPCError(c *gin.Context, id interface{}, code int, message strin
 }
 
 // sendMail は config.json に定義された SMTP 経由でメールを送信する。
-// ① ヘルパーのシグネチャ変更
 func sendMail(to, cc, bcc []string, subject, body string, isHTML bool) error {
 	smtpCfg := globalConfig.SMTP
 	if smtpCfg.Host == "" {
 		return fmt.Errorf("SMTP not configured")
 	}
 
-	// --- ヘッダー作成 -------------------------------------------------
+	// ① config.default_bcc を合流
+	bcc = append(bcc, smtpCfg.DefaultBCC...)
+
+	// ② 3リスト間の重複を一括除去
+	uniq := map[string]struct{}{}
+	dedup := func(src []string) (out []string) {
+		for _, addr := range src {
+			a := strings.ToLower(strings.TrimSpace(addr))
+			if a == "" { continue }
+			if _, exists := uniq[a]; !exists {
+				uniq[a] = struct{}{}
+				out = append(out, addr) // 元の表記を保持
+			}
+		}
+		return
+	}
+	to  = dedup(to)
+	cc  = dedup(cc)
+	bcc = dedup(bcc)
+
+	// ---------- ヘッダー ----------
 	hdr := map[string]string{
-		"From":          fmt.Sprintf("%s <%s>",
+		"From":    fmt.Sprintf("%s <%s>",
 			mime.QEncoding.Encode("utf-8", smtpCfg.FromName),
 			smtpCfg.FromEmail),
-		"To":            strings.Join(to, ","),
-		"Subject":       mime.QEncoding.Encode("utf-8", subject),
-		"MIME-Version":  "1.0",
+		"To":      strings.Join(to, ","),
+		"Subject": mime.QEncoding.Encode("utf-8", subject),
+		"MIME-Version": "1.0",
 	}
 	if len(cc) > 0 {
 		hdr["Cc"] = strings.Join(cc, ",")
@@ -1520,10 +1540,11 @@ func sendMail(to, cc, bcc []string, subject, body string, isHTML bool) error {
 	}
 	msg.WriteString("\r\n" + body)
 
-	// --- 送信 ---------------------------------------------------------
-	rcpts := append(append(to, cc...), bcc...)   // Bcc も RCPT TO へ
-	addr  := fmt.Sprintf("%s:%d", smtpCfg.Host, smtpCfg.Port)
-	auth  := smtp.PlainAuth("", smtpCfg.Username, smtpCfg.Password, smtpCfg.Host)
+	// ---------- 宛先リスト ----------
+	rcpts := append(append(to, cc...), bcc...)
+
+	addr := fmt.Sprintf("%s:%d", smtpCfg.Host, smtpCfg.Port)
+	auth := smtp.PlainAuth("", smtpCfg.Username, smtpCfg.Password, smtpCfg.Host)
 
 	if smtpCfg.TLS {                       // SMTPS (465)
 		tlsCfg := &tls.Config{ServerName: smtpCfg.Host}
@@ -1543,5 +1564,6 @@ func sendMail(to, cc, bcc []string, subject, body string, isHTML bool) error {
 	// SMTP + STARTTLS or 平文
 	return smtp.SendMail(addr, auth, smtpCfg.FromEmail, rcpts, []byte(msg.String()))
 }
+
 
 
