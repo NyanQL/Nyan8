@@ -24,6 +24,11 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"crypto/tls"
+	"mime"
+	"net/smtp"
+	"reflect"
+
 )
 
 // ResponseData はAPIのレスポンスデータを表します。
@@ -49,6 +54,7 @@ type Config struct {
 	KeyFile           string    `json:"keyPath"`
 	JavaScriptInclude []string  `json:"javascript_include"`
 	Log               LogConfig `json:"log"`
+	SMTP SMTPConfig `json:"smtp"`
 }
 
 // LogConfig はログ設定データを表します。
@@ -92,6 +98,17 @@ type JSONRPCError struct {
 	Message string      `json:"message"`
 	Data    interface{} `json:"data,omitempty"`
 }
+
+type SMTPConfig struct {
+	Host      string `json:"host"`
+	Port      int    `json:"port"`
+	Username  string `json:"username"`
+	Password  string `json:"password"`
+	FromEmail string `json:"from_email"`
+	FromName  string `json:"from_name"`
+	TLS       bool   `json:"tls"`
+}
+
 
 // config格納場所
 var globalConfig Config
@@ -1113,6 +1130,81 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 	})
 
 	vm.Set("nyanGetFile", newNyanGetFile(vm))
+
+	vm.Set("nyanSendMail", func(call goja.FunctionCall) goja.Value {
+
+		// ---------- ユーティリティ -------------
+		toSlice := func(v interface{}) []string {
+			switch x := v.(type) {
+			case nil:
+				return []string{}
+			case string:
+				return []string{x}
+			case []interface{}:
+				out := make([]string, 0, len(x))
+				for _, e := range x {
+					if s, ok := e.(string); ok { out = append(out, s) }
+				}
+				return out
+			case []string:
+				return x
+			default:
+				return []string{}
+			}
+		}
+
+		// ---------- A. オブジェクト呼び出し ----------
+		if len(call.Arguments) == 1 && call.Argument(0).ExportType() != nil &&
+			call.Argument(0).ExportType().Kind() == reflect.Map {
+
+			obj := call.Argument(0).Export().(map[string]interface{})
+			to    := toSlice(obj["to"])
+			cc    := toSlice(obj["cc"])
+			bcc   := toSlice(obj["bcc"])
+			subj  := fmt.Sprint(obj["subject"])
+			body  := fmt.Sprint(obj["body"])
+			html  := false
+			if v, ok := obj["html"].(bool); ok { html = v }
+
+			if len(to) == 0 {
+				panic(vm.ToValue("nyanSendMail: 'to' が空です"))
+			}
+			if subj == "" {
+				panic(vm.ToValue("nyanSendMail: 'subject' が空です"))
+			}
+
+			if err := sendMail(to, cc, bcc, subj, body, html); err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(true)
+		}
+
+		// ---------- B. 旧シグネチャ互換 (to,subject,body[,html][,cc][,bcc]) ----------
+		if len(call.Arguments) < 3 {
+			panic(vm.ToValue("nyanSendMail(to, subject, body [, isHtml] [, cc] [, bcc]) が必要です"))
+		}
+
+		to    := toSlice(call.Argument(0).Export())
+		subj  := call.Argument(1).String()
+		body  := call.Argument(2).String()
+		html  := false
+		cc    := []string{}
+		bcc   := []string{}
+
+		if len(call.Arguments) >= 4 { html = call.Argument(3).ToBoolean() }
+		if len(call.Arguments) >= 5 { cc   = toSlice(call.Argument(4).Export()) }
+		if len(call.Arguments) >= 6 { bcc  = toSlice(call.Argument(5).Export()) }
+
+		if len(to) == 0 {
+			panic(vm.ToValue("nyanSendMail: to が空です"))
+		}
+
+		if err := sendMail(to, cc, bcc, subj, body, html); err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(true)
+	})
+
 }
 
 // convertShiftJISToUTF8 は、与えられたバイト列をShift-JIS(CP932)としてUTF-8文字列に変換する
@@ -1395,3 +1487,61 @@ func respondJSONRPCError(c *gin.Context, id interface{}, code int, message strin
 		ID:      id,
 	})
 }
+
+// sendMail は config.json に定義された SMTP 経由でメールを送信する。
+// ① ヘルパーのシグネチャ変更
+func sendMail(to, cc, bcc []string, subject, body string, isHTML bool) error {
+	smtpCfg := globalConfig.SMTP
+	if smtpCfg.Host == "" {
+		return fmt.Errorf("SMTP not configured")
+	}
+
+	// --- ヘッダー作成 -------------------------------------------------
+	hdr := map[string]string{
+		"From":          fmt.Sprintf("%s <%s>",
+			mime.QEncoding.Encode("utf-8", smtpCfg.FromName),
+			smtpCfg.FromEmail),
+		"To":            strings.Join(to, ","),
+		"Subject":       mime.QEncoding.Encode("utf-8", subject),
+		"MIME-Version":  "1.0",
+	}
+	if len(cc) > 0 {
+		hdr["Cc"] = strings.Join(cc, ",")
+	}
+	if isHTML {
+		hdr["Content-Type"] = "text/html; charset=UTF-8"
+	} else {
+		hdr["Content-Type"] = "text/plain; charset=UTF-8"
+	}
+
+	var msg strings.Builder
+	for k, v := range hdr {
+		msg.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
+	}
+	msg.WriteString("\r\n" + body)
+
+	// --- 送信 ---------------------------------------------------------
+	rcpts := append(append(to, cc...), bcc...)   // Bcc も RCPT TO へ
+	addr  := fmt.Sprintf("%s:%d", smtpCfg.Host, smtpCfg.Port)
+	auth  := smtp.PlainAuth("", smtpCfg.Username, smtpCfg.Password, smtpCfg.Host)
+
+	if smtpCfg.TLS {                       // SMTPS (465)
+		tlsCfg := &tls.Config{ServerName: smtpCfg.Host}
+		conn, err := tls.Dial("tcp", addr, tlsCfg)
+		if err != nil { return err }
+		c, err := smtp.NewClient(conn, smtpCfg.Host)
+		if err != nil { return err }
+		defer c.Quit()
+		if err := c.Auth(auth); err != nil { return err }
+		if err := c.Mail(smtpCfg.FromEmail); err != nil { return err }
+		for _, r := range rcpts { if err := c.Rcpt(r); err != nil { return err } }
+		w, err := c.Data(); if err != nil { return err }
+		if _, err := w.Write([]byte(msg.String())); err != nil { return err }
+		return w.Close()
+	}
+
+	// SMTP + STARTTLS or 平文
+	return smtp.SendMail(addr, auth, smtpCfg.FromEmail, rcpts, []byte(msg.String()))
+}
+
+
