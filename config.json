@@ -15,5 +15,17 @@
     "MaxAge": 7,
     "Compress": true,
     "EnableLogging": false
+  },
+  "smtp": {
+    "host": "",
+    "port": 587,
+    "username": "",
+    "password": "",
+    "from_email": "",
+    "from_name": "",
+    "tls": false,
+    "default_bcc": [
+      ""
+    ]
   }
 }

@@ -106,7 +106,7 @@ type SMTPConfig struct {
 	Password  string `json:"password"`
 	FromEmail string `json:"from_email"`
 	FromName  string `json:"from_name"`
-	TLS       bool   `json:"tls"`,
+	TLS       bool   `json:"tls"`
 	DefaultBCC []string `json:"default_bcc"`
 }
 
