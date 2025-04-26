@@ -1,10 +1,27 @@
 package main
 
 import (
+	// ── 標準 ─────────────────────────────
 	"bytes"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
+	"mime"
+	"mime/multipart"
+	"net/http"
+	"net/smtp"
+	"net/textproto"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
+	"sync"
 	"github.com/dop251/goja"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -13,18 +30,8 @@ import (
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
-	"io"
-	"io/ioutil"
-	"log"
-	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
-	"runtime"
-	"strings"
-	"sync"
 )
+
 
 // ResponseData はAPIのレスポンスデータを表します。
 type ResponseData struct {
@@ -49,6 +56,7 @@ type Config struct {
 	KeyFile           string    `json:"keyPath"`
 	JavaScriptInclude []string  `json:"javascript_include"`
 	Log               LogConfig `json:"log"`
+	SMTP SMTPConfig `json:"smtp"`
 }
 
 // LogConfig はログ設定データを表します。
@@ -92,6 +100,24 @@ type JSONRPCError struct {
 	Message string      `json:"message"`
 	Data    interface{} `json:"data,omitempty"`
 }
+
+type SMTPConfig struct {
+	Host      string `json:"host"`
+	Port      int    `json:"port"`
+	Username  string `json:"username"`
+	Password  string `json:"password"`
+	FromEmail string `json:"from_email"`
+	FromName  string `json:"from_name"`
+	TLS       bool   `json:"tls"`
+	DefaultBCC []string `json:"default_bcc"`
+}
+
+type MailAttachment struct {
+	FileName    string
+	ContentType string
+	Data        []byte
+}
+
 
 // config格納場所
 var globalConfig Config
@@ -999,48 +1025,34 @@ func parseConstArray(scriptContent []byte, constName string) []interface{} {
 
 // gojaのVMのセットアップ
 func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
-	// 既存の関数登録（getCookie, setCookie, setItem, getItem, console.log）はそのまま
 
 	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
-		username := call.Argument(1).String()
-		password := call.Argument(2).String()
-		result, err := getAPI(url, username, password)
+		user := call.Argument(1).String()
+		pass := call.Argument(2).String()
+		result, err := getAPI(url, user, pass)
 		if err != nil {
-			// エラーの場合は例外としてスロー（またはエラーメッセージを返す）
 			panic(vm.ToValue(err.Error()))
 		}
-		v := vm.ToValue(result)
-		return v
+		return vm.ToValue(result)
 	})
 
 	vm.Set("nyanGetCookie", func(name string) string {
-		if ginCtx != nil {
-			cookieValue, err := ginCtx.Cookie(name)
-			if err != nil {
-				logger.Printf("Error retrieving cookie: %v", err)
-				return ""
-			}
-			return cookieValue
+		if ginCtx == nil {
+			return ""
 		}
-		logger.Printf("Gin context is not set")
-		return ""
+		v, _ := ginCtx.Cookie(name)
+		return v
 	})
-
 	vm.Set("nyanSetCookie", func(name, value string) {
 		if ginCtx != nil {
 			ginCtx.SetCookie(name, value, 3600, "/", "", false, true)
-			logger.Printf("Set-Cookie: %s=%s", name, value)
-		} else {
-			logger.Printf("Gin context is not set")
 		}
 	})
 
-	vm.Set("nyanSetItem", func(key, value string) {
-		storage.Store(key, value)
-	})
-	vm.Set("nyanGetItem", func(key string) string {
-		if v, ok := storage.Load(key); ok {
+	vm.Set("nyanSetItem", func(k, v string) { storage.Store(k, v) })
+	vm.Set("nyanGetItem", func(k string) string {
+		if v, ok := storage.Load(k); ok {
 			if s, ok := v.(string); ok {
 				return s
 			}
@@ -1049,73 +1061,222 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 	})
 
 	vm.Set("console", map[string]interface{}{
-		"log": func(args ...interface{}) {
-			logger.Printf(fmt.Sprint(args...))
-		},
+		"log": func(args ...interface{}) { logger.Print(args...) },
 	})
 
 	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
-		jsonData := call.Argument(1).String()
-		username := call.Argument(2).String()
-		password := call.Argument(3).String()
+		data := call.Argument(1).String()
+		user := call.Argument(2).String()
+		pass := call.Argument(3).String()
 
-		// 第5引数：ヘッダー情報（オブジェクトまたはJSON文字列）
-		var headers map[string]string
+		var hdr map[string]string
 		if len(call.Arguments) >= 5 {
-			// まずは、GojaのExportを使って直接オブジェクトとして取り出す
-			if obj, ok := call.Argument(4).Export().(map[string]interface{}); ok {
-				headers = make(map[string]string)
-				for key, value := range obj {
-					if s, ok := value.(string); ok {
-						headers[key] = s
-					} else {
-						// 文字列以外なら fmt.Sprintで文字列化
-						headers[key] = fmt.Sprint(value)
-					}
-				}
-			} else {
-				// オブジェクトとして取得できなければ、JSON文字列として処理する
-				headerJSON := call.Argument(4).String()
-				if err := json.Unmarshal([]byte(headerJSON), &headers); err != nil {
-					panic(vm.ToValue("Invalid header JSON: " + err.Error()))
+			if m, ok := call.Argument(4).Export().(map[string]interface{}); ok {
+				hdr = make(map[string]string)
+				for k, v := range m {
+					hdr[k] = fmt.Sprint(v)
 				}
 			}
 		}
-
-		result, err := jsonAPI(url, []byte(jsonData), username, password, headers)
+		res, err := jsonAPI(url, []byte(data), user, pass, hdr)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
-		return vm.ToValue(result)
+		return vm.ToValue(res)
 	})
 
-	// execCommand を JavaScript から呼び出すためのラッパー関数を登録
 	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
-		if len(call.Arguments) < 1 {
-			panic(vm.ToValue("exec: No command provided"))
+		if len(call.Arguments) == 0 {
+			panic(vm.ToValue("command required"))
 		}
-		commandLine := call.Argument(0).String()
-		result, err := execCommand(commandLine)
+		cmd := call.Argument(0).String()
+		out, err := execCommand(cmd)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
-		// ExecResult を JSON に変換してから、マップに戻すことで json タグが反映される
-		b, err := json.Marshal(result)
-		if err != nil {
-			panic(vm.ToValue(err.Error()))
-		}
+		js, _ := json.Marshal(out)
 		var m map[string]interface{}
-		if err := json.Unmarshal(b, &m); err != nil {
-			panic(vm.ToValue(err.Error()))
-		}
+		_ = json.Unmarshal(js, &m)
 		return vm.ToValue(m)
 	})
 
 	vm.Set("nyanGetFile", newNyanGetFile(vm))
+
+	/* ===============================================================
+	   nyanSendMail
+	   - オブジェクト呼び出し {to,cc,bcc,subject,body,html,attachments}
+	   - 旧シグネチャ呼び出し  (to,subject,body[,html][,cc][,bcc])
+	================================================================ */
+
+	vm.Set("nyanSendMail", func(call goja.FunctionCall) goja.Value {
+
+		// ---- ヘルパー：任意 → []string --------------------------------
+		toSlice := func(v interface{}) []string {
+			switch t := v.(type) {
+			case nil:
+				return nil
+			case string:
+				return []string{t}
+			case []string:
+				return t
+			case []interface{}:
+				out := make([]string, 0, len(t))
+				for _, x := range t {
+					out = append(out, fmt.Sprint(x))
+				}
+				return out
+			default:
+				return []string{fmt.Sprint(t)}
+			}
+		}
+
+		// ---------- A. オブジェクト形式 --------------------------------
+		if len(call.Arguments) == 1 {
+			obj, ok := call.Argument(0).Export().(map[string]interface{})
+			if !ok {
+				panic(vm.ToValue("object argument expected"))
+			}
+
+			to := toSlice(obj["to"])
+			cc := toSlice(obj["cc"])
+			bcc := toSlice(obj["bcc"])
+			subj := fmt.Sprint(obj["subject"])
+			body := fmt.Sprint(obj["body"])
+			html := false
+			if v, ok := obj["html"].(bool); ok {
+				html = v
+			}
+
+			// ---------- 添付パース ----------
+			atts := []MailAttachment{}
+			if raw, ok := obj["attachments"].([]interface{}); ok {
+				for _, v := range raw {
+					m, ok := v.(map[string]interface{})
+					if !ok {
+						if o, ok := v.(*goja.Object); ok {
+							m, _ = o.Export().(map[string]interface{})
+						}
+					}
+					if m == nil {
+						continue
+					}
+					// path
+					if pv, ok := m["path"]; ok {
+						p := fmt.Sprint(pv)
+						if p != "" {
+							abs := p
+							if !filepath.IsAbs(p) {
+								wd, _ := os.Getwd()
+								abs = filepath.Join(wd, p)
+							}
+							data, err := os.ReadFile(abs)
+							if err != nil {
+								panic(vm.ToValue("read attach: " + err.Error()))
+							}
+							atts = append(atts, MailAttachment{
+								FileName:    filepath.Base(abs),
+								ContentType: mime.TypeByExtension(filepath.Ext(abs)),
+								Data:        data,
+							})
+						}
+					}
+					// dataBase64
+					if b64, ok := m["dataBase64"]; ok {
+						dec, err := base64.StdEncoding.DecodeString(fmt.Sprint(b64))
+						if err != nil {
+							panic(vm.ToValue("base64 decode: " + err.Error()))
+						}
+						atts = append(atts, MailAttachment{
+							FileName:    fmt.Sprint(m["filename"]),
+							ContentType: fmt.Sprint(m["contentType"]),
+							Data:        dec,
+						})
+					}
+				}
+			}
+
+			if err := sendMail(to, cc, bcc, subj, body, html, atts); err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
+			return vm.ToValue(true)
+
+		}
+
+		// ---------- B. 旧シグネチャ ------------------------------------
+		if len(call.Arguments) < 3 {
+			panic(vm.ToValue("need at least 3 arguments"))
+		}
+		to := toSlice(call.Argument(0).Export())
+		subj := call.Argument(1).String()
+		body := call.Argument(2).String()
+		html := false
+		cc, bcc := []string{}, []string{}
+		if len(call.Arguments) >= 4 {
+			html = call.Argument(3).ToBoolean()
+		}
+		if len(call.Arguments) >= 5 {
+			cc = toSlice(call.Argument(4).Export())
+		}
+		if len(call.Arguments) >= 6 {
+			bcc = toSlice(call.Argument(5).Export())
+		}
+
+		if err := sendMail(to, cc, bcc, subj, body, html, nil); err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(true)
+	})
+
+
+	// --- base64--------------------------------------
+	vm.Set("nyanReadFileB64", func(path string) string {
+		// 相対パスならカレントディレクトリ基準で解決
+		abs := path
+		if !filepath.IsAbs(path) {
+			wd, _ := os.Getwd()
+			abs = filepath.Join(wd, path)
+		}
+
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			// JS 側に例外として伝える
+			panic(vm.ToValue(err.Error()))
+		}
+		return base64.StdEncoding.EncodeToString(data) // 改行無し／バイナリ OK
+	})
+	// --------------------------------------------------------------
+	vm.Set("nyanSendMailAttachment", func(path string) map[string]interface{} {
+		abs := path
+		if !filepath.IsAbs(path) {
+			wd, _ := os.Getwd()
+			abs = filepath.Join(wd, path)
+		}
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+
+		// DetectContentType は 512byte まで見れば十分
+		ctype := http.DetectContentType(data)
+		if ctype == "application/octet-stream" {
+			// 拡張子でもう一押し
+			if extCT := mime.TypeByExtension(filepath.Ext(abs)); extCT != "" {
+				ctype = extCT
+			}
+		}
+
+		return map[string]interface{}{
+			"filename":     filepath.Base(abs),
+			"contentType":  ctype,
+			"dataBase64":   base64.StdEncoding.EncodeToString(data),
+		}
+	})
+
 }
 
-// convertShiftJISToUTF8 は、与えられたバイト列をShift-JIS(CP932)としてUTF-8文字列に変換する
+
+	// convertShiftJISToUTF8 は、与えられたバイト列をShift-JIS(CP932)としてUTF-8文字列に変換する
 func convertShiftJISToUTF8(b []byte) (string, error) {
 	// 変換用のReaderを作る
 	r := transform.NewReader(bytes.NewReader(b), japanese.ShiftJIS.NewDecoder())
@@ -1394,4 +1555,142 @@ func respondJSONRPCError(c *gin.Context, id interface{}, code int, message strin
 		Error:   rpcErr,
 		ID:      id,
 	})
+}
+
+// sendMail は config.json の SMTP 設定でメールを送り、attachments があれば添付する。
+func sendMail(
+	to, cc, bcc []string,        // 宛先
+	subject, body string,        // 件名・本文
+	isHTML bool,                 // true=HTML  false=プレーン
+	attachments []MailAttachment, // 添付ファイル
+) error {
+
+	/* ───── 0. 設定チェック ───────────────────────── */
+	s := globalConfig.SMTP
+	if s.Host == "" {
+		return fmt.Errorf("SMTP not configured")
+	}
+
+	/* ───── 1. 宛先マージ & 重複除去 ───────────────── */
+	bcc = append(bcc, s.DefaultBCC...)
+	seen := map[string]struct{}{}
+	dedupe := func(src []string) (out []string) {
+		for _, addr := range src {
+			if addr = strings.TrimSpace(addr); addr == "" {
+				continue
+			}
+			key := strings.ToLower(addr)
+			if _, ok := seen[key]; !ok {
+				seen[key] = struct{}{}
+				out = append(out, addr) // 表示は元の大小文字
+			}
+		}
+		return
+	}
+	to, cc, bcc = dedupe(to), dedupe(cc), dedupe(bcc)
+
+	/* ───── 2. MIME ヘッダー ─────────────────────── */
+	h := textproto.MIMEHeader{}
+	h.Set("From",
+		fmt.Sprintf("%s <%s>",
+			mime.QEncoding.Encode("UTF-8", s.FromName),
+			s.FromEmail))
+	h.Set("To", strings.Join(to, ","))
+	if len(cc) > 0 {
+		h.Set("Cc", strings.Join(cc, ","))
+	}
+	h.Set("Subject", mime.QEncoding.Encode("UTF-8", subject))
+	h.Set("MIME-Version", "1.0")
+
+	/* ───── 3. マルチパート組み立て ──────────────── */
+	var msg bytes.Buffer
+	mp := multipart.NewWriter(&msg)
+	h.Set("Content-Type",
+		fmt.Sprintf("multipart/mixed; boundary=%q", mp.Boundary()))
+
+	// 3-1 先頭ヘッダー出力
+	for k, v := range h {
+		msg.WriteString(fmt.Sprintf("%s: %s\r\n", k, v[0]))
+	}
+	msg.WriteString("\r\n")
+
+	// 3-2 本文パート
+	partHdr := textproto.MIMEHeader{}
+	if isHTML {
+		partHdr.Set("Content-Type", "text/html; charset=UTF-8")
+	} else {
+		partHdr.Set("Content-Type", "text/plain; charset=UTF-8")
+	}
+	partHdr.Set("Content-Transfer-Encoding", "base64")
+
+	bp, _ := mp.CreatePart(partHdr)
+	encBody := base64.NewEncoder(base64.StdEncoding, bp)
+	encBody.Write([]byte(body))
+	encBody.Close()
+
+	// 3-3 添付パート
+	for _, a := range attachments {
+		if a.FileName == "" {
+			a.FileName = "attachment"
+		}
+		a.ContentType = http.DetectContentType(a.Data)
+		if a.ContentType == "application/octet-stream" {
+			a.ContentType = mime.TypeByExtension(filepath.Ext(a.FileName))
+			if a.ContentType == "" {
+				a.ContentType = "application/octet-stream"
+			}
+		}
+		attHdr := textproto.MIMEHeader{}
+		attHdr.Set("Content-Type",
+			fmt.Sprintf("%s; name=%q", a.ContentType, a.FileName))
+		attHdr.Set("Content-Disposition",
+			fmt.Sprintf(`attachment; filename=%q`, a.FileName))
+		attHdr.Set("Content-Transfer-Encoding", "base64")
+
+		ap, _ := mp.CreatePart(attHdr)
+		encAtt := base64.NewEncoder(base64.StdEncoding, ap)
+		encAtt.Write(a.Data)
+		encAtt.Close()
+	}
+	mp.Close() // --boundary-- を書く
+
+	logger.Printf("DEBUG: attachments=%d, message=%d bytes", len(attachments), msg.Len())
+
+	/* ───── 4. SMTP 送信 ────────────────────────── */
+	rcpts := append(append(to, cc...), bcc...)
+	addr  := fmt.Sprintf("%s:%d", s.Host, s.Port)
+	auth  := smtp.PlainAuth("", s.Username, s.Password, s.Host)
+
+	// 4-1 SMTPS / STARTTLS 直後 TLS
+	if s.TLS {
+		conn, err := tls.Dial("tcp", addr, &tls.Config{ServerName: s.Host})
+		if err != nil {
+			return err
+		}
+		c, err := smtp.NewClient(conn, s.Host)
+		if err != nil {
+			return err
+		}
+		defer c.Quit()
+
+		if err := c.Auth(auth); err != nil {
+			return err
+		}
+		if err := c.Mail(s.FromEmail); err != nil {
+			return err
+		}
+		for _, r := range rcpts {
+			if err := c.Rcpt(r); err != nil {
+				return err
+			}
+		}
+		w, _ := c.Data()
+		if _, err := w.Write(msg.Bytes()); err != nil {
+			return err
+		}
+		return w.Close()
+	}
+
+	// 4-2 平文 or STARTTLS をサーバ側が自動要求
+	return smtp.SendMail(addr, auth, s.FromEmail, rcpts, msg.Bytes())
 }
