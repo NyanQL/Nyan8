@@ -1026,8 +1026,6 @@ func parseConstArray(scriptContent []byte, constName string) []interface{} {
 // gojaのVMのセットアップ
 func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 
-	/* ========== 既存ユーティリティの登録（省略せず収録） ========== */
-
 	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
 		user := call.Argument(1).String()
@@ -1229,6 +1227,52 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		}
 		return vm.ToValue(true)
 	})
+
+
+	// --- base64--------------------------------------
+	vm.Set("nyanReadFileB64", func(path string) string {
+		// 相対パスならカレントディレクトリ基準で解決
+		abs := path
+		if !filepath.IsAbs(path) {
+			wd, _ := os.Getwd()
+			abs = filepath.Join(wd, path)
+		}
+
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			// JS 側に例外として伝える
+			panic(vm.ToValue(err.Error()))
+		}
+		return base64.StdEncoding.EncodeToString(data) // 改行無し／バイナリ OK
+	})
+	// --------------------------------------------------------------
+	vm.Set("nyanFileAttachment", func(path string) map[string]interface{} {
+		abs := path
+		if !filepath.IsAbs(path) {
+			wd, _ := os.Getwd()
+			abs = filepath.Join(wd, path)
+		}
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+
+		// DetectContentType は 512byte まで見れば十分
+		ctype := http.DetectContentType(data)
+		if ctype == "application/octet-stream" {
+			// 拡張子でもう一押し
+			if extCT := mime.TypeByExtension(filepath.Ext(abs)); extCT != "" {
+				ctype = extCT
+			}
+		}
+
+		return map[string]interface{}{
+			"filename":     filepath.Base(abs),
+			"contentType":  ctype,
+			"dataBase64":   base64.StdEncoding.EncodeToString(data),
+		}
+	})
+
 }
 
 
@@ -1589,8 +1633,12 @@ func sendMail(
 		if a.FileName == "" {
 			a.FileName = "attachment"
 		}
-		if a.ContentType == "" {
-			a.ContentType = "application/octet-stream"
+		a.ContentType = http.DetectContentType(a.Data)
+		if a.ContentType == "application/octet-stream" {
+			a.ContentType = mime.TypeByExtension(filepath.Ext(a.FileName))
+			if a.ContentType == "" {
+				a.ContentType = "application/octet-stream"
+			}
 		}
 		attHdr := textproto.MIMEHeader{}
 		attHdr.Set("Content-Type",
