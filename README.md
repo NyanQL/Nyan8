@@ -118,30 +118,34 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 | **`nyanFileToBase64`** | ファイル → Base64 変換 |
 
 ### 4‑1  パラメータ取得
+getやpost,jsonで受け取ったパラメータは `nyanAllParams` で取得できます。
+
 ```javascript
 console.log(nyanAllParams);
 ```
 
 ### 4‑2  外部 API 例（POST JSON）
+外部APIを利用することができます。
+
 
 ```javascript
 // (1) ヘッダー無し – 必須 4 引数
-var res = nyanJsonAPI(
+let res = nyanJsonAPI(
   "https://example.com/api",
   JSON.stringify({ key: "value" }),
   "id",
   "pass"
 );
-var obj = JSON.parse(res);
+let obj = JSON.parse(res);
 
 // (2) ヘッダー付き – 5 番目の引数にオブジェクト or JSON 文字列
-var headers = {
+let headers = {
   "X-Custom-Token": "abcd1234",
   "Content-Language": "ja"
 };
 
 // オブジェクトをそのまま渡す
-var res2 = nyanJsonAPI(
+let res2 = nyanJsonAPI(
   "https://example.com/api",
   JSON.stringify({ foo: "bar" }),
   "id",
@@ -150,7 +154,7 @@ var res2 = nyanJsonAPI(
 );
 
 // JSON 文字列で渡すことも可能
-var res3 = nyanJsonAPI(
+let res3 = nyanJsonAPI(
   "https://example.com/api",
   '{"foo":"bar"}',
   "id",
@@ -181,7 +185,7 @@ nyanSendMail({
 
 ### 5‑2  ファイル添付（Base64 変換ユーティリティ利用）
 ```javascript
-var png = nyanFileToBase64("./image/cat.png");
+let png = nyanFileToBase64("./image/cat.png");
 nyanSendMail({
   to: ["dest@example.com"],
   subject: "画像",
