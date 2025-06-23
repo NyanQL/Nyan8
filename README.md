@@ -117,16 +117,52 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 | **`nyanSendMail`** | メール送信（添付可）|
 | **`nyanFileToBase64`** | ファイル → Base64 変換 |
 
-### 4‑1  パラメータ取得
+### 4‑1 console.log
+console.logはコンソールもしくはログファイルへ内容が出力されます。
+```javascript
+console.log("Hello, Nyan8!");
+```
+
+### 4‑2 パラメータ取得
 getやpost,jsonで受け取ったパラメータは `nyanAllParams` で取得できます。
 
 ```javascript
 console.log(nyanAllParams);
 ```
 
-### 4‑2  外部 API 例（POST JSON）
+### 4‑3 外部 APIの利用
 外部APIを利用することができます。
 
+#### 4-3-1 GET リクエスト 
+getでの利用ができます。
+idとpassはBASIC認証用のIDとパスワードです。必要に応じて設定してください。
+```javascript
+// (1) ヘッダー無しのリクエストの場合
+let res = nyanGetApi(
+  "https://example.com/api",
+  "id",
+  "pass"
+);
+
+let obj = JSON.parse(res);
+
+// (2) ヘッダー付きのリクエストの場合
+let res = nyanGetApi(
+  "https://example.com/api",
+  "id",
+  "pass",
+  {
+    "X-Custom-Token": "abcd1234",
+    "Content-Language": "ja"
+  }
+);
+
+let obj = JSON.parse(res);
+
+````
+#### 4-3-2 POST リクエスト(JSON)
+POSTでの利用ができます。
+idとpassはBASIC認証用のIDとパスワードです。必要に応じて設定してください。
 
 ```javascript
 // (1) ヘッダー無し – 必須 4 引数
