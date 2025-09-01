@@ -1,7 +1,7 @@
 package main
 
 import (
-	// ── 標準 ─────────────────────────────
+
 	"bytes"
 	"crypto/tls"
 	"encoding/base64"
@@ -12,6 +12,7 @@ import (
 	"log"
 	"mime"
 	"mime/multipart"
+     "net"
 	"net/http"
 	"net/smtp"
 	"net/textproto"
@@ -301,6 +302,13 @@ func handleAPIRequest(c *gin.Context) {
 	// 全てのパラメータをマージ
 	allParams := make(map[string]interface{})
 	allParams["api"] = c.Request.URL.Path[1:]
+	allParams["_remote_ip"] = getClientIP(c.Request)
+    allParams["_user_agent"] = c.Request.UserAgent()
+    headersMap := make(map[string]string)
+    for k, v := range c.Request.Header {
+        headersMap[k] = strings.Join(v, ",")
+    }
+    allParams["_headers"] = headersMap
 
 	// POSTの場合、フォームデータをパースする
 	if c.Request.Method == http.MethodPost && strings.HasPrefix(c.ContentType(), "application/x-www-form-urlencoded") {
@@ -459,6 +467,14 @@ func handleWebSocket(c *gin.Context) {
 			continue
 		}
 
+		receivedData["_remote_ip"] = getClientIP(c.Request)
+        receivedData["_user_agent"] = c.Request.UserAgent()
+        headersMap := make(map[string]string)
+        for k, v := range c.Request.Header {
+            headersMap[k] = strings.Join(v, ",")
+        }
+        receivedData["_headers"] = headersMap
+
 		// api.json を読み込む
 		apiJsonPath := filepath.Join(execDir, "api.json")
 		scriptListData, err := loadJSONFile(apiJsonPath)
@@ -499,6 +515,7 @@ func handleWebSocket(c *gin.Context) {
 			logger.Printf("Failed to send message to WebSocket: %v", err)
 			break
 		}
+
 
 		// push 項目が設定されている場合、push 対象APIの処理を実行
 		if pushTargetRaw, exists := scriptInfo["push"]; exists {
@@ -1273,6 +1290,32 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		}
 	})
 
+	//--リモートのIP UserAgent Header情報の取得-------------------------
+	vm.Set("nyanGetRemoteIP", func() string {
+        if ginCtx == nil {
+            return ""
+        }
+        return getClientIP(ginCtx.Request)
+    })
+
+    vm.Set("nyanGetUserAgent", func() string {
+        if ginCtx == nil {
+            return ""
+        }
+        return ginCtx.Request.UserAgent()
+    })
+
+    vm.Set("nyanGetRequestHeaders", func() map[string]string {
+        out := map[string]string{}
+        if ginCtx == nil {
+            return out
+        }
+        for k, v := range ginCtx.Request.Header {
+            out[k] = strings.Join(v, ",")
+        }
+        return out
+    })
+
 }
 
 
@@ -1693,4 +1736,34 @@ func sendMail(
 
 	// 4-2 平文 or STARTTLS をサーバ側が自動要求
 	return smtp.SendMail(addr, auth, s.FromEmail, rcpts, msg.Bytes())
+}
+
+func getClientIP(r *http.Request) string {
+    if r == nil {
+        return ""
+    }
+
+    // X-Forwarded-For（カンマ区切りで複数入ることがある）
+    if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+        parts := strings.Split(xff, ",")
+        for _, p := range parts {
+            ip := strings.TrimSpace(p)
+            if ip != "" && ip != "unknown" {
+                return ip
+            }
+        }
+    }
+
+    // X-Real-IP
+    if xr := strings.TrimSpace(r.Header.Get("X-Real-IP")); xr != "" {
+        return xr
+    }
+
+    // RemoteAddr のパース（host:port）
+    if host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr)); err == nil && host != "" {
+        return host
+    }
+
+    // フォールバック
+    return r.RemoteAddr
 }
