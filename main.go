@@ -1,7 +1,7 @@
 package main
 
 import (
-	// ── 標準 ─────────────────────────────
+
 	"bytes"
 	"crypto/tls"
 	"encoding/base64"
@@ -12,6 +12,7 @@ import (
 	"log"
 	"mime"
 	"mime/multipart"
+     "net"
 	"net/http"
 	"net/smtp"
 	"net/textproto"
@@ -302,6 +303,7 @@ func handleAPIRequest(c *gin.Context) {
 	allParams := make(map[string]interface{})
 	allParams["api"] = c.Request.URL.Path[1:]
 
+
 	// POSTの場合、フォームデータをパースする
 	if c.Request.Method == http.MethodPost && strings.HasPrefix(c.ContentType(), "application/x-www-form-urlencoded") {
 		if err := c.Request.ParseForm(); err != nil {
@@ -459,6 +461,14 @@ func handleWebSocket(c *gin.Context) {
 			continue
 		}
 
+		receivedData["_remote_ip"] = getClientIP(c.Request)
+        receivedData["_user_agent"] = c.Request.UserAgent()
+        headersMap := make(map[string]string)
+        for k, v := range c.Request.Header {
+            headersMap[k] = strings.Join(v, ",")
+        }
+        receivedData["_headers"] = headersMap
+
 		// api.json を読み込む
 		apiJsonPath := filepath.Join(execDir, "api.json")
 		scriptListData, err := loadJSONFile(apiJsonPath)
@@ -499,6 +509,7 @@ func handleWebSocket(c *gin.Context) {
 			logger.Printf("Failed to send message to WebSocket: %v", err)
 			break
 		}
+
 
 		// push 項目が設定されている場合、push 対象APIの処理を実行
 		if pushTargetRaw, exists := scriptInfo["push"]; exists {
@@ -1273,6 +1284,32 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		}
 	})
 
+	//--リモートのIP UserAgent Header情報の取得-------------------------
+	vm.Set("nyanGetRemoteIP", func() string {
+        if ginCtx == nil {
+            return ""
+        }
+        return getClientIP(ginCtx.Request)
+    })
+
+    vm.Set("nyanGetUserAgent", func() string {
+        if ginCtx == nil {
+            return ""
+        }
+        return ginCtx.Request.UserAgent()
+    })
+
+    vm.Set("nyanGetRequestHeaders", func() map[string]string {
+        out := map[string]string{}
+        if ginCtx == nil {
+            return out
+        }
+        for k, v := range ginCtx.Request.Header {
+            out[k] = strings.Join(v, ",")
+        }
+        return out
+    })
+
 }
 
 
@@ -1353,31 +1390,38 @@ func newNyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		// 引数のチェック
 		if len(call.Arguments) < 1 {
-			// vm を使ってエラーオブジェクトを生成する
 			panic(vm.NewTypeError("nyanGetFileには1つの引数（ファイルパス）が必要です"))
 		}
 		relativePath := call.Arguments[0].String()
 
-		// 実行中のバイナリのパスを取得し、ディレクトリ部分を取得
+		// 実行中のバイナリのディレクトリからの相対パスに解決
 		exePath, err := os.Executable()
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
 		exeDir := filepath.Dir(exePath)
-
-		// バイナリディレクトリからの相対パスを結合してフルパスを作成
 		fullPath := filepath.Join(exeDir, relativePath)
 
-		// ファイルを読み込み
-		content, err := ioutil.ReadFile(fullPath)
+		// ディレクトリ指定なら null
+		if fi, err := os.Stat(fullPath); err == nil && fi.IsDir() {
+			return goja.Null()
+		}
+
+		// 読み込み。存在しないなら null、その他はエラーを投げる
+		content, err := os.ReadFile(fullPath)
 		if err != nil {
+			if os.IsNotExist(err) {
+				return goja.Null()
+			}
+			// 権限など他のエラーはJS例外に（従来の動作）
 			panic(vm.ToValue(err.Error()))
 		}
 
-		// 読み込んだ内容を文字列として返す
+		// 読み込んだ内容を文字列で返す（バイナリは Base64 を使う nyanReadFileB64 を推奨）
 		return vm.ToValue(string(content))
 	}
 }
+
 
 func handleJSONRPC(c *gin.Context) {
 	var rpcReq JSONRPCRequest
@@ -1693,4 +1737,34 @@ func sendMail(
 
 	// 4-2 平文 or STARTTLS をサーバ側が自動要求
 	return smtp.SendMail(addr, auth, s.FromEmail, rcpts, msg.Bytes())
+}
+
+func getClientIP(r *http.Request) string {
+    if r == nil {
+        return ""
+    }
+
+    // X-Forwarded-For（カンマ区切りで複数入ることがある）
+    if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+        parts := strings.Split(xff, ",")
+        for _, p := range parts {
+            ip := strings.TrimSpace(p)
+            if ip != "" && ip != "unknown" {
+                return ip
+            }
+        }
+    }
+
+    // X-Real-IP
+    if xr := strings.TrimSpace(r.Header.Get("X-Real-IP")); xr != "" {
+        return xr
+    }
+
+    // RemoteAddr のパース（host:port）
+    if host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr)); err == nil && host != "" {
+        return host
+    }
+
+    // フォールバック
+    return r.RemoteAddr
 }

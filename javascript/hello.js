@@ -2,7 +2,6 @@
 function main(){
 
     let name = "Nyan8";
-    console.log(nyanAllParams);
     if(typeof nyanAllParams.name !== "undefined")
     {
         name = nyanAllParams.name;
