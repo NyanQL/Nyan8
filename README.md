@@ -102,40 +102,63 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 
 ---
 
-## 4  ランタイムユーティリティ（JavaScript 側）
+## 4   Javascript 上で実行可能な関数と概要
 
-| 関数 | 概要 |
-|------|------|
-| `nyanAllParams` | GET/POST/JSON 受信パラメータをまとめたオブジェクト |
-| `console.log()` | Go ログ or コンソールへ出力 |
-| `nyanGetCookie` / `nyanSetCookie` | Cookie 操作 |
-| `nyanGetItem` / `nyanSetItem` | メモリ内 key‑value ストレージ |
-| `nyanGetAPI` | HTTP GET ｜
-| `nyanJsonAPI` | HTTP POST（JSON） |
-| `nyanHostExec` | ホスト OS でシェル実行し結果取得 |
-| `nyanGetFile` | サーバー上のファイルを読み込み |
-| **`nyanSendMail`** | メール送信（添付可）|
-| **`nyanFileToBase64`** | ファイル → Base64 変換 |
+| -  | 関数                                | 概要                                |
+|----|-----------------------------------|-----------------------------------|
+| 1  | `nyanAllParams`                   | GET/POST/JSON 受信パラメータをまとめたオブジェクト  |
+| 2  | `console.log()`                       | ログファイル もしくは コンソールへ出力              |
+| 3  | `nyanGetCookie()` / `nyanSetCookie()` | Cookie 操作                         |
+| 4  | `nyanGetItem()` / `nyanSetItem()`     | メモリ内 key‑value ストレージ              |
+| 5  | `nyanGetAPI()`                        | HTTP GET                          |
+| 6  | `nyanJsonAPI()`                       | HTTP POST（JSON）                   |
+| 7  | `nyanHostExec()`                      | ホスト OS でシェル実行し結果取得                |
+| 8  | `nyanGetFile()`                       | サーバー上のファイルを読み込み ファイルが存在しない場合はnull |
+| 9  | `nyanGetRemoteIP()`                   | リモートIPを取得                         |
+| 10 | `nyanGetUserAgent()`                  | UserAgentを取得                      |
+| 11 | `nyanGetRequestHeaders()`             | Header情報を取得できます。                  |
+| 12 | **`nyanSendMail()`**                  | メール送信（添付可）                        |
+| 13 | **`nyanFileToBase64()`**              | ファイル → Base64 変換                  |
 
-### 4‑1 console.log
+### 4‑1 nyanAllParams
+GET/POST/JSON 受信パラメータをまとめたオブジェクトです。
+このオブジェクトから受信した情報をすべて取得することができます。
+
+```javascript
+console.log("nyanAllParams");
+```
+
+### 4‑2 console.log
 console.logはコンソールもしくはログファイルへ内容が出力されます。
+
 ```javascript
 console.log("Hello, Nyan8!");
 ```
-
-### 4‑2 パラメータ取得
-getやpost,jsonで受け取ったパラメータは `nyanAllParams` で取得できます。
+### 4-3 nyanGetCookie / nyanSetCookie
+cookieの取得と設定ができます。
 
 ```javascript
-console.log(nyanAllParams);
+// (1) 取得
+let val = nyanGetCookie("my_cookie");
+console.log("my_cookie:", val);
+// (2) 設定
+nyanSetCookie("my_cookie", "hello", 3600); // 1時間有効
 ```
 
-### 4‑3 外部 APIの利用
-外部APIを利用することができます。
+### 4‑4 nyanGetItem / nyanSetItem
+ローカルストレージへの保存と取得が可能です。
 
-#### 4-3-1 GET リクエスト 
-getでの利用ができます。
+```javascript
+// (1) 取得
+let val = nyanGetItem("my_key");
+console.log("my_key:", val);
+// (2) 設定
+nyanSetItem("my_key", "hello");
+```
+### 4‑5 外部APIの呼び出し nyanGetAPI
+nyanGetAPI と nyanJsonAPI は外部 API を呼び出すためのユーティリティです。
 idとpassはBASIC認証用のIDとパスワードです。必要に応じて設定してください。
+
 ```javascript
 // (1) ヘッダー無しのリクエストの場合
 let res = nyanGetApi(
@@ -160,8 +183,9 @@ let res = nyanGetApi(
 let obj = JSON.parse(res);
 
 ````
-#### 4-3-2 POST リクエスト(JSON)
-POSTでの利用ができます。
+
+### 4‑6 外部APIの呼び出し nyanJsonAPI
+JSONをPOSTするリクエストができます。
 idとpassはBASIC認証用のIDとパスワードです。必要に応じて設定してください。
 
 ```javascript
@@ -205,75 +229,171 @@ let res3 = nyanJsonAPI(
 
 ---
 
-## 5  メール送信 & Base64 ユーティリティ
 
-> **詳細な使い方・トラブルシューティングは** [「メール送信 & Base64 ユーティリティ利用ガイド」](#メール送信--base64-ユーティリティ利用ガイド) を参照してください。
 
-### 5‑1  最小例
+### 4-7 ホストコマンド実行 nyanHostExec
+ホスト OS のシェルコマンドを実行し、結果を JSON 形式で取得します。
+
 ```javascript
-nyanSendMail({
-  to: ["user@example.com"],
-  subject: "テスト",
-  body: "hello",
-  html: false
-});
+let result = nyanHostExec("ls -l");
+console.log(result);
 ```
 
-### 5‑2  ファイル添付（Base64 変換ユーティリティ利用）
-```javascript
-let png = nyanFileToBase64("./image/cat.png");
-nyanSendMail({
-  to: ["dest@example.com"],
-  subject: "画像",
-  body: "<p>ネコです</p>",
-  html: true,
-  attachments: [{
-    filename: "cat.png",
-    contentType: png.contentType,
-    dataBase64: png.base64
-  }]
-});
-```
+#### console.log() の出力例： 
+stdout にコマンドの標準出力、 stderr に標準エラー出力が入ります。
 
----
-
-## 6  JSON‑RPC 2.0 エンドポイント
-
-`POST /nyan-rpc` に以下の形式でリクエストを送信します。
-
+エラーが発生した場合はexitCode が 0 以外になります。 
+正常に処理が完了した場合、exitCode が 0 になります。 
 ```json
 {
-  "jsonrpc": "2.0",
-  "method": "add",
-  "params": { "addNumber": 5 },
-  "id": 1
+  "stdout": "total 8\ndrwxr-xr-x  4 user  staff  128 Aug 15 12:00 .\ndrwxr-xr-x 10 user  staff  320 Aug 15 11:59 ..\n-rw-r--r--  1 user  staff   0 Aug 15 12:00 file1.txt\n-rw-r--r--  1 user  staff   0 Aug 15 12:00 file2.txt\n",
+  "stderr": "",
+  "exitCode": 0
 }
 ```
 
-※ Batch（配列リクエスト）は現在未実装です。
+### 4‑8 nyanGetFile
+サーバー上のファイルを読み込み、内容を文字列として取得します。
 
+実行するNyan8バイナリーからの相対パスでも絶対パスでもファイルを指定することができます。
+ファイルが存在しない場合 nullが返却されます。
+
+```javascript
+let content = nyanGetFile("./data.txt");
+if (content !== null) {
+  console.log("File content:", content);
+} else {
+  console.log("File not found.");
+}
+```
+
+## 4‑9 nyanGetRemoteIP
+リクエスト元のリモートIPアドレスを取得します。
+
+```javascript  
+let ip = nyanGetRemoteIP();
+console.log("Remote IP:", ip);
+```
+### 4‑10 nyanGetUserAgent
+リクエスト元のUserAgentを取得します。
+
+```javascript
+let ua = nyanGetUserAgent();
+console.log("UserAgent:", ua);
+```
+### 4‑11 nyanGetRequestHeaders
+リクエストヘッダーをオブジェクト形式で取得します。
+
+```javascript
+let headers = nyanGetRequestHeaders();
+console.log("Request Headers:", headers);
+```
+
+### 4‑12 メール送信 nyanSendMail
+強力なメール送信機能を備えています。CC/BCC、添付ファイルもサポートしています。
+
+```javascript
+let to = ["sample@exsample.com"];
+let subject = "Test Email from Nyan8";
+let body = "This is a test email sent from Nyan8.";
+let attachments = [
+  {
+    filename: "test.txt",
+    content: "Hello, this is a test file."
+  }];
+let result = nyanSendMail(to, subject, body, attachments);
+console.log(result);
+```
+
+#### 引数
+| 引数         | 型          | 説明                                      |
+|--------------|-------------|-----------------------------------------|
+| to           | Array       | 宛先メールアドレスの配列                         |
+| subject      | String      | メール件名                                   |
+| body         | String      | メール本文                                   |
+| attachments  | Array       | 添付ファイルの配列。各要素はオブジェクトで、`filename` と `content` を含む。 |
+| cc           | Array       | CC 宛先メールアドレスの配列（省略可）               |
+| bcc          | Array       | BCC 宛先メールアドレスの配列（省略可）              |
+| isHtml       | Boolean     | true で HTML メールとして送信（省略可、デフォルト false） |
+| fromEmail    | String      | 送信元メールアドレス（省略可、config.json の設定が優先）   |
+| fromName     | String      | 送信元名（省略可、config.json の設定が優先）         |
+| replyTo      | String      | 返信先メールアドレス（省略可）                     |
+| replyToName  | String      | 返信先名（省略可）                           |
+   
+#### 戻り値
+成功時：`{ success: true, message: "Email sent successfully." }`
+失敗時：`{ success: false, message: "Error message." }`
+
+### 4‑13 ファイル→Base64 変換 nyanFileToBase64
+指定したファイルを Base64 文字列に変換します。
+
+```javascript
+let base64Str = nyanFileToBase64("./image.png");
+   
+if (base64Str !== null) {
+  console.log("Base64 String:", base64Str);
+} else {
+  console.log("File not found.");
+}
+```
+
+### 4‑14 ファイル保存 nyanSaveFile  
+指定した Base64 文字列をデコードしてファイルに保存します。
+
+```javascript
+let b64 = "SGVsbG8sIFdvcmxkIQ=="; // "Hello, World!" の Base64
+nyanSaveFile(b64, "./storage/hello.txt");
+```
+
+### 5  API エンドポイント
+#### `GET /nyan`
+サーバの基本情報と利用可能な API 一覧を取得します。
+**レスポンス例**
+```json
+{
+  "name": "Nyan8 Server",
+  "profile": "dev",
+  "version": "1.0.0",
+  "apis": {
+    "add": { "description": "2 に足す API" },
+    "add_push": { "description": "add の結果を push 配信" }
+  }
+}
+```
+#### `GET /nyan/{API名}`
+指定した API の詳細情報（説明、受け入れ可能パラメータ、出力カラム）を取得します。
+**レスポンス例**
+```json
+{
+  "api": "add",
+  "description": "2 に足す API",
+  "nyanAcceptedParams": { "num": "数値" },
+  "nyanOutputColumns": ["result"]
+}
+```
 ---
+## 6  レスポンス形式
+### 成功時
 
-## 7  API サーバー情報取得
+```json
+{
+  "success": true,
+  "status": 200,
+  "result": [...]
+}
+```
+### エラー時
 
-* **サーバー全体** : `GET /nyan`
-* **個別 API**    : `GET /nyan/<API 名>`
+```json
+{
+  "success": false,
+  "status": 400,
+  "error": "Error message"
+}
+```
 
----
+---   
+## 7  ライセンス
+[MIT License](LICENSE.md)
 
-## 8  予約語
-
-`api`, `nyan` で始まるキー・パスは **予約語** として扱われます。パラメータ名や API 名に使用しないでください。
-
----
-
-## 9  ライセンス
-
-本プロジェクトは **MIT License** で配布されています。詳細は [`LICENSE.md`](LICENSE.md) をご覧ください。
-
----
-
-# メール送信 & Base64 ユーティリティ利用ガイド
-
-*(以下、既存のガイドを再掲しています。必要に応じて省略・別ファイル化してください)*
 

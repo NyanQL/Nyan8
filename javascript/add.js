@@ -14,6 +14,13 @@ function main(){
     console.log("nyanSetCookie:" + typeof nyanSetCookie);
     console.log("nyanGetCookie:" + typeof nyanGetCookie);
     //console.log("nyanHostExec result:" , nyanHostExec("echo 'test'; "));
+    console.log(nyanAllParams);
+    console.log(nyanGetRemoteIP());
+    console.log(nyanGetUserAgent());
+    console.log(nyanGetRequestHeaders());
+    const fileText = nyanGetFile("./api.json");
+    console.log(fileText);
+
 
     if (isDecimalNumber(nyanAllParams.addNumber)) {
         let result = parseFloat(2) + parseFloat(nyanAllParams.addNumber);

@@ -2,10 +2,6 @@
 function main(){
 
     let name = "Nyan8";
-    console.log(nyanAllParams);
-    console.log(nyanGetRemoteIP());
-    console.log(nyanGetUserAgent());
-    console.log(nyanGetRequestHeaders());
     if(typeof nyanAllParams.name !== "undefined")
     {
         name = nyanAllParams.name;
