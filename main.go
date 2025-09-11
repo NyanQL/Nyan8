@@ -12,7 +12,8 @@ import (
 	"log"
 	"mime"
 	"mime/multipart"
-     "net"
+    "net"
+    "net/url"
 	"net/http"
 	"net/smtp"
 	"net/textproto"
@@ -1048,6 +1049,50 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		return vm.ToValue(result)
 	})
 
+	vm.Set("nyanPostAPI", func(call goja.FunctionCall) goja.Value {
+        if len(call.Arguments) < 2 {
+            panic(vm.ToValue("nyanPostAPI: need at least 2 arguments: url, params [, user, pass, headers]"))
+        }
+
+        urlStr := call.Argument(0).String()
+
+        // 第2引数: params（オブジェクト）
+        params := map[string]string{}
+        if m, ok := call.Argument(1).Export().(map[string]interface{}); ok {
+            for k, v := range m {
+                params[k] = fmt.Sprint(v)
+            }
+        } else {
+            panic(vm.ToValue("nyanPostAPI: params must be an object"))
+        }
+
+        // Basic認証用の user, pass（省略可能）
+        user, pass := "", ""
+        if len(call.Arguments) >= 3 {
+            user = call.Argument(2).String()
+        }
+        if len(call.Arguments) >= 4 {
+            pass = call.Argument(3).String()
+        }
+
+        // 追加ヘッダ（省略可能）
+        headers := map[string]string{}
+        if len(call.Arguments) >= 5 {
+            if hm, ok := call.Argument(4).Export().(map[string]interface{}); ok {
+                for k, v := range hm {
+                    headers[k] = fmt.Sprint(v)
+                }
+            }
+        }
+
+        res, err := nyanPostAPI(urlStr, params, user, pass, headers)
+        if err != nil {
+            panic(vm.ToValue(err.Error()))
+        }
+        return vm.ToValue(res)
+    })
+
+
 	vm.Set("nyanGetCookie", func(name string) string {
 		if ginCtx == nil {
 			return ""
@@ -1768,3 +1813,43 @@ func getClientIP(r *http.Request) string {
     // フォールバック
     return r.RemoteAddr
 }
+
+// フォームPOST（application/x-www-form-urlencoded）を行う関数
+func nyanPostAPI(urlStr string, params map[string]string, username, password string, headers map[string]string) (string, error) {
+    form := url.Values{}
+    for k, v := range params {
+        form.Set(k, v)
+    }
+
+    req, err := http.NewRequest("POST", urlStr, strings.NewReader(form.Encode()))
+    if err != nil {
+        return "", fmt.Errorf("error creating request: %v", err)
+    }
+
+    // Content-Type は form-urlencoded
+    req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+    // 追加ヘッダ
+    for k, v := range headers {
+        req.Header.Set(k, v)
+    }
+
+    // Basic認証（id が指定されているときだけ）
+    if username != "" {
+        req.SetBasicAuth(username, password)
+    }
+
+    client := &http.Client{}
+    resp, err := client.Do(req)
+    if err != nil {
+        return "", fmt.Errorf("error sending request: %v", err)
+    }
+    defer resp.Body.Close()
+
+    body, err := ioutil.ReadAll(resp.Body)
+    if err != nil {
+        return "", fmt.Errorf("error reading response: %v", err)
+    }
+    return string(body), nil
+}
+
