@@ -19,8 +19,10 @@ function main(){
     console.log(nyanGetUserAgent());
     console.log(nyanGetRequestHeaders());
     const fileText = nyanGetFile("./api.json");
-    console.log(fileText);
-
+    //console.log(fileText);
+    //自分自身を呼ぶとループするので注意
+    console.log("post:" + nyanPostAPI('http://localhost:8889/', {api: "hello"}));
+    console.log("get:" + nyanGetAPI('http://localhost:8889/hello'));
 
     if (isDecimalNumber(nyanAllParams.addNumber)) {
         let result = parseFloat(2) + parseFloat(nyanAllParams.addNumber);

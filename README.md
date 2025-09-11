@@ -104,13 +104,13 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 
 ## 4   Javascript 上で実行可能な関数と概要
 
-| -  | 関数                                | 概要                                |
-|----|-----------------------------------|-----------------------------------|
-| 1  | `nyanAllParams`                   | GET/POST/JSON 受信パラメータをまとめたオブジェクト  |
+| -  | 関数                                    | 概要                                |
+|----|---------------------------------------|-----------------------------------|
+| 1  | `nyanAllParams`                       | GET/POST/JSON 受信パラメータをまとめたオブジェクト  |
 | 2  | `console.log()`                       | ログファイル もしくは コンソールへ出力              |
 | 3  | `nyanGetCookie()` / `nyanSetCookie()` | Cookie 操作                         |
 | 4  | `nyanGetItem()` / `nyanSetItem()`     | メモリ内 key‑value ストレージ              |
-| 5  | `nyanGetAPI()`                        | HTTP GET                          |
+| 5  | `nyanGetAPI()` / `nyanPostAPI()`      | HTTP GET  / HTTP POST             |
 | 6  | `nyanJsonAPI()`                       | HTTP POST（JSON）                   |
 | 7  | `nyanHostExec()`                      | ホスト OS でシェル実行し結果取得                |
 | 8  | `nyanGetFile()`                       | サーバー上のファイルを読み込み ファイルが存在しない場合はnull |
@@ -156,13 +156,14 @@ console.log("my_key:", val);
 nyanSetItem("my_key", "hello");
 ```
 ### 4‑5 外部APIの呼び出し nyanGetAPI
-nyanGetAPI と nyanJsonAPI は外部 API を呼び出すためのユーティリティです。
+nyanGetAPI とnyanPostAPI と nyanJsonAPI は外部 API を呼び出すためのユーティリティです。
 idとpassはBASIC認証用のIDとパスワードです。必要に応じて設定してください。
 
 ```javascript
 // (1) ヘッダー無しのリクエストの場合
 let res = nyanGetApi(
-  "https://example.com/api",
+  "https://example.com/api", 
+        {key: "value"},
   "id",
   "pass"
 );
@@ -172,12 +173,40 @@ let obj = JSON.parse(res);
 // (2) ヘッダー付きのリクエストの場合
 let res = nyanGetApi(
   "https://example.com/api",
+        {key: "value"},
   "id",
   "pass",
   {
     "X-Custom-Token": "abcd1234",
     "Content-Language": "ja"
   }
+);
+
+let obj = JSON.parse(res);
+```
+
+nyanPostAPI も同様に使えます。
+```javascript
+// (1) ヘッダー無しのリクエストの場合
+let res = nyanPostApi(
+        "https://example.com/",
+        {key: "value"},
+        "id",
+        "pass"
+);
+
+let obj = JSON.parse(res);
+
+// (2) ヘッダー付きのリクエストの場合
+let res = nyanPostApi(
+        "https://example.com/api",
+        {key: "value"},
+        "id",
+        "pass",
+        {
+           "X-Custom-Token": "abcd1234",
+           "Content-Language": "ja"
+        }
 );
 
 let obj = JSON.parse(res);
