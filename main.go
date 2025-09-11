@@ -1112,7 +1112,7 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		return vm.ToValue(m)
 	})
 
-	vm.Set("nyanGetFile", newNyanGetFile(vm))
+	vm.Set("nyanGetFile",  nyanGetFile(vm))
 
 	/* ===============================================================
 	   nyanSendMail
@@ -1386,7 +1386,7 @@ func execCommand(commandLine string) (*ExecResult, error) {
 	return result, nil
 }
 
-func newNyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
+func nyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		// 引数のチェック
 		if len(call.Arguments) < 1 {
