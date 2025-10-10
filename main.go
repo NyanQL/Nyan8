@@ -1,29 +1,11 @@
 package main
 
 import (
-
 	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
-	"io/ioutil"
-	"log"
-	"mime"
-	"mime/multipart"
-    "net"
-    "net/url"
-	"net/http"
-	"net/smtp"
-	"net/textproto"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
-	"runtime"
-	"strings"
-	"sync"
 	"github.com/dop251/goja"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -32,6 +14,23 @@ import (
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
+	"io"
+	"io/ioutil"
+	"log"
+	"mime"
+	"mime/multipart"
+	"net"
+	"net/http"
+	"net/smtp"
+	"net/textproto"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
+	"sync"
 )
 
 
@@ -189,6 +188,8 @@ func main() {
 	})
 
 	r.POST("/nyan-rpc", handleJSONRPC)
+	r.Any("/nyan-toolbox", handleNyanToolbox)
+	r.Any("/nyan-toolbox/:toolName", handleNyanToolboxDetail)
 	r.Any("/nyan", handleNyan)
 	r.Any("/nyan/:apiName", handleNyanDetail)
 	r.Any("/", handleRequest) // HTTPとWebSocketリクエストを同じエンドポイントで処理
@@ -1853,3 +1854,105 @@ func nyanPostAPI(urlStr string, params map[string]string, username, password str
     return string(body), nil
 }
 
+// ==========================================================
+// /nyan-toolbox : Toolbox 一覧
+// ==========================================================
+func handleNyanToolbox(c *gin.Context) {
+	// 作業ディレクトリの取得
+	execDir, err := os.Getwd()
+	if err != nil {
+		respondWithError(c, http.StatusInternalServerError, "Failed to get working directory", err)
+		return
+	}
+
+	// api.json を読み込み
+	apiJsonPath := filepath.Join(execDir, "api.json")
+	apiConf, err := loadJSONFile(apiJsonPath)
+	if err != nil {
+		respondWithError(c, http.StatusInternalServerError, "Failed to load API configuration", err)
+		return
+	}
+
+	tools := map[string]interface{}{}
+	for name, raw := range apiConf {
+		api := raw.(map[string]interface{})
+		desc, _ := api["description"].(string)
+		tools[name] = map[string]interface{}{
+			"description": desc,
+			"kind":        "js",
+		}
+	}
+
+	toolbox := map[string]interface{}{
+		"name":    globalConfig.Name + " Toolbox",
+		"profile": globalConfig.Profile,
+		"version": globalConfig.Version,
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"toolbox": toolbox,
+		"tools":   tools,
+	})
+}
+
+// ==========================================================
+// /nyan-toolbox/:toolName : Toolbox詳細
+// ==========================================================
+func handleNyanToolboxDetail(c *gin.Context) {
+	toolName := c.Param("toolName")
+	if toolName == "" {
+		respondWithError(c, http.StatusBadRequest, "No tool name provided", nil)
+		return
+	}
+
+	// /nyan/:apiName と同じ情報を利用
+	execDir, err := os.Getwd()
+	if err != nil {
+		respondWithError(c, http.StatusInternalServerError, "Failed to get working directory", err)
+		return
+	}
+
+	apiJsonPath := filepath.Join(execDir, "api.json")
+	apiConf, err := loadJSONFile(apiJsonPath)
+	if err != nil {
+		respondWithError(c, http.StatusInternalServerError, "Failed to load API configuration", err)
+		return
+	}
+
+	apiDataRaw, exists := apiConf[toolName]
+	if !exists {
+		respondWithError(c, http.StatusNotFound, fmt.Sprintf("Tool not found: %s", toolName), nil)
+		return
+	}
+
+	apiData, ok := apiDataRaw.(map[string]interface{})
+	if !ok {
+		respondWithError(c, http.StatusInternalServerError, "Invalid API data format in api.json", nil)
+		return
+	}
+
+	description, _ := apiData["description"].(string)
+	scriptPath, _ := apiData["script"].(string)
+
+	nyanAcceptedParams := map[string]interface{}{}
+	nyanOutputColumns := []interface{}{}
+
+	if scriptPath != "" {
+		fullScriptPath := filepath.Join(execDir, scriptPath)
+		scriptContent, err := ioutil.ReadFile(fullScriptPath)
+		if err == nil {
+			nyanAcceptedParams = parseConstObject(scriptContent, "nyanAcceptedParams")
+			nyanOutputColumns = parseConstArray(scriptContent, "nyanOutputColumns")
+		}
+	}
+
+	tool := map[string]interface{}{
+		"tool":        toolName,
+		"description": description,
+		"kind":        "js",
+		"parameters":  nyanAcceptedParams,  // ← ここでサンプル値そのまま
+		"outputs":     nyanOutputColumns,   // ← resultで返るキー名一覧
+	}
+
+	c.JSON(http.StatusOK, tool)
+}
