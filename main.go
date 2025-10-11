@@ -39,7 +39,7 @@ func main() {
 	r.GET("/nyan-toolbox/:toolName", handleNyanToolboxDetail)
 	r.POST("/nyan-toolbox/:toolName", handleNyanToolboxExecute)
 
-	r.Run(":8889") // ポートはconfig.jsonから取得してもOK
+	r.Run(fmt.Sprintf(":%d", config.Port))
 }
 
 /*
