@@ -271,3 +271,25 @@ func handleNyanToolboxDetail(c *gin.Context) {
 		"kind":        "js",
 	})
 }
+
+func handleNyanDetail(c *gin.Context) {
+}
+
+// /nyan-toolbox ハンドラ（一覧）
+func handleNyanToolboxList(c *gin.Context) {
+	apiData, _ := loadJSONFile("api.json")
+	tools := []gin.H{}
+	for name, v := range apiData {
+		item := gin.H{"tool": name}
+		if m, ok := v.(map[string]interface{}); ok {
+			if desc, ok := m["description"].(string); ok {
+				item["description"] = desc
+			}
+		}
+		item["kind"] = "js"
+		tools = append(tools, item)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"tools": tools,
+	})
+}
