@@ -188,9 +188,9 @@ func main() {
 	})
 
 	r.POST("/nyan-rpc", handleJSONRPC)
-	r.GET("/nyan-toolbox/", handleNyanToolboxList)
-	r.GET("/nyan-toolbox/:apiName", handleNyanToolbox)
-	r.POST("/nyan-toolbox/:apiName", handleNyanToolbox)
+	r.GET("/nyan-toolbox", handleNyanToolbox)
+	r.GET("/nyan-toolbox/:apiName", handleNyanToolboxDetail)
+	r.POST("/nyan-toolbox/:apiName", handleNyanToolboxExecute)
 	r.Any("/nyan", handleNyan)
 	r.Any("/nyan/:apiName", handleNyanDetail)
 	r.Any("/", handleRequest) // HTTPとWebSocketリクエストを同じエンドポイントで処理
@@ -729,12 +729,18 @@ func initLogger(execDir string) {
 
 // エラーレスポンス
 func respondWithError(c *gin.Context, status int, errMsg string, err error) {
+	payload := gin.H{
+		"error": errMsg,
+	}
 	if err != nil {
+		// ログには詳細も出す
 		logger.Printf("ERROR: %s - %v", errMsg, err)
+		// クライアントにも詳細文字列を返す（原因の可視化）
+		payload["detail"] = err.Error()
 	} else {
 		logger.Printf("ERROR: %s", errMsg)
 	}
-	c.JSON(status, gin.H{"error": errMsg})
+	c.JSON(status, payload)
 }
 
 // リカバリーミドルウェア
@@ -751,55 +757,65 @@ func RecoveryMiddleware() gin.HandlerFunc {
 }
 
 // registerDynamicEndpoints は api.json の内容に基づいてルート直下のエンドポイントを登録する関数です。
+// registerDynamicEndpoints は api.json の内容に基づいてルート直下のエンドポイントを登録する関数です。
 func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
-	// api.json を読み込み（例: map[string]interface{} とする）
 	apiConf, err := loadJSONFile(filepath.Join(execDir, "api.json"))
 	if err != nil {
 		return fmt.Errorf("failed to load api.json: %v", err)
 	}
 
-	// api.json の各キーをエンドポイント名とする
+	// 予約パスは動的登録しない（固定ハンドラを優先させる）
+	reserved := map[string]struct{}{
+		"nyan":         {},
+		"nyan-rpc":     {},
+		"nyan-toolbox": {},
+	}
+
 	for apiName := range apiConf {
-		currentAPIName := apiName // ローカル変数にコピー（クロージャ用）
-		// ルーティング登録。currentAPIName の値をクロージャでキャプチャ
+		// 予約パスのスキップ（念のため "nyan-" プレフィックスも抑止）
+		if _, ok := reserved[apiName]; ok || strings.HasPrefix(apiName, "nyan-") {
+			continue
+		}
+
+		currentAPIName := apiName // クロージャ用に退避
 		r.Any("/"+currentAPIName, func(c *gin.Context) {
-			// WebSocket のアップグレードリクエストかどうかをチェック
+			// WebSocket アップグレードなら WebSocket ハンドラへ
 			if websocket.IsWebSocketUpgrade(c.Request) {
-				// WebSocket 用のハンドラーに処理を委譲する
 				handleWebSocket(c)
 				return
 			}
-			// URLからエンドポイント名を取得。ここでは、リクエストされたパス（"/foo" 等）から先頭の "/" を除いたものを使用
-			endpoint := c.FullPath()[1:]
-			if endpoint == "" {
-				endpoint = currentAPIName
-			}
+
 			// リクエストパラメータのマージ
 			allParams := make(map[string]interface{})
-			// URLクエリパラメータの収集
+			// URLクエリ
 			for key, values := range c.Request.URL.Query() {
 				allParams[key] = values[0]
 			}
-			// POSTフォームの収集
+			// POSTフォーム
 			for key, values := range c.Request.PostForm {
 				allParams[key] = values[0]
 			}
-			// JSON ボディがあれば収集
+			// JSONボディ
 			if c.ContentType() == "application/json" {
 				var jsonBody map[string]interface{}
 				if err := c.BindJSON(&jsonBody); err == nil {
-					for key, value := range jsonBody {
-						allParams[key] = value
+					for k, v := range jsonBody {
+						allParams[k] = v
 					}
 				} else {
 					respondWithError(c, http.StatusBadRequest, "Invalid JSON data", err)
 					return
 				}
 			}
-			// エンドポイント名を "api" パラメータとしてセット
+
+			// エンドポイント名を "api" にセット
+			endpoint := c.FullPath()[1:]
+			if endpoint == "" {
+				endpoint = currentAPIName
+			}
 			allParams["api"] = endpoint
 
-			// api.json から対象のスクリプト情報を取得
+			// api.json から対象スクリプトを取得
 			scriptListData, err := loadJSONFile(filepath.Join(execDir, "api.json"))
 			if err != nil {
 				respondWithError(c, http.StatusInternalServerError, "Failed to load API configuration", err)
@@ -815,15 +831,16 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 				respondWithError(c, http.StatusBadRequest, fmt.Sprintf("Script path not found for key: %s", endpoint), nil)
 				return
 			}
-			// 絶対パスに変換
-			scriptPath = filepath.Join(execDir, scriptPath)
-			// JavaScript を実行
-			result, err := runJavaScript(scriptPath, allParams, c)
+
+			// 実行
+			fullScriptPath := filepath.Join(execDir, scriptPath)
+			result, err := runJavaScript(fullScriptPath, allParams, c)
 			if err != nil {
 				respondWithError(c, http.StatusInternalServerError, "Failed to run JavaScript", err)
 				return
 			}
-			// 結果を JSON としてレスポンス用にパース
+
+			// 結果のパースと返却
 			var jsonData map[string]interface{}
 			if err := json.Unmarshal([]byte(result), &jsonData); err != nil {
 				respondWithError(c, http.StatusInternalServerError, "Failed to parse JavaScript response", err)
@@ -835,6 +852,7 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 				return
 			}
 
+			// push 処理
 			performPush(scriptInfo, scriptListData, allParams, execDir)
 
 			c.JSON(int(status), jsonData)
@@ -842,6 +860,7 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 	}
 	return nil
 }
+
 
 // performPush は、API 設定とパラメータを元に push 対象の WebSocket 接続へメッセージを送信します。
 func performPush(scriptInfo map[string]interface{}, scriptListData map[string]interface{}, allParams map[string]interface{}, execDir string) {
@@ -1771,4 +1790,290 @@ func getClientIP(r *http.Request) string {
 	// フォールバック
 	return r.RemoteAddr
 }
+
+// ========================================
+// /nyan-toolbox
+// ========================================
+
+// ========================================
+// /nyan-toolbox : MCP互換ツール一覧エンドポイント
+// ========================================
+func handleNyanToolbox(c *gin.Context) {
+	execDir, err := os.Getwd()
+	if err != nil {
+		respondWithError(c, http.StatusInternalServerError, "Failed to get working directory", err)
+		return
+	}
+
+	// api.jsonを読み込み
+	apiJsonPath := filepath.Join(execDir, "api.json")
+	apiConf, err := loadJSONFile(apiJsonPath)
+	if err != nil {
+		respondWithError(c, http.StatusInternalServerError, "Failed to load api.json", err)
+		return
+	}
+
+	var tools []map[string]interface{}
+
+	for name, raw := range apiConf {
+		api, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		description, _ := api["description"].(string)
+		scriptPath, _ := api["script"].(string)
+
+		// デフォルトの input_schema（空定義）
+		inputSchema := map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{},
+			"required":   []string{},
+		}
+
+		// JavaScript から const nyanAcceptedParams を抽出して input_schema を推定
+		if scriptPath != "" {
+			fullScriptPath := filepath.Join(execDir, scriptPath)
+			if scriptContent, err := os.ReadFile(fullScriptPath); err == nil {
+				params := parseConstObject(scriptContent, "nyanAcceptedParams")
+				if len(params) > 0 {
+					props := map[string]interface{}{}
+					required := []string{}
+					for key, val := range params {
+						// 型推定（JSON解釈の都合で数値は float64 になりがち）
+						t := "string"
+						switch val.(type) {
+						case float64, int, int64:
+							t = "number"
+						case bool:
+							t = "boolean"
+						}
+						props[key] = map[string]interface{}{
+							"type":        t,
+							"description": fmt.Sprintf("Parameter: %s", key),
+						}
+						required = append(required, key)
+					}
+					inputSchema["properties"] = props
+					inputSchema["required"] = required
+				}
+			}
+		}
+
+		tools = append(tools, map[string]interface{}{
+			"name":         name,
+			"description":  description,
+			"input_schema": inputSchema,
+		})
+	}
+
+	// ★MCPのtools配列形式で返す（/nyan の形式は一切混ぜない）
+	c.JSON(http.StatusOK, gin.H{"tools": tools})
+}
+
+// ========================================
+// /nyan-toolbox/:apiName (GET) : ツール詳細
+// ========================================
+func handleNyanToolboxDetail(c *gin.Context) {
+	apiName := c.Param("apiName")
+	if apiName == "" {
+		respondWithError(c, http.StatusBadRequest, "No apiName provided", nil)
+		return
+	}
+
+	execDir, err := os.Getwd()
+	if err != nil {
+		respondWithError(c, http.StatusInternalServerError, "Failed to get working directory", err)
+		return
+	}
+
+	// api.json を読み込み
+	apiJsonPath := filepath.Join(execDir, "api.json")
+	apiConf, err := loadJSONFile(apiJsonPath)
+	if err != nil {
+		respondWithError(c, http.StatusInternalServerError, "Failed to load api.json", err)
+		return
+	}
+
+	raw, ok := apiConf[apiName]
+	if !ok {
+		respondWithError(c, http.StatusNotFound, fmt.Sprintf("API not found: %s", apiName), nil)
+		return
+	}
+	api, ok := raw.(map[string]interface{})
+	if !ok {
+		respondWithError(c, http.StatusInternalServerError, "Invalid API data format", nil)
+		return
+	}
+
+	description, _ := api["description"].(string)
+	scriptPath, _ := api["script"].(string)
+
+	// input_schema の推定
+	inputSchema := map[string]interface{}{
+		"type":       "object",
+		"properties": map[string]interface{}{},
+		"required":   []string{},
+	}
+	if scriptPath != "" {
+		fullScriptPath := filepath.Join(execDir, scriptPath)
+		if scriptContent, err := os.ReadFile(fullScriptPath); err == nil {
+			params := parseConstObject(scriptContent, "nyanAcceptedParams")
+			if len(params) > 0 {
+				props := map[string]interface{}{}
+				required := []string{}
+				for key, val := range params {
+					t := "string"
+					switch val.(type) {
+					case float64, int, int64:
+						t = "number"
+					case bool:
+						t = "boolean"
+					}
+					props[key] = map[string]interface{}{
+						"type":        t,
+						"description": fmt.Sprintf("Parameter: %s", key),
+					}
+					required = append(required, key)
+				}
+				inputSchema["properties"] = props
+				inputSchema["required"] = required
+			}
+		}
+	}
+
+	// MCPの単一ツール定義に準じた返し方（name/description/input_schema）
+	c.JSON(http.StatusOK, gin.H{
+		"name":         apiName,
+		"description":  description,
+		"input_schema": inputSchema,
+	})
+}
+
+// ========================================
+// /nyan-toolbox/:apiName (POST) : ツール実行
+// ========================================
+func handleNyanToolboxExecute(c *gin.Context) {
+	apiName := c.Param("apiName")
+	if apiName == "" {
+		respondWithError(c, http.StatusBadRequest, "No apiName provided", nil)
+		return
+	}
+
+	execDir, err := os.Getwd()
+	if err != nil {
+		respondWithError(c, http.StatusInternalServerError, "Failed to get working directory", err)
+		return
+	}
+
+	// api.json を読み込み
+	apiJsonPath := filepath.Join(execDir, "api.json")
+	apiConf, err := loadJSONFile(apiJsonPath)
+	if err != nil {
+		respondWithError(c, http.StatusInternalServerError, "Failed to load api.json", err)
+		return
+	}
+
+	// 対象APIのスクリプト情報
+	raw, ok := apiConf[apiName]
+	if !ok {
+		respondWithError(c, http.StatusNotFound, fmt.Sprintf("API not found: %s", apiName), nil)
+		return
+	}
+	api, ok := raw.(map[string]interface{})
+	if !ok {
+		respondWithError(c, http.StatusInternalServerError, "Invalid API data format", nil)
+		return
+	}
+
+	scriptPath, _ := api["script"].(string)
+	if scriptPath == "" {
+		respondWithError(c, http.StatusBadRequest, fmt.Sprintf("Script path not found for %s", apiName), nil)
+		return
+	}
+	fullScriptPath := filepath.Join(execDir, scriptPath)
+
+	// ---- 既存エンドポイントと同等のパラメータ統合 ----
+	allParams := make(map[string]interface{})
+
+	// URLクエリ
+	for key, values := range c.Request.URL.Query() {
+		if len(values) > 0 {
+			allParams[key] = values[0]
+		}
+	}
+
+	// POSTフォーム（application/x-www-form-urlencoded の場合）
+	if c.Request.Method == http.MethodPost && strings.HasPrefix(c.ContentType(), "application/x-www-form-urlencoded") {
+		if err := c.Request.ParseForm(); err == nil {
+			for key, values := range c.Request.PostForm {
+				if len(values) > 0 {
+					allParams[key] = values[0]
+				}
+			}
+		}
+	}
+
+	// JSON ボディ（application/json の場合）
+	if strings.HasPrefix(c.ContentType(), "application/json") {
+		var bodyParams map[string]interface{}
+		if err := c.ShouldBindJSON(&bodyParams); err != nil {
+			respondWithError(c, http.StatusBadRequest, "Invalid JSON body", err)
+			return
+		}
+		for k, v := range bodyParams {
+			allParams[k] = v
+		}
+	}
+
+	// 一部スクリプトが参照するメタ情報を付与（WS処理に合わせる）
+	allParams["_remote_ip"] = getClientIP(c.Request)
+	allParams["_user_agent"] = c.Request.UserAgent()
+	hdrs := map[string]string{}
+	for k, v := range c.Request.Header {
+		hdrs[k] = strings.Join(v, ",")
+	}
+	allParams["_headers"] = hdrs
+
+	// 既存ロジックが参照する "api" を付与（ツール名を入れる）
+	allParams["api"] = apiName
+
+	// 実行
+	resultStr, err := runJavaScript(fullScriptPath, allParams, c)
+	if err != nil {
+		respondWithError(c, http.StatusInternalServerError, "Failed to run JavaScript", err)
+		return
+	}
+
+	// 返却JSONをパース
+	var jsResult map[string]interface{}
+	if err := json.Unmarshal([]byte(resultStr), &jsResult); err != nil {
+		respondWithError(c, http.StatusInternalServerError, "Failed to parse script response", err)
+		return
+	}
+
+	// ステータスを抽出（無ければ200にフォールバック）
+	httpStatus := http.StatusOK
+	if s, ok := jsResult["status"].(float64); ok {
+		httpStatus = int(s)
+	}
+
+	// 必要に応じて push を発火
+	performPush(api, apiConf, allParams, execDir)
+
+	// ツール呼び出しのラップ結果で返す（MCP想定）
+	description, _ := api["description"].(string)
+	c.JSON(httpStatus, gin.H{
+		"success": true,
+		"status":  httpStatus,
+		"result": gin.H{
+			"tool":        apiName,
+			"input":       allParams,   // 実際にJSへ渡した入力（デバッグに有用）
+			"output":      jsResult,    // JSの返却そのまま
+			"description": description,
+		},
+	})
+}
+
+
 
