@@ -9,7 +9,7 @@ require (
 	github.com/gin-gonic/gin v1.9.1
 	github.com/gorilla/websocket v1.5.3
 	github.com/natefinch/lumberjack v2.0.0+incompatible
-	golang.org/x/net v0.21.0
+	golang.org/x/net v0.38.0
 	golang.org/x/text v0.23.0
 )
 
