@@ -1863,7 +1863,7 @@ func handleNyanToolbox(c *gin.Context) {
 		tools = append(tools, map[string]interface{}{
 			"name":         name,
 			"description":  description,
-			"input_schema": inputSchema,
+			"inputSchema": inputSchema,
 		})
 	}
 
