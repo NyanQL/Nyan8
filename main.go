@@ -211,6 +211,11 @@ func main() {
 	r.GET("/nyan-toolbox", handleMCPGet)     // SSEしない場合は 405
 	r.DELETE("/nyan-toolbox", handleMCPDeleteSession) // 任意: セッション明示終了
 
+	//mcp
+	r.POST("/mcp", handleMCP)
+	r.GET("/mcp", handleMCPGet)                 // 405 を返すだけ
+	r.DELETE("/mcp", handleMCPDeleteSession)    // セッション明示終了
+
 	r.Any("/nyan", handleNyan)
 	r.Any("/nyan/:apiName", handleNyanDetail)
 	r.Any("/", handleRequest) // HTTPとWebSocketリクエストを同じエンドポイントで処理
