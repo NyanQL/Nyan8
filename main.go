@@ -4,6 +4,7 @@ import (
 
 	"bytes"
 	"crypto/tls"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -32,6 +33,7 @@ import (
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
+	"time"
 )
 
 
@@ -120,6 +122,21 @@ type MailAttachment struct {
 	Data        []byte
 }
 
+type rpcReq struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      any             `json:"id,omitempty"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+
+var (
+	supportedProto = map[string]bool{"2025-06-18": true, "2025-03-26": true}
+	sessions sync.Map // sid -> struct{created time.Time}
+)
+const defaultProto = "2025-03-26"
+
+
 
 // config格納場所
 var globalConfig Config
@@ -190,9 +207,10 @@ func main() {
 	})
 
 	r.POST("/nyan-rpc", handleJSONRPC)
-	r.GET("/nyan-toolbox", handleNyanToolbox)
-	r.GET("/nyan-toolbox/:apiName", handleNyanToolboxDetail)
-	r.POST("/nyan-toolbox/:apiName", handleNyanToolboxExecute)
+	r.POST("/nyan-toolbox", handleMCP)      // JSON-RPC 全メソッド
+	r.GET("/nyan-toolbox", handleMCPGet)     // SSEしない場合は 405
+	r.DELETE("/nyan-toolbox", handleMCPDeleteSession) // 任意: セッション明示終了
+
 	r.Any("/nyan", handleNyan)
 	r.Any("/nyan/:apiName", handleNyanDetail)
 	r.Any("/", handleRequest) // HTTPとWebSocketリクエストを同じエンドポイントで処理
@@ -1866,64 +1884,191 @@ func getClientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-// ========================================
-// /nyan-toolbox : MCP互換ツール一覧エンドポイント
-// ========================================
-func handleNyanToolbox(c *gin.Context) {
+func handleMCP(c *gin.Context) {
+	// 通知/応答なら 202 を返す規約（必要に応じて判定）
+	var req rpcReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, map[string]any{"error":"bad json"})
+		return
+	}
+
+	// initialize は特別扱い（セッション開始 & プロトコル合意）
+	switch req.Method {
+	case "initialize":
+		// params.protocolVersion を読む
+		var p struct {
+			ProtocolVersion string         `json:"protocolVersion"`
+			Capabilities    map[string]any `json:"capabilities"`
+			ClientInfo      map[string]any `json:"clientInfo"`
+		}
+		_ = json.Unmarshal(req.Params, &p)
+
+		ver := p.ProtocolVersion
+		if !supportedProto[ver] { ver = defaultProto } // 最低限の互換を返す
+
+		// セッション発行（任意だが推奨）
+		sid := generateSecureSessionID()
+		sessions.Store(sid, time.Now())
+		c.Header("Mcp-Session-Id", sid)
+
+		// サーバの capabilities（最低限 tools）
+		res := map[string]any{
+			"protocolVersion": ver,
+			"capabilities": map[string]any{
+				"tools": map[string]any{"listChanged": false},
+			},
+			"serverInfo": map[string]string{
+				"name":    globalConfig.Name,
+				"version": globalConfig.Version,
+			},
+		}
+		c.JSON(http.StatusOK, map[string]any{
+			"jsonrpc":"2.0","id":req.ID,"result":res,
+		})
+		return
+
+	case "notifications/initialized":
+		c.Status(http.StatusAccepted) // 202・ボディ無し
+		return
+
+	case "ping":
+		c.JSON(http.StatusOK, map[string]any{"jsonrpc":"2.0","id":req.ID,"result":map[string]any{}})
+		return
+	}
+
+	// initialize 以外はセッションとプロトコルヘッダを検証
+	sid := c.GetHeader("Mcp-Session-Id")
+	if _, ok := sessions.Load(sid); !ok {
+		c.AbortWithStatus(http.StatusNotFound) // 404 → クライアントは再 initialize
+		return
+	}
+	proto := c.GetHeader("MCP-Protocol-Version")
+	if proto == "" { proto = defaultProto }
+	if !supportedProto[proto] {
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	switch req.Method {
+	case "tools/list":
+		// api.json → Tool 定義（inputSchema は camelCase）
+		result := buildToolsList() // []Tool と nextCursor を返す自前関数
+		c.JSON(http.StatusOK, map[string]any{
+			"jsonrpc":"2.0","id":req.ID,"result":result,
+		})
+		return
+
+	case "tools/call":
+		var p struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		_ = json.Unmarshal(req.Params, &p)
+		// JS 実行
+		out := callJS(p.Name, p.Arguments, c) // 既存 runJavaScript をラップして取得
+		// MCP 形式の結果に整形（最低限 text）
+		c.JSON(http.StatusOK, map[string]any{
+			"jsonrpc":"2.0","id":req.ID,"result": map[string]any{
+				"content": []map[string]any{{"type":"text","text": stringOrJSON(out)}},
+			},
+		})
+		return
+
+	default:
+		c.JSON(http.StatusOK, map[string]any{
+			"jsonrpc":"2.0","id":req.ID,
+			"error": map[string]any{"code":-32601,"message":"Method not found"},
+		})
+		return
+	}
+}
+
+func handleMCPGet(c *gin.Context) {
+	c.AbortWithStatus(http.StatusMethodNotAllowed) // 405
+}
+
+// ===== ここから追加分: MCPヘルパー群 =====
+
+// 暗号学的ランダムで URL セーフなセッションIDを生成
+func generateSecureSessionID() string {
+	b := make([]byte, 32) // 256bit
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Errorf("failed to generate session id: %w", err))
+	}
+	return base64.RawURLEncoding.EncodeToString(b) // パディング無し
+}
+
+// セッションTTL（必要に応じて利用）
+const sessionTTL = 24 * time.Hour
+
+func isSessionAlive(created time.Time) bool {
+	return time.Since(created) < sessionTTL
+}
+
+// DELETE /nyan-toolbox でセッション明示終了
+func handleMCPDeleteSession(c *gin.Context) {
+	sid := c.GetHeader("Mcp-Session-Id")
+	if sid == "" {
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	if _, ok := sessions.Load(sid); ok {
+		sessions.Delete(sid)
+		c.Status(http.StatusNoContent) // 204
+		return
+	}
+	c.AbortWithStatus(http.StatusNotFound)
+}
+
+// tools/list の結果を api.json から構築（MCP 形式）
+func buildToolsList() map[string]any {
 	execDir, err := os.Getwd()
 	if err != nil {
-		respondWithError(c, http.StatusInternalServerError, "Failed to get working directory", err)
-		return
+		return map[string]any{"tools": []any{}, "nextCursor": nil}
 	}
-
-	// api.jsonを読み込み
-	apiJsonPath := filepath.Join(execDir, "api.json")
-	apiConf, err := loadJSONFile(apiJsonPath)
+	apiConfPath := filepath.Join(execDir, "api.json")
+	apiConf, err := loadJSONFile(apiConfPath)
 	if err != nil {
-		respondWithError(c, http.StatusInternalServerError, "Failed to load api.json", err)
-		return
+		return map[string]any{"tools": []any{}, "nextCursor": nil}
 	}
 
-	var tools []map[string]interface{}
-
+	tools := make([]map[string]any, 0, len(apiConf))
 	for name, raw := range apiConf {
-		api, ok := raw.(map[string]interface{})
+		api, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}
-
-		description, _ := api["description"].(string)
+		desc, _ := api["description"].(string)
 		scriptPath, _ := api["script"].(string)
 
-		// デフォルトの input_schema（空定義）
-		inputSchema := map[string]interface{}{
+		// デフォルト schema
+		inputSchema := map[string]any{
 			"type":       "object",
-			"properties": map[string]interface{}{},
+			"properties": map[string]any{},
 			"required":   []string{},
 		}
 
-		// JavaScript から const nyanAcceptedParams を抽出して input_schema を推定
+		// JS 内の const nyanAcceptedParams を Schema 推定に利用
 		if scriptPath != "" {
-			fullScriptPath := filepath.Join(execDir, scriptPath)
-			if scriptContent, err := os.ReadFile(fullScriptPath); err == nil {
+			full := filepath.Join(execDir, scriptPath)
+			if scriptContent, err := os.ReadFile(full); err == nil {
 				params := parseConstObject(scriptContent, "nyanAcceptedParams")
 				if len(params) > 0 {
-					props := map[string]interface{}{}
+					props := map[string]any{}
 					required := []string{}
-					for key, val := range params {
-						// 型推定（JSON解釈の都合で数値は float64 になりがち）
+					for k, v := range params {
 						t := "string"
-						switch val.(type) {
+						switch v.(type) {
 						case float64, int, int64:
 							t = "number"
 						case bool:
 							t = "boolean"
 						}
-						props[key] = map[string]interface{}{
+						props[k] = map[string]any{
 							"type":        t,
-							"description": fmt.Sprintf("Parameter: %s", key),
+							"description": fmt.Sprintf("Parameter: %s", k),
 						}
-						required = append(required, key)
+						required = append(required, k)
 					}
 					inputSchema["properties"] = props
 					inputSchema["required"] = required
@@ -1931,217 +2076,78 @@ func handleNyanToolbox(c *gin.Context) {
 			}
 		}
 
-		tools = append(tools, map[string]interface{}{
-			"name":         name,
-			"description":  description,
-			"inputSchema": inputSchema,
+		tools = append(tools, map[string]any{
+			"name":        name,
+			"description": desc,
+			"inputSchema": inputSchema, // MCP は camelCase
 		})
 	}
 
-	// ★MCPのtools配列形式で返す（/nyan の形式は一切混ぜない）
-	c.JSON(http.StatusOK, gin.H{"tools": tools})
+	return map[string]any{
+		"tools":      tools,
+		"nextCursor": nil,
+	}
 }
 
-// ========================================
-// /nyan-toolbox/:apiName (GET) : ツール詳細
-// ========================================
-func handleNyanToolboxDetail(c *gin.Context) {
-	apiName := c.Param("apiName")
-	if apiName == "" {
-		respondWithError(c, http.StatusBadRequest, "No apiName provided", nil)
-		return
-	}
-
+// tools/call 用: JS 呼び出しの薄いラッパ
+func callJS(toolName string, args map[string]any, c *gin.Context) string {
 	execDir, err := os.Getwd()
 	if err != nil {
-		respondWithError(c, http.StatusInternalServerError, "Failed to get working directory", err)
-		return
+		return `{"status":500,"error":"cwd error"}`
 	}
-
-	// api.json を読み込み
-	apiJsonPath := filepath.Join(execDir, "api.json")
-	apiConf, err := loadJSONFile(apiJsonPath)
+	apiConfPath := filepath.Join(execDir, "api.json")
+	apiConf, err := loadJSONFile(apiConfPath)
 	if err != nil {
-		respondWithError(c, http.StatusInternalServerError, "Failed to load api.json", err)
-		return
+		return `{"status":500,"error":"api.json load error"}`
 	}
 
-	raw, ok := apiConf[apiName]
+	raw, ok := apiConf[toolName]
 	if !ok {
-		respondWithError(c, http.StatusNotFound, fmt.Sprintf("API not found: %s", apiName), nil)
-		return
+		return fmt.Sprintf(`{"status":404,"error":"tool not found: %s"}`, toolName)
 	}
-	api, ok := raw.(map[string]interface{})
+	api, ok := raw.(map[string]any)
 	if !ok {
-		respondWithError(c, http.StatusInternalServerError, "Invalid API data format", nil)
-		return
+		return `{"status":500,"error":"invalid api config"}`
 	}
-
-	description, _ := api["description"].(string)
-	scriptPath, _ := api["script"].(string)
-
-	// input_schema の推定
-	inputSchema := map[string]interface{}{
-		"type":       "object",
-		"properties": map[string]interface{}{},
-		"required":   []string{},
-	}
-	if scriptPath != "" {
-		fullScriptPath := filepath.Join(execDir, scriptPath)
-		if scriptContent, err := os.ReadFile(fullScriptPath); err == nil {
-			params := parseConstObject(scriptContent, "nyanAcceptedParams")
-			if len(params) > 0 {
-				props := map[string]interface{}{}
-				required := []string{}
-				for key, val := range params {
-					t := "string"
-					switch val.(type) {
-					case float64, int, int64:
-						t = "number"
-					case bool:
-						t = "boolean"
-					}
-					props[key] = map[string]interface{}{
-						"type":        t,
-						"description": fmt.Sprintf("Parameter: %s", key),
-					}
-					required = append(required, key)
-				}
-				inputSchema["properties"] = props
-				inputSchema["required"] = required
-			}
-		}
-	}
-
-	// MCPの単一ツール定義に準じた返し方（name/description/input_schema）
-	c.JSON(http.StatusOK, gin.H{
-		"name":         apiName,
-		"description":  description,
-		"input_schema": inputSchema,
-	})
-}
-
-// ========================================
-// /nyan-toolbox/:apiName (POST) : ツール実行
-// ========================================
-func handleNyanToolboxExecute(c *gin.Context) {
-	apiName := c.Param("apiName")
-	if apiName == "" {
-		respondWithError(c, http.StatusBadRequest, "No apiName provided", nil)
-		return
-	}
-
-	execDir, err := os.Getwd()
-	if err != nil {
-		respondWithError(c, http.StatusInternalServerError, "Failed to get working directory", err)
-		return
-	}
-
-	// api.json を読み込み
-	apiJsonPath := filepath.Join(execDir, "api.json")
-	apiConf, err := loadJSONFile(apiJsonPath)
-	if err != nil {
-		respondWithError(c, http.StatusInternalServerError, "Failed to load api.json", err)
-		return
-	}
-
-	// 対象APIのスクリプト情報
-	raw, ok := apiConf[apiName]
-	if !ok {
-		respondWithError(c, http.StatusNotFound, fmt.Sprintf("API not found: %s", apiName), nil)
-		return
-	}
-	api, ok := raw.(map[string]interface{})
-	if !ok {
-		respondWithError(c, http.StatusInternalServerError, "Invalid API data format", nil)
-		return
-	}
-
 	scriptPath, _ := api["script"].(string)
 	if scriptPath == "" {
-		respondWithError(c, http.StatusBadRequest, fmt.Sprintf("Script path not found for %s", apiName), nil)
-		return
+		return `{"status":400,"error":"no script path"}`
 	}
-	fullScriptPath := filepath.Join(execDir, scriptPath)
 
-	// ---- 既存エンドポイントと同等のパラメータ統合 ----
-	allParams := make(map[string]interface{})
+	fullScript := filepath.Join(execDir, scriptPath)
 
-	// URLクエリ
-	for key, values := range c.Request.URL.Query() {
-		if len(values) > 0 {
-			allParams[key] = values[0]
+	// 引数＋メタ情報を準備
+	allParams := map[string]any{}
+	for k, v := range args {
+		allParams[k] = v
+	}
+	allParams["api"] = toolName
+	if c != nil {
+		allParams["_remote_ip"] = getClientIP(c.Request)
+		allParams["_user_agent"] = c.Request.UserAgent()
+		h := map[string]string{}
+		for k, v := range c.Request.Header {
+			h[k] = strings.Join(v, ",")
 		}
+		allParams["_headers"] = h
 	}
 
-	// POSTフォーム（application/x-www-form-urlencoded の場合）
-	if c.Request.Method == http.MethodPost && strings.HasPrefix(c.ContentType(), "application/x-www-form-urlencoded") {
-		if err := c.Request.ParseForm(); err == nil {
-			for key, values := range c.Request.PostForm {
-				if len(values) > 0 {
-					allParams[key] = values[0]
-				}
-			}
-		}
-	}
-
-	// JSON ボディ（application/json の場合）
-	if strings.HasPrefix(c.ContentType(), "application/json") {
-		var bodyParams map[string]interface{}
-		if err := c.ShouldBindJSON(&bodyParams); err != nil {
-			respondWithError(c, http.StatusBadRequest, "Invalid JSON body", err)
-			return
-		}
-		for k, v := range bodyParams {
-			allParams[k] = v
-		}
-	}
-
-	// 一部スクリプトが参照するメタ情報を付与（WS処理に合わせる）
-	allParams["_remote_ip"] = getClientIP(c.Request)
-	allParams["_user_agent"] = c.Request.UserAgent()
-	hdrs := map[string]string{}
-	for k, v := range c.Request.Header {
-		hdrs[k] = strings.Join(v, ",")
-	}
-	allParams["_headers"] = hdrs
-
-	// 既存ロジックが参照する "api" を付与（ツール名を入れる）
-	allParams["api"] = apiName
-
-	// 実行
-	resultStr, err := runJavaScript(fullScriptPath, allParams, c)
+	out, err := runJavaScript(fullScript, allParams, c)
 	if err != nil {
-		respondWithError(c, http.StatusInternalServerError, "Failed to run JavaScript", err)
-		return
+		return fmt.Sprintf(`{"status":500,"error":%q}`, err.Error())
 	}
+	return out
+}
 
-	// 返却JSONをパース
-	var jsResult map[string]interface{}
-	if err := json.Unmarshal([]byte(resultStr), &jsResult); err != nil {
-		respondWithError(c, http.StatusInternalServerError, "Failed to parse script response", err)
-		return
+// text 用に見やすく整形（JSONならインデント）
+func stringOrJSON(s string) string {
+	t := strings.TrimSpace(s)
+	if (strings.HasPrefix(t, "{") && strings.HasSuffix(t, "}")) ||
+		(strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]")) {
+		var buf bytes.Buffer
+		if err := json.Indent(&buf, []byte(t), "", "  "); err == nil {
+			return buf.String()
+		}
 	}
-
-	// ステータスを抽出（無ければ200にフォールバック）
-	httpStatus := http.StatusOK
-	if s, ok := jsResult["status"].(float64); ok {
-		httpStatus = int(s)
-	}
-
-	// 必要に応じて push を発火
-	performPush(api, apiConf, allParams, execDir)
-
-	// ツール呼び出しのラップ結果で返す（MCP想定）
-	description, _ := api["description"].(string)
-	c.JSON(httpStatus, gin.H{
-		"success": true,
-		"status":  httpStatus,
-		"result": gin.H{
-			"tool":        apiName,
-			"input":       allParams,   // 実際にJSへ渡した入力（デバッグに有用）
-			"output":      jsResult,    // JSの返却そのまま
-			"description": description,
-		},
-	})
+	return s
 }
