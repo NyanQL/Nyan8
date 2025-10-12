@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/smtp"
 	"net/textproto"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -164,7 +165,8 @@ func main() {
 
 	config, err := loadConfig(configPath)
 	if err != nil {
-		logger.Fatalf("Error loading config from %s: %v", configPath, err)
+		// logger はまだ初期化前なので標準ログで終了
+		log.Fatalf("Error loading config from %s: %v", configPath, err)
 	}
 	globalConfig = config
 
@@ -202,15 +204,22 @@ func main() {
 	}
 
 	// HTTPSサーバーを起動するかどうかを判断
-	certFilePath := filepath.Join(execDir, config.CertFile)
-	keyFilePath := filepath.Join(execDir, config.KeyFile)
+	// ★★★ 修正：cert/key のパス解決に resolvePath を使用 ★★★
+	certFilePath, err := resolvePath(execDir, config.CertFile)
+	if err != nil {
+		logger.Fatalf("Invalid certPath %q: %v", config.CertFile, err)
+	}
+	keyFilePath, err := resolvePath(execDir, config.KeyFile)
+	if err != nil {
+		logger.Fatalf("Invalid keyPath %q: %v", config.KeyFile, err)
+	}
 
 	if config.CertFile != "" && config.KeyFile != "" {
 		// HTTPSサーバーの起動
 		logger.Printf("Starting HTTPS server at %d", config.Port)
 		server := &http.Server{
 			Addr:    fmt.Sprintf(":%d", config.Port),
-			Handler: h2c.NewHandler(r, &http2.Server{}), // h2cハンドラを使用してHTTP/2を有効化
+			Handler: h2c.NewHandler(r, &http2.Server{}), // h2cハンドラを使用してHTTP/2を有効化（従来のまま）
 		}
 		err = server.ListenAndServeTLS(certFilePath, keyFilePath)
 		if err != nil {
@@ -231,9 +240,59 @@ func main() {
 }
 
 // isTemporaryDirectory はディレクトリが一時ディレクトリかどうかを判定します
+// ★★★ 修正：filepath.HasPrefix は存在しないため、安全な判定に置き換え ★★★
 func isTemporaryDirectory(path string) bool {
-	tempDir := os.TempDir()
-	return filepath.HasPrefix(path, tempDir)
+	sep := string(os.PathSeparator)
+	p := filepath.Clean(path) + sep
+	t := filepath.Clean(os.TempDir()) + sep
+	return strings.HasPrefix(p, t)
+}
+
+// ★★★ 追加：ファイルパス解決関数 ★★★
+// baseDir を起点に p を安全に解決する。
+// - file:// を OSパスへ
+// - ~, ~/ をホームへ
+// - 環境変数を展開
+// - 絶対パスならそのまま、相対なら baseDir と結合
+func resolvePath(baseDir, p string) (string, error) {
+	if p == "" {
+		return "", nil
+	}
+
+	// 環境変数展開
+	p = os.ExpandEnv(p)
+
+	// file:// URL → ローカルパス
+	if strings.HasPrefix(p, "file://") {
+		u, err := url.Parse(p)
+		if err != nil {
+			return "", fmt.Errorf("invalid file URL: %w", err)
+		}
+		// / を OS の区切りに
+		p = filepath.FromSlash(u.Path)
+		// Windows の file://C:/... 形式調整（/C:/... → C:/...）
+		if runtime.GOOS == "windows" && strings.HasPrefix(p, string(os.PathSeparator)) && len(p) >= 3 && p[1] == ':' {
+			p = p[1:]
+		}
+	}
+
+	// ~ と ~/ の展開
+	if strings.HasPrefix(p, "~") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot resolve home dir: %w", err)
+		}
+		if p == "~" {
+			p = home
+		} else if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
+			p = filepath.Join(home, p[2:])
+		}
+	}
+
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p), nil
+	}
+	return filepath.Join(baseDir, p), nil
 }
 
 // loadConfig は設定ファイルを読み込みます。
@@ -379,7 +438,8 @@ func handleAPIRequest(c *gin.Context) {
 		return
 	}
 
-	// 絶対パスに変換
+	// 絶対パスに変換（相対なら execDir 起点）
+	// ※ scriptPath は通常相対想定だが、絶対指定も許容できるよう resolvePath を使ってもよい
 	scriptPath = filepath.Join(execDir, scriptPath)
 
 	// JavaScriptを実行し、結果を取得
@@ -574,13 +634,28 @@ func runJavaScript(scriptPath string, allParams map[string]interface{}, ginCtx *
 	// 必要なグローバル関数等を登録する
 	setupGojaVM(vm, ginCtx)
 
+	// ★★★ 追加：include の基準ディレクトリを取得（mainと同じロジック） ★★★
+	basePath, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	if err != nil {
+		return "", fmt.Errorf("failed to get base path: %v", err)
+	}
+	if isTemporaryDirectory(basePath) {
+		if basePath, err = os.Getwd(); err != nil {
+			return "", fmt.Errorf("failed to get working directory: %v", err)
+		}
+	}
+
 	// globalConfig.JavaScriptInclude にある各ファイルを読み込み、連結する
 	var jsCode string
 	for _, includePath := range globalConfig.JavaScriptInclude {
-		includePath = filepath.Join(filepath.Dir(os.Args[0]), includePath)
-		code, err := ioutil.ReadFile(includePath)
+		// ★★★ 修正：resolvePath で絶対/相対/URL/環境変数/波線を解決 ★★★
+		includeAbs, rerr := resolvePath(basePath, includePath)
+		if rerr != nil {
+			return "", fmt.Errorf("failed to resolve included JS file %s: %v", includePath, rerr)
+		}
+		code, err := ioutil.ReadFile(includeAbs)
 		if err != nil {
-			return "", fmt.Errorf("failed to read included JS file %s: %v", includePath, err)
+			return "", fmt.Errorf("failed to read included JS file %s: %v", includeAbs, err)
 		}
 		jsCode += string(code) + "\n"
 	}
@@ -2070,6 +2145,3 @@ func handleNyanToolboxExecute(c *gin.Context) {
 		},
 	})
 }
-
-
-
