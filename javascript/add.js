@@ -1,7 +1,6 @@
 const nyanAcceptedParams = {"addNumber": 2};
 const nyanOutputColumns =  ["result"];
 
-
 function main(){
 
     console.log(nyanAllParams.addNumber);
@@ -19,8 +18,7 @@ function main(){
     console.log(nyanGetUserAgent());
     console.log(nyanGetRequestHeaders());
     const fileText = nyanGetFile("./api.json");
-    console.log(fileText);
-
+    //console.log(fileText);
 
     if (isDecimalNumber(nyanAllParams.addNumber)) {
         let result = parseFloat(2) + parseFloat(nyanAllParams.addNumber);

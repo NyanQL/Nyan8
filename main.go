@@ -4,6 +4,7 @@ import (
 
 	"bytes"
 	"crypto/tls"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -12,10 +13,11 @@ import (
 	"log"
 	"mime"
 	"mime/multipart"
-     "net"
+	"net"
 	"net/http"
 	"net/smtp"
 	"net/textproto"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,6 +33,7 @@ import (
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
+	"time"
 )
 
 
@@ -119,6 +122,21 @@ type MailAttachment struct {
 	Data        []byte
 }
 
+type rpcReq struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      any             `json:"id,omitempty"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+
+var (
+	supportedProto = map[string]bool{"2025-06-18": true, "2025-03-26": true}
+	sessions sync.Map // sid -> struct{created time.Time}
+)
+const defaultProto = "2025-03-26"
+
+
 
 // config格納場所
 var globalConfig Config
@@ -164,7 +182,8 @@ func main() {
 
 	config, err := loadConfig(configPath)
 	if err != nil {
-		logger.Fatalf("Error loading config from %s: %v", configPath, err)
+		// logger はまだ初期化前なので標準ログで終了
+		log.Fatalf("Error loading config from %s: %v", configPath, err)
 	}
 	globalConfig = config
 
@@ -188,6 +207,10 @@ func main() {
 	})
 
 	r.POST("/nyan-rpc", handleJSONRPC)
+	r.POST("/nyan-toolbox", handleMCP)      // JSON-RPC 全メソッド
+	r.GET("/nyan-toolbox", handleMCPGet)     // SSEしない場合は 405
+	r.DELETE("/nyan-toolbox", handleMCPDeleteSession) // 任意: セッション明示終了
+
 	r.Any("/nyan", handleNyan)
 	r.Any("/nyan/:apiName", handleNyanDetail)
 	r.Any("/", handleRequest) // HTTPとWebSocketリクエストを同じエンドポイントで処理
@@ -199,15 +222,22 @@ func main() {
 	}
 
 	// HTTPSサーバーを起動するかどうかを判断
-	certFilePath := filepath.Join(execDir, config.CertFile)
-	keyFilePath := filepath.Join(execDir, config.KeyFile)
+	// ★★★ 修正：cert/key のパス解決に resolvePath を使用 ★★★
+	certFilePath, err := resolvePath(execDir, config.CertFile)
+	if err != nil {
+		logger.Fatalf("Invalid certPath %q: %v", config.CertFile, err)
+	}
+	keyFilePath, err := resolvePath(execDir, config.KeyFile)
+	if err != nil {
+		logger.Fatalf("Invalid keyPath %q: %v", config.KeyFile, err)
+	}
 
 	if config.CertFile != "" && config.KeyFile != "" {
 		// HTTPSサーバーの起動
 		logger.Printf("Starting HTTPS server at %d", config.Port)
 		server := &http.Server{
 			Addr:    fmt.Sprintf(":%d", config.Port),
-			Handler: h2c.NewHandler(r, &http2.Server{}), // h2cハンドラを使用してHTTP/2を有効化
+			Handler: h2c.NewHandler(r, &http2.Server{}), // h2cハンドラを使用してHTTP/2を有効化（従来のまま）
 		}
 		err = server.ListenAndServeTLS(certFilePath, keyFilePath)
 		if err != nil {
@@ -228,9 +258,59 @@ func main() {
 }
 
 // isTemporaryDirectory はディレクトリが一時ディレクトリかどうかを判定します
+// ★★★ 修正：filepath.HasPrefix は存在しないため、安全な判定に置き換え ★★★
 func isTemporaryDirectory(path string) bool {
-	tempDir := os.TempDir()
-	return filepath.HasPrefix(path, tempDir)
+	sep := string(os.PathSeparator)
+	p := filepath.Clean(path) + sep
+	t := filepath.Clean(os.TempDir()) + sep
+	return strings.HasPrefix(p, t)
+}
+
+// ★★★ 追加：ファイルパス解決関数 ★★★
+// baseDir を起点に p を安全に解決する。
+// - file:// を OSパスへ
+// - ~, ~/ をホームへ
+// - 環境変数を展開
+// - 絶対パスならそのまま、相対なら baseDir と結合
+func resolvePath(baseDir, p string) (string, error) {
+	if p == "" {
+		return "", nil
+	}
+
+	// 環境変数展開
+	p = os.ExpandEnv(p)
+
+	// file:// URL → ローカルパス
+	if strings.HasPrefix(p, "file://") {
+		u, err := url.Parse(p)
+		if err != nil {
+			return "", fmt.Errorf("invalid file URL: %w", err)
+		}
+		// / を OS の区切りに
+		p = filepath.FromSlash(u.Path)
+		// Windows の file://C:/... 形式調整（/C:/... → C:/...）
+		if runtime.GOOS == "windows" && strings.HasPrefix(p, string(os.PathSeparator)) && len(p) >= 3 && p[1] == ':' {
+			p = p[1:]
+		}
+	}
+
+	// ~ と ~/ の展開
+	if strings.HasPrefix(p, "~") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot resolve home dir: %w", err)
+		}
+		if p == "~" {
+			p = home
+		} else if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
+			p = filepath.Join(home, p[2:])
+		}
+	}
+
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p), nil
+	}
+	return filepath.Join(baseDir, p), nil
 }
 
 // loadConfig は設定ファイルを読み込みます。
@@ -376,7 +456,8 @@ func handleAPIRequest(c *gin.Context) {
 		return
 	}
 
-	// 絶対パスに変換
+	// 絶対パスに変換（相対なら execDir 起点）
+	// ※ scriptPath は通常相対想定だが、絶対指定も許容できるよう resolvePath を使ってもよい
 	scriptPath = filepath.Join(execDir, scriptPath)
 
 	// JavaScriptを実行し、結果を取得
@@ -462,12 +543,12 @@ func handleWebSocket(c *gin.Context) {
 		}
 
 		receivedData["_remote_ip"] = getClientIP(c.Request)
-        receivedData["_user_agent"] = c.Request.UserAgent()
-        headersMap := make(map[string]string)
-        for k, v := range c.Request.Header {
-            headersMap[k] = strings.Join(v, ",")
-        }
-        receivedData["_headers"] = headersMap
+		receivedData["_user_agent"] = c.Request.UserAgent()
+		headersMap := make(map[string]string)
+		for k, v := range c.Request.Header {
+			headersMap[k] = strings.Join(v, ",")
+		}
+		receivedData["_headers"] = headersMap
 
 		// api.json を読み込む
 		apiJsonPath := filepath.Join(execDir, "api.json")
@@ -571,13 +652,28 @@ func runJavaScript(scriptPath string, allParams map[string]interface{}, ginCtx *
 	// 必要なグローバル関数等を登録する
 	setupGojaVM(vm, ginCtx)
 
+	// ★★★ 追加：include の基準ディレクトリを取得（mainと同じロジック） ★★★
+	basePath, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	if err != nil {
+		return "", fmt.Errorf("failed to get base path: %v", err)
+	}
+	if isTemporaryDirectory(basePath) {
+		if basePath, err = os.Getwd(); err != nil {
+			return "", fmt.Errorf("failed to get working directory: %v", err)
+		}
+	}
+
 	// globalConfig.JavaScriptInclude にある各ファイルを読み込み、連結する
 	var jsCode string
 	for _, includePath := range globalConfig.JavaScriptInclude {
-		includePath = filepath.Join(filepath.Dir(os.Args[0]), includePath)
-		code, err := ioutil.ReadFile(includePath)
+		// ★★★ 修正：resolvePath で絶対/相対/URL/環境変数/波線を解決 ★★★
+		includeAbs, rerr := resolvePath(basePath, includePath)
+		if rerr != nil {
+			return "", fmt.Errorf("failed to resolve included JS file %s: %v", includePath, rerr)
+		}
+		code, err := ioutil.ReadFile(includeAbs)
 		if err != nil {
-			return "", fmt.Errorf("failed to read included JS file %s: %v", includePath, err)
+			return "", fmt.Errorf("failed to read included JS file %s: %v", includeAbs, err)
 		}
 		jsCode += string(code) + "\n"
 	}
@@ -726,12 +822,18 @@ func initLogger(execDir string) {
 
 // エラーレスポンス
 func respondWithError(c *gin.Context, status int, errMsg string, err error) {
+	payload := gin.H{
+		"error": errMsg,
+	}
 	if err != nil {
+		// ログには詳細も出す
 		logger.Printf("ERROR: %s - %v", errMsg, err)
+		// クライアントにも詳細文字列を返す（原因の可視化）
+		payload["detail"] = err.Error()
 	} else {
 		logger.Printf("ERROR: %s", errMsg)
 	}
-	c.JSON(status, gin.H{"error": errMsg})
+	c.JSON(status, payload)
 }
 
 // リカバリーミドルウェア
@@ -748,55 +850,65 @@ func RecoveryMiddleware() gin.HandlerFunc {
 }
 
 // registerDynamicEndpoints は api.json の内容に基づいてルート直下のエンドポイントを登録する関数です。
+// registerDynamicEndpoints は api.json の内容に基づいてルート直下のエンドポイントを登録する関数です。
 func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
-	// api.json を読み込み（例: map[string]interface{} とする）
 	apiConf, err := loadJSONFile(filepath.Join(execDir, "api.json"))
 	if err != nil {
 		return fmt.Errorf("failed to load api.json: %v", err)
 	}
 
-	// api.json の各キーをエンドポイント名とする
+	// 予約パスは動的登録しない（固定ハンドラを優先させる）
+	reserved := map[string]struct{}{
+		"nyan":         {},
+		"nyan-rpc":     {},
+		"nyan-toolbox": {},
+	}
+
 	for apiName := range apiConf {
-		currentAPIName := apiName // ローカル変数にコピー（クロージャ用）
-		// ルーティング登録。currentAPIName の値をクロージャでキャプチャ
+		// 予約パスのスキップ（念のため "nyan-" プレフィックスも抑止）
+		if _, ok := reserved[apiName]; ok || strings.HasPrefix(apiName, "nyan-") {
+			continue
+		}
+
+		currentAPIName := apiName // クロージャ用に退避
 		r.Any("/"+currentAPIName, func(c *gin.Context) {
-			// WebSocket のアップグレードリクエストかどうかをチェック
+			// WebSocket アップグレードなら WebSocket ハンドラへ
 			if websocket.IsWebSocketUpgrade(c.Request) {
-				// WebSocket 用のハンドラーに処理を委譲する
 				handleWebSocket(c)
 				return
 			}
-			// URLからエンドポイント名を取得。ここでは、リクエストされたパス（"/foo" 等）から先頭の "/" を除いたものを使用
-			endpoint := c.FullPath()[1:]
-			if endpoint == "" {
-				endpoint = currentAPIName
-			}
+
 			// リクエストパラメータのマージ
 			allParams := make(map[string]interface{})
-			// URLクエリパラメータの収集
+			// URLクエリ
 			for key, values := range c.Request.URL.Query() {
 				allParams[key] = values[0]
 			}
-			// POSTフォームの収集
+			// POSTフォーム
 			for key, values := range c.Request.PostForm {
 				allParams[key] = values[0]
 			}
-			// JSON ボディがあれば収集
+			// JSONボディ
 			if c.ContentType() == "application/json" {
 				var jsonBody map[string]interface{}
 				if err := c.BindJSON(&jsonBody); err == nil {
-					for key, value := range jsonBody {
-						allParams[key] = value
+					for k, v := range jsonBody {
+						allParams[k] = v
 					}
 				} else {
 					respondWithError(c, http.StatusBadRequest, "Invalid JSON data", err)
 					return
 				}
 			}
-			// エンドポイント名を "api" パラメータとしてセット
+
+			// エンドポイント名を "api" にセット
+			endpoint := c.FullPath()[1:]
+			if endpoint == "" {
+				endpoint = currentAPIName
+			}
 			allParams["api"] = endpoint
 
-			// api.json から対象のスクリプト情報を取得
+			// api.json から対象スクリプトを取得
 			scriptListData, err := loadJSONFile(filepath.Join(execDir, "api.json"))
 			if err != nil {
 				respondWithError(c, http.StatusInternalServerError, "Failed to load API configuration", err)
@@ -812,15 +924,16 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 				respondWithError(c, http.StatusBadRequest, fmt.Sprintf("Script path not found for key: %s", endpoint), nil)
 				return
 			}
-			// 絶対パスに変換
-			scriptPath = filepath.Join(execDir, scriptPath)
-			// JavaScript を実行
-			result, err := runJavaScript(scriptPath, allParams, c)
+
+			// 実行
+			fullScriptPath := filepath.Join(execDir, scriptPath)
+			result, err := runJavaScript(fullScriptPath, allParams, c)
 			if err != nil {
 				respondWithError(c, http.StatusInternalServerError, "Failed to run JavaScript", err)
 				return
 			}
-			// 結果を JSON としてレスポンス用にパース
+
+			// 結果のパースと返却
 			var jsonData map[string]interface{}
 			if err := json.Unmarshal([]byte(result), &jsonData); err != nil {
 				respondWithError(c, http.StatusInternalServerError, "Failed to parse JavaScript response", err)
@@ -832,6 +945,7 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 				return
 			}
 
+			// push 処理
 			performPush(scriptInfo, scriptListData, allParams, execDir)
 
 			c.JSON(int(status), jsonData)
@@ -839,6 +953,7 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 	}
 	return nil
 }
+
 
 // performPush は、API 設定とパラメータを元に push 対象の WebSocket 接続へメッセージを送信します。
 func performPush(scriptInfo map[string]interface{}, scriptListData map[string]interface{}, allParams map[string]interface{}, execDir string) {
@@ -1286,34 +1401,34 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 
 	//--リモートのIP UserAgent Header情報の取得-------------------------
 	vm.Set("nyanGetRemoteIP", func() string {
-        if ginCtx == nil {
-            return ""
-        }
-        return getClientIP(ginCtx.Request)
-    })
+		if ginCtx == nil {
+			return ""
+		}
+		return getClientIP(ginCtx.Request)
+	})
 
-    vm.Set("nyanGetUserAgent", func() string {
-        if ginCtx == nil {
-            return ""
-        }
-        return ginCtx.Request.UserAgent()
-    })
+	vm.Set("nyanGetUserAgent", func() string {
+		if ginCtx == nil {
+			return ""
+		}
+		return ginCtx.Request.UserAgent()
+	})
 
-    vm.Set("nyanGetRequestHeaders", func() map[string]string {
-        out := map[string]string{}
-        if ginCtx == nil {
-            return out
-        }
-        for k, v := range ginCtx.Request.Header {
-            out[k] = strings.Join(v, ",")
-        }
-        return out
-    })
+	vm.Set("nyanGetRequestHeaders", func() map[string]string {
+		out := map[string]string{}
+		if ginCtx == nil {
+			return out
+		}
+		for k, v := range ginCtx.Request.Header {
+			out[k] = strings.Join(v, ",")
+		}
+		return out
+	})
 
 }
 
 
-	// convertShiftJISToUTF8 は、与えられたバイト列をShift-JIS(CP932)としてUTF-8文字列に変換する
+// convertShiftJISToUTF8 は、与えられたバイト列をShift-JIS(CP932)としてUTF-8文字列に変換する
 func convertShiftJISToUTF8(b []byte) (string, error) {
 	// 変換用のReaderを作る
 	r := transform.NewReader(bytes.NewReader(b), japanese.ShiftJIS.NewDecoder())
@@ -1740,31 +1855,299 @@ func sendMail(
 }
 
 func getClientIP(r *http.Request) string {
-    if r == nil {
-        return ""
-    }
+	if r == nil {
+		return ""
+	}
 
-    // X-Forwarded-For（カンマ区切りで複数入ることがある）
-    if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-        parts := strings.Split(xff, ",")
-        for _, p := range parts {
-            ip := strings.TrimSpace(p)
-            if ip != "" && ip != "unknown" {
-                return ip
-            }
-        }
-    }
+	// X-Forwarded-For（カンマ区切りで複数入ることがある）
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		for _, p := range parts {
+			ip := strings.TrimSpace(p)
+			if ip != "" && ip != "unknown" {
+				return ip
+			}
+		}
+	}
 
-    // X-Real-IP
-    if xr := strings.TrimSpace(r.Header.Get("X-Real-IP")); xr != "" {
-        return xr
-    }
+	// X-Real-IP
+	if xr := strings.TrimSpace(r.Header.Get("X-Real-IP")); xr != "" {
+		return xr
+	}
 
-    // RemoteAddr のパース（host:port）
-    if host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr)); err == nil && host != "" {
-        return host
-    }
+	// RemoteAddr のパース（host:port）
+	if host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr)); err == nil && host != "" {
+		return host
+	}
 
-    // フォールバック
-    return r.RemoteAddr
+	// フォールバック
+	return r.RemoteAddr
+}
+
+func handleMCP(c *gin.Context) {
+	// 通知/応答なら 202 を返す規約（必要に応じて判定）
+	var req rpcReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, map[string]any{"error":"bad json"})
+		return
+	}
+
+	// initialize は特別扱い（セッション開始 & プロトコル合意）
+	switch req.Method {
+	case "initialize":
+		// params.protocolVersion を読む
+		var p struct {
+			ProtocolVersion string         `json:"protocolVersion"`
+			Capabilities    map[string]any `json:"capabilities"`
+			ClientInfo      map[string]any `json:"clientInfo"`
+		}
+		_ = json.Unmarshal(req.Params, &p)
+
+		ver := p.ProtocolVersion
+		if !supportedProto[ver] { ver = defaultProto } // 最低限の互換を返す
+
+		// セッション発行（任意だが推奨）
+		sid := generateSecureSessionID()
+		sessions.Store(sid, time.Now())
+		c.Header("Mcp-Session-Id", sid)
+
+		// サーバの capabilities（最低限 tools）
+		res := map[string]any{
+			"protocolVersion": ver,
+			"capabilities": map[string]any{
+				"tools": map[string]any{"listChanged": false},
+			},
+			"serverInfo": map[string]string{
+				"name":    globalConfig.Name,
+				"version": globalConfig.Version,
+			},
+		}
+		c.JSON(http.StatusOK, map[string]any{
+			"jsonrpc":"2.0","id":req.ID,"result":res,
+		})
+		return
+
+	case "notifications/initialized":
+		c.Status(http.StatusAccepted) // 202・ボディ無し
+		return
+
+	case "ping":
+		c.JSON(http.StatusOK, map[string]any{"jsonrpc":"2.0","id":req.ID,"result":map[string]any{}})
+		return
+	}
+
+	// initialize 以外はセッションとプロトコルヘッダを検証
+	sid := c.GetHeader("Mcp-Session-Id")
+	if _, ok := sessions.Load(sid); !ok {
+		c.AbortWithStatus(http.StatusNotFound) // 404 → クライアントは再 initialize
+		return
+	}
+	proto := c.GetHeader("MCP-Protocol-Version")
+	if proto == "" { proto = defaultProto }
+	if !supportedProto[proto] {
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	switch req.Method {
+	case "tools/list":
+		// api.json → Tool 定義（inputSchema は camelCase）
+		result := buildToolsList() // []Tool と nextCursor を返す自前関数
+		c.JSON(http.StatusOK, map[string]any{
+			"jsonrpc":"2.0","id":req.ID,"result":result,
+		})
+		return
+
+	case "tools/call":
+		var p struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		_ = json.Unmarshal(req.Params, &p)
+		// JS 実行
+		out := callJS(p.Name, p.Arguments, c) // 既存 runJavaScript をラップして取得
+		// MCP 形式の結果に整形（最低限 text）
+		c.JSON(http.StatusOK, map[string]any{
+			"jsonrpc":"2.0","id":req.ID,"result": map[string]any{
+				"content": []map[string]any{{"type":"text","text": stringOrJSON(out)}},
+			},
+		})
+		return
+
+	default:
+		c.JSON(http.StatusOK, map[string]any{
+			"jsonrpc":"2.0","id":req.ID,
+			"error": map[string]any{"code":-32601,"message":"Method not found"},
+		})
+		return
+	}
+}
+
+func handleMCPGet(c *gin.Context) {
+	c.AbortWithStatus(http.StatusMethodNotAllowed) // 405
+}
+
+// ===== ここから追加分: MCPヘルパー群 =====
+
+// 暗号学的ランダムで URL セーフなセッションIDを生成
+func generateSecureSessionID() string {
+	b := make([]byte, 32) // 256bit
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Errorf("failed to generate session id: %w", err))
+	}
+	return base64.RawURLEncoding.EncodeToString(b) // パディング無し
+}
+
+// セッションTTL（必要に応じて利用）
+const sessionTTL = 24 * time.Hour
+
+func isSessionAlive(created time.Time) bool {
+	return time.Since(created) < sessionTTL
+}
+
+// DELETE /nyan-toolbox でセッション明示終了
+func handleMCPDeleteSession(c *gin.Context) {
+	sid := c.GetHeader("Mcp-Session-Id")
+	if sid == "" {
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	if _, ok := sessions.Load(sid); ok {
+		sessions.Delete(sid)
+		c.Status(http.StatusNoContent) // 204
+		return
+	}
+	c.AbortWithStatus(http.StatusNotFound)
+}
+
+// tools/list の結果を api.json から構築（MCP 形式）
+func buildToolsList() map[string]any {
+	execDir, err := os.Getwd()
+	if err != nil {
+		return map[string]any{"tools": []any{}, "nextCursor": nil}
+	}
+	apiConfPath := filepath.Join(execDir, "api.json")
+	apiConf, err := loadJSONFile(apiConfPath)
+	if err != nil {
+		return map[string]any{"tools": []any{}, "nextCursor": nil}
+	}
+
+	tools := make([]map[string]any, 0, len(apiConf))
+	for name, raw := range apiConf {
+		api, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		desc, _ := api["description"].(string)
+		scriptPath, _ := api["script"].(string)
+
+		// デフォルト schema
+		inputSchema := map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+			"required":   []string{},
+		}
+
+		// JS 内の const nyanAcceptedParams を Schema 推定に利用
+		if scriptPath != "" {
+			full := filepath.Join(execDir, scriptPath)
+			if scriptContent, err := os.ReadFile(full); err == nil {
+				params := parseConstObject(scriptContent, "nyanAcceptedParams")
+				if len(params) > 0 {
+					props := map[string]any{}
+					required := []string{}
+					for k, v := range params {
+						t := "string"
+						switch v.(type) {
+						case float64, int, int64:
+							t = "number"
+						case bool:
+							t = "boolean"
+						}
+						props[k] = map[string]any{
+							"type":        t,
+							"description": fmt.Sprintf("Parameter: %s", k),
+						}
+						required = append(required, k)
+					}
+					inputSchema["properties"] = props
+					inputSchema["required"] = required
+				}
+			}
+		}
+
+		tools = append(tools, map[string]any{
+			"name":        name,
+			"description": desc,
+			"inputSchema": inputSchema, // MCP は camelCase
+		})
+	}
+
+	return map[string]any{
+		"tools":      tools,
+		"nextCursor": nil,
+	}
+}
+
+// tools/call 用: JS 呼び出しの薄いラッパ
+func callJS(toolName string, args map[string]any, c *gin.Context) string {
+	execDir, err := os.Getwd()
+	if err != nil {
+		return `{"status":500,"error":"cwd error"}`
+	}
+	apiConfPath := filepath.Join(execDir, "api.json")
+	apiConf, err := loadJSONFile(apiConfPath)
+	if err != nil {
+		return `{"status":500,"error":"api.json load error"}`
+	}
+
+	raw, ok := apiConf[toolName]
+	if !ok {
+		return fmt.Sprintf(`{"status":404,"error":"tool not found: %s"}`, toolName)
+	}
+	api, ok := raw.(map[string]any)
+	if !ok {
+		return `{"status":500,"error":"invalid api config"}`
+	}
+	scriptPath, _ := api["script"].(string)
+	if scriptPath == "" {
+		return `{"status":400,"error":"no script path"}`
+	}
+
+	fullScript := filepath.Join(execDir, scriptPath)
+
+	// 引数＋メタ情報を準備
+	allParams := map[string]any{}
+	for k, v := range args {
+		allParams[k] = v
+	}
+	allParams["api"] = toolName
+	if c != nil {
+		allParams["_remote_ip"] = getClientIP(c.Request)
+		allParams["_user_agent"] = c.Request.UserAgent()
+		h := map[string]string{}
+		for k, v := range c.Request.Header {
+			h[k] = strings.Join(v, ",")
+		}
+		allParams["_headers"] = h
+	}
+
+	out, err := runJavaScript(fullScript, allParams, c)
+	if err != nil {
+		return fmt.Sprintf(`{"status":500,"error":%q}`, err.Error())
+	}
+	return out
+}
+
+// text 用に見やすく整形（JSONならインデント）
+func stringOrJSON(s string) string {
+	t := strings.TrimSpace(s)
+	if (strings.HasPrefix(t, "{") && strings.HasSuffix(t, "}")) ||
+		(strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]")) {
+		var buf bytes.Buffer
+		if err := json.Indent(&buf, []byte(t), "", "  "); err == nil {
+			return buf.String()
+		}
+	}
+	return s
 }
