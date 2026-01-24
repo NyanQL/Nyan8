@@ -8,12 +8,6 @@
     "script": "./javascript/hello.js",
     "description": "挨拶をしてくれるAPIです。/helloにwebsocketで接続するとaddにリクエストがあるとpush通知を受信できます。"
   },
-  "websocket_clients": {
-    "type": "ws_client",
-    "script": "./javascript/ws/receiver_main.js",
-    "connectURL": "env:NYAN8_CHAT_WS_URL",
-    "description": "外部チャット等に常時接続するクライアント（環境変数でURL指定）"
-  },
   "websocket_clients_local": {
     "type": "ws_client",
     "script": "./javascript/ws/receiver_main.js",

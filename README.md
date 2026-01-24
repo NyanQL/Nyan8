@@ -13,7 +13,6 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 |------|------|
 | **JavaScript API** | HTTP/HTTPS 経由で JS ファイルを呼び出し、JSON を返却 |
 | **WebSocket Push** | `api.json` の `push` 設定だけで双方向通信を実現 |
-| **Push-In 受信** | `/push-in/:target` に Bearer 認証付き POST で外部から push を中継 |
 | **JSON‑RPC 2.0** | `/nyan‑rpc` エンドポイントで RPC を提供（Batch は今後対応） |
 | **メール送信** | `nyanSendMail` で CC/BCC・添付ファイルを含むメールを送信可能 |
 | **ファイル→Base64** | `nyanFileToBase64` でファイルを Base64 文字列へ一発変換 |
@@ -127,12 +126,6 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 - `connectURL` が `env:XXXX` の場合、環境変数 `XXXX` で接続 URL を解決します。
 
 ```jsonc
-"websocket_clients": {
-  "type": "ws_client",
-  "script": "./javascript/ws/receiver_main.js",
-  "connectURL": "env:NYAN8_CHAT_WS_URL",
-  "description": "チャットに常時参加するクライアント"
-},
 "websocket_clients_local": {
   "type": "ws_client",
   "script": "./javascript/ws/receiver_main.js",
@@ -144,7 +137,6 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 受信したメッセージは `script` で指定した JavaScript に `nyanAllParams` として渡され、戻り値がそのまま上流の WebSocket へ送信されます（空文字を返すと返信しません）。
 
 動かし方の例:
-- 本番や外部接続先がある場合: `export NYAN8_CHAT_WS_URL=wss://example.com/ws` のように環境変数をセットしてから `./nyan8ctl.sh start` を実行。
 - まずはローカルで挙動を見る場合: 上記 `websocket_clients_local` を有効のままにして `./nyan8ctl.sh start`。別ターミナルで `python3 /tmp/ws-broadcast.py`（同梱のローカル WS サーバー例）や手持ちの WS クライアントから `ws://localhost:8889/hello` に送ると、`receiver_main.js` の応答が見えます。
 
 ---
