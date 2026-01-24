@@ -13,6 +13,7 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 |------|------|
 | **JavaScript API** | HTTP/HTTPS 経由で JS ファイルを呼び出し、JSON を返却 |
 | **WebSocket Push** | `api.json` の `push` 設定だけで双方向通信を実現 |
+| **Push-In 受信** | `/push-in/:target` に Bearer 認証付き POST で外部から push を中継 |
 | **JSON‑RPC 2.0** | `/nyan‑rpc` エンドポイントで RPC を提供（Batch は今後対応） |
 | **メール送信** | `nyanSendMail` で CC/BCC・添付ファイルを含むメールを送信可能 |
 | **ファイル→Base64** | `nyanFileToBase64` でファイルを Base64 文字列へ一発変換 |
@@ -56,6 +57,10 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
     "Compress": true,               // 圧縮
     "EnableLogging": true           // false=コンソールのみ
   },
+  "push_receiver": {
+    "enabled": true,               // false で無効化
+    "secret": "changeme"           // Authorization: Bearer <secret>
+  },
   "smtp": {
     "host": "smtp.example.com",
     "port": 465,
@@ -81,6 +86,21 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 
 </details>
 
+### Push-In 受信（外部からの中継）
+
+- 設定: `push_receiver.enabled=true` で有効化、`secret` を Bearer トークンに設定。
+- エンドポイント: `POST /push-in/:target` （`Authorization: Bearer <secret>` 必須）。`target` は WebSocket のパス名（例: `hello`）。
+- 動作: 受信ボディをそのまま `target` に接続中の WebSocket へテキストで転送。
+- 例:
+  ```bash
+  curl -X POST http://localhost:8889/push-in/hello \
+    -H "Authorization: Bearer changeme" \
+    -d '{"msg":"hi"}'
+  ```
+  ※送信先の WebSocket (`ws://localhost:8889/hello`) が接続済みであることが前提です。
+
+</details>
+
 ### 3‑2  `api.json`
 
 ```jsonc
@@ -99,6 +119,33 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 
 * `/add` に HTTP アクセス → `apis/add.js` が実行
 * WebSocket 接続 `/add_push` を張っておけば、`add` 完了時に push が届きます
+
+### type と WebSocket クライアント
+
+- `type` を省略した場合は従来通り HTTP/WS サーバーの API (`"type": "api"`) として動作します。
+- `type: "ws_client"` を指定すると Nyan8 自身が WebSocket クライアントになり、起動時に常時接続します。
+- `connectURL` が `env:XXXX` の場合、環境変数 `XXXX` で接続 URL を解決します。
+
+```jsonc
+"websocket_clients": {
+  "type": "ws_client",
+  "script": "./javascript/ws/receiver_main.js",
+  "connectURL": "env:NYAN8_CHAT_WS_URL",
+  "description": "チャットに常時参加するクライアント"
+},
+"websocket_clients_local": {
+  "type": "ws_client",
+  "script": "./javascript/ws/receiver_main.js",
+  "connectURL": "ws://localhost:8889/hello",
+  "description": "ローカル動作確認用（自身の /hello に接続）"
+}
+```
+
+受信したメッセージは `script` で指定した JavaScript に `nyanAllParams` として渡され、戻り値がそのまま上流の WebSocket へ送信されます（空文字を返すと返信しません）。
+
+動かし方の例:
+- 本番や外部接続先がある場合: `export NYAN8_CHAT_WS_URL=wss://example.com/ws` のように環境変数をセットしてから `./nyan8ctl.sh start` を実行。
+- まずはローカルで挙動を見る場合: 上記 `websocket_clients_local` を有効のままにして `./nyan8ctl.sh start`。別ターミナルで `python3 /tmp/ws-broadcast.py`（同梱のローカル WS サーバー例）や手持ちの WS クライアントから `ws://localhost:8889/hello` に送ると、`receiver_main.js` の応答が見えます。
 
 ---
 
@@ -403,5 +450,3 @@ chatGPTでの利用について、sslの設定をすれば利用可能な状態�
 ---   
 ## 8 ライセンス
 [MIT License](LICENSE.md)
-
-
