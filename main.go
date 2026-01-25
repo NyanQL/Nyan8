@@ -1,13 +1,21 @@
 package main
 
 import (
-
 	"bytes"
-	"crypto/tls"
 	"crypto/rand"
+	"crypto/subtle"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/dop251/goja"
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	"github.com/natefinch/lumberjack"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/transform"
 	"io"
 	"io/ioutil"
 	"log"
@@ -25,17 +33,8 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"github.com/dop251/goja"
-	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
-	"github.com/natefinch/lumberjack"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
-	"golang.org/x/text/encoding/japanese"
-	"golang.org/x/text/transform"
 	"time"
 )
-
 
 // ResponseData はAPIのレスポンスデータを表します。
 type ResponseData struct {
@@ -52,15 +51,16 @@ type ErrorData struct {
 
 // Config は設定データを表します。
 type Config struct {
-	Name              string    `json:"name"`
-	Profile           string    `json:"profile"`
-	Version           string    `json:"version"`
-	Port              int       `json:"Port"`
-	CertFile          string    `json:"certPath"`
-	KeyFile           string    `json:"keyPath"`
-	JavaScriptInclude []string  `json:"javascript_include"`
-	Log               LogConfig `json:"log"`
-	SMTP SMTPConfig `json:"smtp"`
+	Name              string             `json:"name"`
+	Profile           string             `json:"profile"`
+	Version           string             `json:"version"`
+	Port              int                `json:"Port"`
+	CertFile          string             `json:"certPath"`
+	KeyFile           string             `json:"keyPath"`
+	JavaScriptInclude []string           `json:"javascript_include"`
+	Log               LogConfig          `json:"log"`
+	SMTP              SMTPConfig         `json:"smtp"`
+	PushReceiver      PushReceiverConfig `json:"push_receiver"`
 }
 
 // LogConfig はログ設定データを表します。
@@ -86,10 +86,10 @@ type ExecResult struct {
 }
 
 type JSONRPCResponse struct {
-	JSONRPC string           `json:"jsonrpc"`
-	Result  interface{}      `json:"result,omitempty"`
-	Error   *JSONRPCError    `json:"error,omitempty"`
-	ID      interface{}      `json:"id,omitempty"`
+	JSONRPC string        `json:"jsonrpc"`
+	Result  interface{}   `json:"result,omitempty"`
+	Error   *JSONRPCError `json:"error,omitempty"`
+	ID      interface{}   `json:"id,omitempty"`
 }
 
 type JSONRPCRequest struct {
@@ -106,14 +106,19 @@ type JSONRPCError struct {
 }
 
 type SMTPConfig struct {
-	Host      string `json:"host"`
-	Port      int    `json:"port"`
-	Username  string `json:"username"`
-	Password  string `json:"password"`
-	FromEmail string `json:"from_email"`
-	FromName  string `json:"from_name"`
-	TLS       bool   `json:"tls"`
+	Host       string   `json:"host"`
+	Port       int      `json:"port"`
+	Username   string   `json:"username"`
+	Password   string   `json:"password"`
+	FromEmail  string   `json:"from_email"`
+	FromName   string   `json:"from_name"`
+	TLS        bool     `json:"tls"`
 	DefaultBCC []string `json:"default_bcc"`
+}
+
+type PushReceiverConfig struct {
+	Enabled bool   `json:"enabled"`
+	Secret  string `json:"secret"`
 }
 
 type MailAttachment struct {
@@ -129,14 +134,16 @@ type rpcReq struct {
 	Params  json.RawMessage `json:"params,omitempty"`
 }
 
-
 var (
 	supportedProto = map[string]bool{"2025-06-18": true, "2025-03-26": true}
-	sessions sync.Map // sid -> struct{created time.Time}
+	sessions       sync.Map // sid -> struct{created time.Time}
 )
+
 const defaultProto = "2025-03-26"
-
-
+const (
+	apiTypeAPI      = "api"
+	apiTypeWSClient = "ws_client"
+)
 
 // config格納場所
 var globalConfig Config
@@ -207,9 +214,10 @@ func main() {
 	})
 
 	r.POST("/nyan-rpc", handleJSONRPC)
-	r.POST("/nyan-toolbox", handleMCP)      // JSON-RPC 全メソッド
-	r.GET("/nyan-toolbox", handleMCPGet)     // SSEしない場合は 405
+	r.POST("/nyan-toolbox", handleMCP)                // JSON-RPC 全メソッド
+	r.GET("/nyan-toolbox", handleMCPGet)              // SSEしない場合は 405
 	r.DELETE("/nyan-toolbox", handleMCPDeleteSession) // 任意: セッション明示終了
+	r.POST("/push-in/:target", handlePushIn)
 
 	r.Any("/nyan", handleNyan)
 	r.Any("/nyan/:apiName", handleNyanDetail)
@@ -219,6 +227,10 @@ func main() {
 	execDir, _ = os.Getwd() // または、実行ファイルのディレクトリを使用
 	if err := registerDynamicEndpoints(r, execDir); err != nil {
 		logger.Fatalf("Failed to register dynamic endpoints: %v", err)
+	}
+
+	if err := startWebSocketClients(execDir); err != nil {
+		logger.Printf("Failed to start WebSocket clients: %v", err)
 	}
 
 	// HTTPSサーバーを起動するかどうかを判断
@@ -313,6 +325,40 @@ func resolvePath(baseDir, p string) (string, error) {
 	return filepath.Join(baseDir, p), nil
 }
 
+// APIエントリの type を取得する。未指定なら "api" とする。
+func getAPIType(entry map[string]interface{}) string {
+	if entry == nil {
+		return apiTypeAPI
+	}
+	if t, ok := entry["type"].(string); ok {
+		t = strings.TrimSpace(t)
+		if t != "" {
+			return t
+		}
+	}
+	return apiTypeAPI
+}
+
+// connectURL が env:XXXX 形式なら環境変数 XXXX で解決する。空や未設定はエラー。
+func resolveConnectURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("connectURL is empty")
+	}
+	if strings.HasPrefix(raw, "env:") {
+		key := strings.TrimPrefix(raw, "env:")
+		if key == "" {
+			return "", fmt.Errorf("connectURL env: prefix is empty")
+		}
+		val := os.Getenv(key)
+		if val == "" {
+			return "", fmt.Errorf("environment variable %s is empty", key)
+		}
+		return val, nil
+	}
+	return raw, nil
+}
+
 // loadConfig は設定ファイルを読み込みます。
 func loadConfig(filename string) (Config, error) {
 	var config Config
@@ -383,7 +429,6 @@ func handleAPIRequest(c *gin.Context) {
 	allParams := make(map[string]interface{})
 	allParams["api"] = c.Request.URL.Path[1:]
 
-
 	// POSTの場合、フォームデータをパースする
 	if c.Request.Method == http.MethodPost && strings.HasPrefix(c.ContentType(), "application/x-www-form-urlencoded") {
 		if err := c.Request.ParseForm(); err != nil {
@@ -447,6 +492,11 @@ func handleAPIRequest(c *gin.Context) {
 		return
 	}
 	logger.Print(scriptInfo)
+
+	if getAPIType(scriptInfo) != apiTypeAPI {
+		respondWithError(c, http.StatusBadRequest, fmt.Sprintf("API %s is not an HTTP/WebSocket endpoint", scriptValueKey), nil)
+		return
+	}
 
 	// スクリプトのパスを取得
 	scriptPath, ok := scriptInfo["script"].(string)
@@ -567,6 +617,12 @@ func handleWebSocket(c *gin.Context) {
 			continue
 		}
 
+		if getAPIType(scriptInfo) != apiTypeAPI {
+			logger.Printf("Script type for %s is not api", scriptValue)
+			sendErrorMessage(conn, "Script type not supported")
+			continue
+		}
+
 		scriptPath, ok := scriptInfo["script"].(string)
 		if !ok {
 			logger.Printf("Script path not found for key: %s", scriptValue)
@@ -590,7 +646,6 @@ func handleWebSocket(c *gin.Context) {
 			logger.Printf("Failed to send message to WebSocket: %v", err)
 			break
 		}
-
 
 		// push 項目が設定されている場合、push 対象APIの処理を実行
 		if pushTargetRaw, exists := scriptInfo["push"]; exists {
@@ -862,9 +917,19 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 		"nyan":         {},
 		"nyan-rpc":     {},
 		"nyan-toolbox": {},
+		"push-in":      {},
 	}
 
-	for apiName := range apiConf {
+	for apiName, apiRaw := range apiConf {
+		apiMap, ok := apiRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		if getAPIType(apiMap) != apiTypeAPI {
+			continue
+		}
+
 		// 予約パスのスキップ（念のため "nyan-" プレフィックスも抑止）
 		if _, ok := reserved[apiName]; ok || strings.HasPrefix(apiName, "nyan-") {
 			continue
@@ -919,6 +984,10 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 				respondWithError(c, http.StatusBadRequest, fmt.Sprintf("API config not found for key: %s", endpoint), nil)
 				return
 			}
+			if getAPIType(scriptInfo) != apiTypeAPI {
+				respondWithError(c, http.StatusBadRequest, fmt.Sprintf("API %s is not an HTTP/WebSocket endpoint", endpoint), nil)
+				return
+			}
 			scriptPath, ok := scriptInfo["script"].(string)
 			if !ok {
 				respondWithError(c, http.StatusBadRequest, fmt.Sprintf("Script path not found for key: %s", endpoint), nil)
@@ -954,6 +1023,174 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 	return nil
 }
 
+type wsClientConfig struct {
+	name        string
+	scriptPath  string
+	connectURL  string
+	description string
+}
+
+// startWebSocketClients は api.json に定義された ws_client を起動する。
+func startWebSocketClients(execDir string) error {
+	apiConf, err := loadJSONFile(filepath.Join(execDir, "api.json"))
+	if err != nil {
+		return fmt.Errorf("failed to load api.json: %w", err)
+	}
+
+	var firstErr error
+	for name, raw := range apiConf {
+		entry, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if getAPIType(entry) != apiTypeWSClient {
+			continue
+		}
+
+		scriptPath, _ := entry["script"].(string)
+		connectURLRaw, _ := entry["connectURL"].(string)
+		desc, _ := entry["description"].(string)
+
+		if strings.TrimSpace(scriptPath) == "" {
+			err := fmt.Errorf("ws_client %s: script is missing", name)
+			logger.Print(err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if strings.TrimSpace(connectURLRaw) == "" {
+			err := fmt.Errorf("ws_client %s: connectURL is missing", name)
+			logger.Print(err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		connectURL, err := resolveConnectURL(connectURLRaw)
+		if err != nil {
+			logger.Printf("ws_client %s: %v", name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		scriptAbs, err := resolvePath(execDir, scriptPath)
+		if err != nil {
+			logger.Printf("ws_client %s: invalid script path %s: %v", name, scriptPath, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		cfg := wsClientConfig{
+			name:        name,
+			scriptPath:  scriptAbs,
+			connectURL:  connectURL,
+			description: desc,
+		}
+
+		logger.Printf("Starting WebSocket client %s -> %s", cfg.name, cfg.connectURL)
+		go runWebSocketClient(cfg)
+	}
+
+	return firstErr
+}
+
+// 常時接続を維持し、切断時は指数バックオフで再接続する。
+func runWebSocketClient(cfg wsClientConfig) {
+	backoff := time.Second
+	for {
+		err := connectAndListenWebSocket(cfg)
+		if err != nil {
+			logger.Printf("WebSocket client %s disconnected: %v", cfg.name, err)
+		}
+
+		time.Sleep(backoff)
+		if backoff < 30*time.Second {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+}
+
+func connectAndListenWebSocket(cfg wsClientConfig) error {
+	conn, _, err := websocket.DefaultDialer.Dial(cfg.connectURL, nil)
+	if err != nil {
+		return fmt.Errorf("dial failed: %w", err)
+	}
+	defer conn.Close()
+
+	logger.Printf("WebSocket client %s connected", cfg.name)
+
+	for {
+		msgType, data, err := conn.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("read error: %w", err)
+		}
+
+		if msgType == websocket.CloseMessage {
+			return fmt.Errorf("close message received: %s", string(data))
+		}
+
+		allParams := map[string]interface{}{
+			"api":             cfg.name,
+			"ws_client":       cfg.name,
+			"ws_message_type": websocketMessageTypeLabel(msgType),
+			"ws_message_text": string(data),
+			"ws_connect_url":  cfg.connectURL,
+			"ws_description":  cfg.description,
+		}
+
+		if msgType == websocket.BinaryMessage {
+			allParams["ws_message_base64"] = base64.StdEncoding.EncodeToString(data)
+		}
+
+		if msgType == websocket.TextMessage {
+			var decoded interface{}
+			if err := json.Unmarshal(data, &decoded); err == nil {
+				allParams["ws_message_json"] = decoded
+			}
+		}
+
+		result, err := runJavaScript(cfg.scriptPath, allParams, nil)
+		if err != nil {
+			logger.Printf("ws_client %s script error: %v", cfg.name, err)
+			continue
+		}
+
+		trimmed := strings.TrimSpace(result)
+		if trimmed == "" {
+			continue
+		}
+
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(trimmed)); err != nil {
+			return fmt.Errorf("send error: %w", err)
+		}
+	}
+}
+
+func websocketMessageTypeLabel(t int) string {
+	switch t {
+	case websocket.TextMessage:
+		return "text"
+	case websocket.BinaryMessage:
+		return "binary"
+	case websocket.CloseMessage:
+		return "close"
+	case websocket.PingMessage:
+		return "ping"
+	case websocket.PongMessage:
+		return "pong"
+	default:
+		return fmt.Sprintf("unknown(%d)", t)
+	}
+}
 
 // performPush は、API 設定とパラメータを元に push 対象の WebSocket 接続へメッセージを送信します。
 func performPush(scriptInfo map[string]interface{}, scriptListData map[string]interface{}, allParams map[string]interface{}, execDir string) {
@@ -1001,6 +1238,62 @@ func performPush(scriptInfo map[string]interface{}, scriptListData map[string]in
 	}
 }
 
+// handlePushIn は外部からの push 受信を処理し、指定 target の WebSocket 接続へ転送する
+func handlePushIn(c *gin.Context) {
+	if !globalConfig.PushReceiver.Enabled {
+		respondWithError(c, http.StatusNotFound, "push receiver disabled", nil)
+		return
+	}
+
+	secret := strings.TrimSpace(globalConfig.PushReceiver.Secret)
+	if secret == "" {
+		respondWithError(c, http.StatusForbidden, "push receiver secret not configured", nil)
+		return
+	}
+
+	auth := c.GetHeader("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		respondWithError(c, http.StatusUnauthorized, "missing or invalid authorization header", nil)
+		return
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	if subtle.ConstantTimeCompare([]byte(token), []byte(secret)) != 1 {
+		respondWithError(c, http.StatusUnauthorized, "invalid token", nil)
+		return
+	}
+
+	target := c.Param("target")
+	if target == "" {
+		respondWithError(c, http.StatusBadRequest, "missing target", nil)
+		return
+	}
+
+	payload, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		respondWithError(c, http.StatusInternalServerError, "failed to read request body", err)
+		return
+	}
+
+	rawConn, ok := pushConnections.Load(target)
+	if !ok {
+		respondWithError(c, http.StatusNotFound, fmt.Sprintf("no active push connection for %s", target), nil)
+		return
+	}
+	conn, ok := rawConn.(*websocket.Conn)
+	if !ok {
+		respondWithError(c, http.StatusInternalServerError, "invalid push connection", nil)
+		return
+	}
+
+	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+		respondWithError(c, http.StatusInternalServerError, "failed to deliver push message", err)
+		return
+	}
+
+	logger.Printf("Push-in delivered to %s (%d bytes)", target, len(payload))
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
 // handleNyan は /nyan エンドポイントを処理します。
 func handleNyan(c *gin.Context) {
 	// 作業ディレクトリの取得
@@ -1022,6 +1315,7 @@ func handleNyan(c *gin.Context) {
 	for key, api := range apiConf {
 		if apiMap, ok := api.(map[string]interface{}); ok {
 			delete(apiMap, "script")
+			apiMap["type"] = getAPIType(apiMap)
 			apiConf[key] = apiMap
 		}
 	}
@@ -1080,6 +1374,7 @@ func handleNyanDetail(c *gin.Context) {
 
 	// api.json に記載された description を取得（なければ空文字）
 	description, _ := apiData["description"].(string)
+	apiType := getAPIType(apiData)
 
 	// JavaScriptのパスを取得（なければ空文字のまま）
 	scriptPath, _ := apiData["script"].(string)
@@ -1098,8 +1393,9 @@ func handleNyanDetail(c *gin.Context) {
 
 	// 結果JSONを作成
 	result := map[string]interface{}{
-		"api":               apiName,
-		"description":       description,
+		"api":                apiName,
+		"type":               apiType,
+		"description":        description,
 		"nyanAcceptedParams": nyanAcceptedParams, // スクリプトに無ければ空のまま
 		"nyanOutputColumns":  nyanOutputColumns,  // スクリプトに無ければ空のまま
 	}
@@ -1354,7 +1650,6 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		return vm.ToValue(true)
 	})
 
-
 	// --- base64--------------------------------------
 	vm.Set("nyanReadFileB64", func(path string) string {
 		// 相対パスならカレントディレクトリ基準で解決
@@ -1393,9 +1688,9 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		}
 
 		return map[string]interface{}{
-			"filename":     filepath.Base(abs),
-			"contentType":  ctype,
-			"dataBase64":   base64.StdEncoding.EncodeToString(data),
+			"filename":    filepath.Base(abs),
+			"contentType": ctype,
+			"dataBase64":  base64.StdEncoding.EncodeToString(data),
 		}
 	})
 
@@ -1426,7 +1721,6 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 	})
 
 }
-
 
 // convertShiftJISToUTF8 は、与えられたバイト列をShift-JIS(CP932)としてUTF-8文字列に変換する
 func convertShiftJISToUTF8(b []byte) (string, error) {
@@ -1536,7 +1830,6 @@ func newNyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 		return vm.ToValue(string(content))
 	}
 }
-
 
 func handleJSONRPC(c *gin.Context) {
 	var rpcReq JSONRPCRequest
@@ -1702,7 +1995,6 @@ func handleJSONRPC(c *gin.Context) {
 	c.JSON(http.StatusOK, rpcResp)
 }
 
-
 func respondJSONRPCError(c *gin.Context, id interface{}, code int, message string, data interface{}) {
 	rpcErr := &JSONRPCError{
 		Code:    code,
@@ -1718,9 +2010,9 @@ func respondJSONRPCError(c *gin.Context, id interface{}, code int, message strin
 
 // sendMail は config.json の SMTP 設定でメールを送り、attachments があれば添付する。
 func sendMail(
-	to, cc, bcc []string,        // 宛先
-	subject, body string,        // 件名・本文
-	isHTML bool,                 // true=HTML  false=プレーン
+	to, cc, bcc []string, // 宛先
+	subject, body string, // 件名・本文
+	isHTML bool, // true=HTML  false=プレーン
 	attachments []MailAttachment, // 添付ファイル
 ) error {
 
@@ -1817,8 +2109,8 @@ func sendMail(
 
 	/* ───── 4. SMTP 送信 ────────────────────────── */
 	rcpts := append(append(to, cc...), bcc...)
-	addr  := fmt.Sprintf("%s:%d", s.Host, s.Port)
-	auth  := smtp.PlainAuth("", s.Username, s.Password, s.Host)
+	addr := fmt.Sprintf("%s:%d", s.Host, s.Port)
+	auth := smtp.PlainAuth("", s.Username, s.Password, s.Host)
 
 	// 4-1 SMTPS / STARTTLS 直後 TLS
 	if s.TLS {
@@ -1888,7 +2180,7 @@ func handleMCP(c *gin.Context) {
 	// 通知/応答なら 202 を返す規約（必要に応じて判定）
 	var req rpcReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, map[string]any{"error":"bad json"})
+		c.AbortWithStatusJSON(http.StatusBadRequest, map[string]any{"error": "bad json"})
 		return
 	}
 
@@ -1904,7 +2196,9 @@ func handleMCP(c *gin.Context) {
 		_ = json.Unmarshal(req.Params, &p)
 
 		ver := p.ProtocolVersion
-		if !supportedProto[ver] { ver = defaultProto } // 最低限の互換を返す
+		if !supportedProto[ver] {
+			ver = defaultProto
+		} // 最低限の互換を返す
 
 		// セッション発行（任意だが推奨）
 		sid := generateSecureSessionID()
@@ -1923,7 +2217,7 @@ func handleMCP(c *gin.Context) {
 			},
 		}
 		c.JSON(http.StatusOK, map[string]any{
-			"jsonrpc":"2.0","id":req.ID,"result":res,
+			"jsonrpc": "2.0", "id": req.ID, "result": res,
 		})
 		return
 
@@ -1932,7 +2226,7 @@ func handleMCP(c *gin.Context) {
 		return
 
 	case "ping":
-		c.JSON(http.StatusOK, map[string]any{"jsonrpc":"2.0","id":req.ID,"result":map[string]any{}})
+		c.JSON(http.StatusOK, map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{}})
 		return
 	}
 
@@ -1943,7 +2237,9 @@ func handleMCP(c *gin.Context) {
 		return
 	}
 	proto := c.GetHeader("MCP-Protocol-Version")
-	if proto == "" { proto = defaultProto }
+	if proto == "" {
+		proto = defaultProto
+	}
 	if !supportedProto[proto] {
 		c.AbortWithStatus(http.StatusBadRequest)
 		return
@@ -1954,7 +2250,7 @@ func handleMCP(c *gin.Context) {
 		// api.json → Tool 定義（inputSchema は camelCase）
 		result := buildToolsList() // []Tool と nextCursor を返す自前関数
 		c.JSON(http.StatusOK, map[string]any{
-			"jsonrpc":"2.0","id":req.ID,"result":result,
+			"jsonrpc": "2.0", "id": req.ID, "result": result,
 		})
 		return
 
@@ -1968,16 +2264,16 @@ func handleMCP(c *gin.Context) {
 		out := callJS(p.Name, p.Arguments, c) // 既存 runJavaScript をラップして取得
 		// MCP 形式の結果に整形（最低限 text）
 		c.JSON(http.StatusOK, map[string]any{
-			"jsonrpc":"2.0","id":req.ID,"result": map[string]any{
-				"content": []map[string]any{{"type":"text","text": stringOrJSON(out)}},
+			"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{
+				"content": []map[string]any{{"type": "text", "text": stringOrJSON(out)}},
 			},
 		})
 		return
 
 	default:
 		c.JSON(http.StatusOK, map[string]any{
-			"jsonrpc":"2.0","id":req.ID,
-			"error": map[string]any{"code":-32601,"message":"Method not found"},
+			"jsonrpc": "2.0", "id": req.ID,
+			"error": map[string]any{"code": -32601, "message": "Method not found"},
 		})
 		return
 	}

@@ -7,5 +7,11 @@
   "hello": {
     "script": "./javascript/hello.js",
     "description": "挨拶をしてくれるAPIです。/helloにwebsocketで接続するとaddにリクエストがあるとpush通知を受信できます。"
+  },
+  "websocket_clients_local": {
+    "type": "ws_client",
+    "script": "./javascript/ws/receiver_main.js",
+    "connectURL": "ws://localhost:8889/hello",
+    "description": "ローカル動作確認用（自身の /hello に接続）"
   }
 }
