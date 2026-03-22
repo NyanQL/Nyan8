@@ -15,7 +15,7 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 | **WebSocket Push** | `api.json` の `push` 設定だけで双方向通信を実現 |
 | **JSON‑RPC 2.0** | `/nyan‑rpc` エンドポイントで RPC を提供（Batch は今後対応） |
 | **メール送信** | `nyanSendMail` で CC/BCC・添付ファイルを含むメールを送信可能 |
-| **ファイル→Base64** | `nyanFileToBase64` でファイルを Base64 文字列へ一発変換 |
+| **ファイル→Base64** | `nyanReadFileB64` でファイルを Base64 文字列へ変換 |
 | **ホストコマンド実行** | `nyanHostExec` でシェルコマンドを呼び出し、結果を JSON 取得 |
 | **ログローテーション** | `lumberjack` による自動ローテーション／圧縮対応 |
 
@@ -139,7 +139,7 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 | 11 | `nyanGetRequestHeaders()`             | Header情報を取得できます。                  |
 | 12 | **`nyanCallMe()`**                     | 自分自身のAPIを内部実行で呼び出す                      |
 | 13 | **`nyanSendMail()`**                  | メール送信（添付可）                        |
-| 14 | **`nyanFileToBase64()`**              | ファイル → Base64 変換                  |
+| 14 | **`nyanReadFileB64()`**               | ファイル → Base64 変換                  |
 
 ### 4‑1 nyanAllParams
 GET/POST/JSON 受信パラメータをまとめたオブジェクトです。
@@ -163,7 +163,7 @@ cookieの取得と設定ができます。
 let val = nyanGetCookie("my_cookie");
 console.log("my_cookie:", val);
 // (2) 設定
-nyanSetCookie("my_cookie", "hello", 3600); // 1時間有効
+nyanSetCookie("my_cookie", "hello");
 ```
 
 ### 4‑4 nyanGetItem / nyanSetItem
@@ -182,7 +182,7 @@ idとpassはBASIC認証用のIDとパスワードです。必要に応じて設�
 
 ```javascript
 // (1) ヘッダー無しのリクエストの場合
-let res = nyanGetApi(
+let res = nyanGetAPI(
   "https://example.com/api",
   "id",
   "pass"
@@ -191,7 +191,7 @@ let res = nyanGetApi(
 let obj = JSON.parse(res);
 
 // (2) ヘッダー付きのリクエストの場合
-let res = nyanGetApi(
+let res = nyanGetAPI(
   "https://example.com/api",
   "id",
   "pass",
@@ -219,7 +219,7 @@ let res = nyanJsonAPI(
 );
 let obj = JSON.parse(res);
 
-// (2) ヘッダー付き – 5 番目の引数にオブジェクト or JSON 文字列
+// (2) ヘッダー付き – 5 番目の引数にオブジェクト
 let headers = {
   "X-Custom-Token": "abcd1234",
   "Content-Language": "ja"
@@ -233,20 +233,11 @@ let res2 = nyanJsonAPI(
   "pass",
   headers
 );
-
-// JSON 文字列で渡すことも可能
-let res3 = nyanJsonAPI(
-  "https://example.com/api",
-  '{"foo":"bar"}',
-  "id",
-  "pass",
-  JSON.stringify(headers)
-);
 ```
 
 > **ポイント**  
-> 5 番目の `headers` 引数は **オブジェクト**（`{key: "val"}`）と **JSON 文字列**（`'{"key":"val"}'`）の両方を受け付けます。  
-> ライブラリ側で自動判定・変換されるので、好きな書き方を選んでください。
+> 5 番目の `headers` 引数は **オブジェクト**（`{key: "val"}`）のみ受け付けます。  
+> JSON文字列を渡したい場合は、上位側で文字列をオブジェクト化してください。
 
 ---
 
@@ -318,10 +309,8 @@ let to = ["sample@exsample.com"];
 let subject = "Test Email from Nyan8";
 let body = "This is a test email sent from Nyan8.";
 let attachments = [
-  {
-    filename: "test.txt",
-    content: "Hello, this is a test file."
-  }];
+  nyanSendMailAttachment("./mail-body.txt")
+];
 let result = nyanSendMail(to, subject, body, attachments);
 console.log(result);
 ```
@@ -332,38 +321,35 @@ console.log(result);
 | to           | Array       | 宛先メールアドレスの配列                         |
 | subject      | String      | メール件名                                   |
 | body         | String      | メール本文                                   |
-| attachments  | Array       | 添付ファイルの配列。各要素はオブジェクトで、`filename` と `content` を含む。 |
+| attachments  | Array       | 添付ファイルの配列。各要素は `path` または `dataBase64` を持つ。|
 | cc           | Array       | CC 宛先メールアドレスの配列（省略可）               |
 | bcc          | Array       | BCC 宛先メールアドレスの配列（省略可）              |
-| isHtml       | Boolean     | true で HTML メールとして送信（省略可、デフォルト false） |
-| fromEmail    | String      | 送信元メールアドレス（省略可、config.json の設定が優先）   |
-| fromName     | String      | 送信元名（省略可、config.json の設定が優先）         |
-| replyTo      | String      | 返信先メールアドレス（省略可）                     |
-| replyToName  | String      | 返信先名（省略可）                           |
-   
-#### 戻り値
-成功時：`{ success: true, message: "Email sent successfully." }`
-失敗時：`{ success: false, message: "Error message." }`
+| html         | Boolean     | true で HTML メールとして送信（省略可、デフォルト false） |
 
-### 4‑13 ファイル→Base64 変換 nyanFileToBase64
+#### 戻り値
+成功時：`true`
+失敗時：JavaScript 側で例外（`Error` 相当）が投げられます。
+
+### 4‑13 添付ヘルパー nyanSendMailAttachment
+ファイルパスを渡すと、`nyanSendMail` 用の添付オブジェクトを返します。
+
+```javascript
+let attachment = nyanSendMailAttachment("./mail-body.txt");
+let result = nyanSendMail(["sample@example.com"], "Subject", "Body", [attachment]);
+console.log(result);
+```
+
+### 4‑14 ファイル→Base64 変換 nyanReadFileB64
 指定したファイルを Base64 文字列に変換します。
 
 ```javascript
-let base64Str = nyanFileToBase64("./image.png");
-   
+let base64Str = nyanReadFileB64("./image.png");
+       
 if (base64Str !== null) {
   console.log("Base64 String:", base64Str);
 } else {
   console.log("File not found.");
 }
-```
-
-### 4‑14 ファイル保存 nyanSaveFile  
-指定した Base64 文字列をデコードしてファイルに保存します。
-
-```javascript
-let b64 = "SGVsbG8sIFdvcmxkIQ=="; // "Hello, World!" の Base64
-nyanSaveFile(b64, "./storage/hello.txt");
 ```
 
 ### 4‑15 nyanCallMe
