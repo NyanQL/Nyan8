@@ -203,7 +203,7 @@ let res = nyanGetApi(
 
 let obj = JSON.parse(res);
 
-````
+```
 
 ### 4‑6 外部APIの呼び出し nyanJsonAPI
 JSONをPOSTするリクエストができます。
@@ -368,7 +368,7 @@ nyanSaveFile(b64, "./storage/hello.txt");
 
 ### 4‑15 nyanCallMe
 `nyanCallMe` は同一 Nyan8 プロセス内で、自身のAPIを直接実行します。  
-既存の `nyanGetAPI` / `nyanJsonAPI` と異なり、HTTP/HTTPS 経由を使わないため、証明書や `port` に依存しません（localhost前提の内部呼び出しで有効）。
+既存の `nyanGetAPI` / `nyanJsonAPI` と異なり、HTTP/HTTPS 経由を使わないため、証明書や `port` に依存しません。
 
 ```javascript
 let result = nyanCallMe({ api: "hello2" });

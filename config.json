@@ -6,7 +6,6 @@
   "certPath": "",
   "keyPath": "",
   "javascript_include": [
-    "./javascript/lib/nyanCallMe.js",
     "./javascript/base.js"
   ],
   "log": {

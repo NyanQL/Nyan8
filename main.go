@@ -1535,33 +1535,39 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 
 	vm.Set("nyanGetFile", newNyanGetFile(vm))
 
-	vm.Set("nyanCallSelfAPI", func(call goja.FunctionCall) goja.Value {
-		if len(call.Arguments) < 1 {
-			panic(vm.ToValue("api name is required"))
-		}
-		apiName := call.Argument(0).String()
+	vm.Set("nyanCallMe", func(call goja.FunctionCall) goja.Value {
+		apiName := "hello2"
+		params := map[string]interface{}{}
 
-		var params map[string]interface{}
-		if len(call.Arguments) >= 2 {
-			if raw := call.Argument(1).Export(); raw != nil {
-				if rawMap, ok := raw.(map[string]interface{}); ok {
-					params = rawMap
-				} else if rawObj, ok := call.Argument(1).(*goja.Object); ok {
-					if exported, err := rawObj.Export(); err == nil {
-						if rawMap, ok := exported.(map[string]interface{}); ok {
-							params = rawMap
+		if len(call.Arguments) >= 1 {
+			raw := call.Argument(0).Export()
+			if raw != nil {
+				if m, ok := raw.(map[string]interface{}); ok {
+					params = m
+				} else if obj, ok := call.Argument(0).(*goja.Object); ok {
+					if exported, err := obj.Export(); err == nil {
+						if m, ok := exported.(map[string]interface{}); ok {
+							params = m
 						}
 					}
 				}
 			}
 		}
-		if params == nil {
-			params = map[string]interface{}{}
+
+		if v, ok := params["api"]; ok {
+			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+				apiName = s
+			}
 		}
+		params["api"] = apiName
 
 		result, err := callNyanAPIFromVM(apiName, params, ginCtx)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
+		}
+		var parsed interface{}
+		if err := json.Unmarshal([]byte(result), &parsed); err == nil {
+			return vm.ToValue(parsed)
 		}
 		return vm.ToValue(result)
 	})
