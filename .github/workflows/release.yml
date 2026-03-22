@@ -38,8 +38,12 @@ jobs:
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             binary_name="${binary_name}.exe"
           fi
+          version="${{ github.ref_name }}"
+          if [ -z "${version}" ]; then
+            version="dev"
+          fi
 
-          go build -o "${binary_name}" main.go
+          go build -ldflags "-X main.BinaryVersion=${version}" -o "${binary_name}" main.go
 
           mkdir release_package
           cp "${binary_name}" release_package/

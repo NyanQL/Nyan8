@@ -8,14 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/dop251/goja"
-	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
-	"github.com/natefinch/lumberjack"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
-	"golang.org/x/text/encoding/japanese"
-	"golang.org/x/text/transform"
 	"io"
 	"io/ioutil"
 	"log"
@@ -34,6 +26,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/dop251/goja"
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	"github.com/natefinch/lumberjack"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/transform"
 )
 
 // ResponseData はAPIのレスポンスデータを表します。
@@ -135,6 +136,9 @@ type rpcReq struct {
 }
 
 var (
+	// BinaryVersion can be set at build time with:
+	// go build -ldflags "-X main.BinaryVersion=vX.Y.Z"
+	BinaryVersion = "v0.0.14"
 	supportedProto = map[string]bool{"2025-06-18": true, "2025-03-26": true}
 	sessions       sync.Map // sid -> struct{created time.Time}
 )
@@ -196,6 +200,16 @@ func main() {
 
 	// ロガーをセットアップ
 	initLogger(execDir)
+	binaryVersion := BinaryVersion
+	if strings.TrimSpace(binaryVersion) == "" {
+		binaryVersion = "unset"
+	}
+	configVersion := strings.TrimSpace(globalConfig.Version)
+	if configVersion == "" {
+		configVersion = "unset"
+	}
+	logger.Printf("Binary version: %s", binaryVersion)
+	logger.Printf("Config version: %s", configVersion)
 
 	r := gin.Default()
 	r.SetTrustedProxies(nil) // 信頼するプロキシの設定を解除
@@ -379,6 +393,16 @@ func loadConfig(filename string) (Config, error) {
 		return config, err
 	}
 	return config, nil
+}
+
+func getVersion() string {
+	if strings.TrimSpace(BinaryVersion) != "" {
+		return BinaryVersion
+	}
+	if strings.TrimSpace(globalConfig.Version) != "" {
+		return globalConfig.Version
+	}
+	return "dev"
 }
 
 // handleRequest はHTTPとWebSocketリクエストを処理します。
@@ -1324,7 +1348,7 @@ func handleNyan(c *gin.Context) {
 	nyanInfo := map[string]interface{}{
 		"name":    globalConfig.Name,
 		"profile": globalConfig.Profile,
-		"version": globalConfig.Version,
+		"version": getVersion(),
 	}
 
 	response := NyanResponse{
@@ -2213,7 +2237,7 @@ func handleMCP(c *gin.Context) {
 			},
 			"serverInfo": map[string]string{
 				"name":    globalConfig.Name,
-				"version": globalConfig.Version,
+				"version": getVersion(),
 			},
 		}
 		c.JSON(http.StatusOK, map[string]any{
