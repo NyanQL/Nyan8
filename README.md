@@ -369,6 +369,7 @@ nyanSaveFile(b64, "./storage/hello.txt");
 ### 4‑15 nyanCallMe
 `nyanCallMe` は同一 Nyan8 プロセス内で、自身のAPIを直接実行します。  
 既存の `nyanGetAPI` / `nyanJsonAPI` と異なり、HTTP/HTTPS 経由を使わないため、証明書や `port` に依存しません。
+`nyanCallMe` は呼び出した API の結果をそのまま返すため、通常は `JSON.parse` は不要です（必要なら型安全のために `typeof` チェックしてください）。
 
 ```javascript
 let result = nyanCallMe({ api: "hello2" });

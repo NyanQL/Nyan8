@@ -1539,20 +1539,19 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		apiName := "hello2"
 		params := map[string]interface{}{}
 
-		if len(call.Arguments) >= 1 {
-			raw := call.Argument(0).Export()
-			if raw != nil {
-				if m, ok := raw.(map[string]interface{}); ok {
-					params = m
-				} else if obj, ok := call.Argument(0).(*goja.Object); ok {
-					if exported, err := obj.Export(); err == nil {
+			if len(call.Arguments) >= 1 {
+				raw := call.Argument(0).Export()
+				if raw != nil {
+					if m, ok := raw.(map[string]interface{}); ok {
+						params = m
+					} else if obj, ok := call.Argument(0).(*goja.Object); ok {
+						exported := obj.Export()
 						if m, ok := exported.(map[string]interface{}); ok {
 							params = m
 						}
 					}
 				}
 			}
-		}
 
 		if v, ok := params["api"]; ok {
 			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
