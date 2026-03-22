@@ -421,7 +421,7 @@ func handleRequest(c *gin.Context) {
 // handleAPIRequest はAPIリクエストを処理します。
 func handleAPIRequest(c *gin.Context) {
 	// 実行ファイルのディレクトリを取得
-	fmt.Print(" handleAPIRequest 直後")
+	fmt.Print("handleAPIRequest: ")
 	fmt.Print(c.Request.URL.Path)
 	execPath, err := filepath.Abs(filepath.Dir(os.Args[0]))
 	if err != nil {
@@ -783,6 +783,54 @@ func runJavaScript(scriptPath string, allParams map[string]interface{}, ginCtx *
 	return value.String(), nil
 }
 
+// callNyanAPIFromVM は、main.go 側から自身のAPI定義(js)を直接実行します。
+func callNyanAPIFromVM(apiName string, allParams map[string]interface{}, ginCtx *gin.Context) (string, error) {
+	if strings.TrimSpace(apiName) == "" {
+		return "", fmt.Errorf("api name is required")
+	}
+
+	execDir, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("failed to get working directory: %v", err)
+	}
+
+	apiConf, err := loadJSONFile(filepath.Join(execDir, "api.json"))
+	if err != nil {
+		return "", fmt.Errorf("failed to load api.json: %v", err)
+	}
+
+	apiRaw, ok := apiConf[apiName]
+	if !ok {
+		return "", fmt.Errorf("API config not found: %s", apiName)
+	}
+
+	apiMap, ok := apiRaw.(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("invalid API config format: %s", apiName)
+	}
+	if getAPIType(apiMap) != apiTypeAPI {
+		return "", fmt.Errorf("API %s is not an HTTP endpoint", apiName)
+	}
+
+	scriptPath, ok := apiMap["script"].(string)
+	if !ok || strings.TrimSpace(scriptPath) == "" {
+		return "", fmt.Errorf("script not found for API %s", apiName)
+	}
+
+	params := map[string]interface{}{}
+	for k, v := range allParams {
+		params[k] = v
+	}
+	params["api"] = apiName
+
+	fullScriptPath := filepath.Join(execDir, scriptPath)
+	result, err := runJavaScript(fullScriptPath, params, ginCtx)
+	if err != nil {
+		return "", fmt.Errorf("failed to run API %s: %v", apiName, err)
+	}
+	return result, nil
+}
+
 // loadJSONFile はJSONファイルを読み込みます。
 func loadJSONFile(filePath string) (map[string]interface{}, error) {
 	var jsonData map[string]interface{}
@@ -960,89 +1008,92 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 		}
 
 		currentAPIName := apiName // クロージャ用に退避
-		r.Any("/"+currentAPIName, func(c *gin.Context) {
-			// WebSocket アップグレードなら WebSocket ハンドラへ
-			if websocket.IsWebSocketUpgrade(c.Request) {
-				handleWebSocket(c)
-				return
-			}
-
-			// リクエストパラメータのマージ
-			allParams := make(map[string]interface{})
-			// URLクエリ
-			for key, values := range c.Request.URL.Query() {
-				allParams[key] = values[0]
-			}
-			// POSTフォーム
-			for key, values := range c.Request.PostForm {
-				allParams[key] = values[0]
-			}
-			// JSONボディ
-			if c.ContentType() == "application/json" {
-				var jsonBody map[string]interface{}
-				if err := c.BindJSON(&jsonBody); err == nil {
-					for k, v := range jsonBody {
-						allParams[k] = v
-					}
-				} else {
-					respondWithError(c, http.StatusBadRequest, "Invalid JSON data", err)
+		registerHandler := func(apiName string) gin.HandlerFunc {
+			return func(c *gin.Context) {
+				// WebSocket アップグレードなら WebSocket ハンドラへ
+				if websocket.IsWebSocketUpgrade(c.Request) {
+					handleWebSocket(c)
 					return
 				}
-			}
 
-			// エンドポイント名を "api" にセット
-			endpoint := c.FullPath()[1:]
-			if endpoint == "" {
-				endpoint = currentAPIName
-			}
-			allParams["api"] = endpoint
+				// リクエストパラメータのマージ
+				allParams := make(map[string]interface{})
+				// URLクエリ
+				for key, values := range c.Request.URL.Query() {
+					allParams[key] = values[0]
+				}
+				// POSTフォーム
+				for key, values := range c.Request.PostForm {
+					allParams[key] = values[0]
+				}
+				// JSONボディ
+				if c.ContentType() == "application/json" {
+					var jsonBody map[string]interface{}
+					if err := c.BindJSON(&jsonBody); err == nil {
+						for k, v := range jsonBody {
+							allParams[k] = v
+						}
+					} else {
+						respondWithError(c, http.StatusBadRequest, "Invalid JSON data", err)
+						return
+					}
+				}
 
-			// api.json から対象スクリプトを取得
-			scriptListData, err := loadJSONFile(filepath.Join(execDir, "api.json"))
-			if err != nil {
-				respondWithError(c, http.StatusInternalServerError, "Failed to load API configuration", err)
-				return
-			}
-			scriptInfo, ok := scriptListData[endpoint].(map[string]interface{})
-			if !ok {
-				respondWithError(c, http.StatusBadRequest, fmt.Sprintf("API config not found for key: %s", endpoint), nil)
-				return
-			}
-			if getAPIType(scriptInfo) != apiTypeAPI {
-				respondWithError(c, http.StatusBadRequest, fmt.Sprintf("API %s is not an HTTP/WebSocket endpoint", endpoint), nil)
-				return
-			}
-			scriptPath, ok := scriptInfo["script"].(string)
-			if !ok {
-				respondWithError(c, http.StatusBadRequest, fmt.Sprintf("Script path not found for key: %s", endpoint), nil)
-				return
-			}
+				// エンドポイント名を "api" にセット
+				allParams["api"] = apiName
 
-			// 実行
-			fullScriptPath := filepath.Join(execDir, scriptPath)
-			result, err := runJavaScript(fullScriptPath, allParams, c)
-			if err != nil {
-				respondWithError(c, http.StatusInternalServerError, "Failed to run JavaScript", err)
-				return
-			}
+				// api.json から対象スクリプトを取得
+				scriptListData, err := loadJSONFile(filepath.Join(execDir, "api.json"))
+				if err != nil {
+					respondWithError(c, http.StatusInternalServerError, "Failed to load API configuration", err)
+					return
+				}
+				scriptInfo, ok := scriptListData[apiName].(map[string]interface{})
+				if !ok {
+					respondWithError(c, http.StatusBadRequest, fmt.Sprintf("API config not found for key: %s", apiName), nil)
+					return
+				}
+				if getAPIType(scriptInfo) != apiTypeAPI {
+					respondWithError(c, http.StatusBadRequest, fmt.Sprintf("API %s is not an HTTP/WebSocket endpoint", apiName), nil)
+					return
+				}
+				scriptPath, ok := scriptInfo["script"].(string)
+				if !ok {
+					respondWithError(c, http.StatusBadRequest, fmt.Sprintf("Script path not found for key: %s", apiName), nil)
+					return
+				}
 
-			// 結果のパースと返却
-			var jsonData map[string]interface{}
-			if err := json.Unmarshal([]byte(result), &jsonData); err != nil {
-				respondWithError(c, http.StatusInternalServerError, "Failed to parse JavaScript response", err)
-				return
-			}
-			status, ok := jsonData["status"].(float64)
-			if !ok {
-				respondWithError(c, http.StatusInternalServerError, "Status field not found in JavaScript response", nil)
-				return
-			}
+				// 実行
+				fullScriptPath := filepath.Join(execDir, scriptPath)
+				result, err := runJavaScript(fullScriptPath, allParams, c)
+				if err != nil {
+					respondWithError(c, http.StatusInternalServerError, "Failed to run JavaScript", err)
+					return
+				}
 
-			// push 処理
-			performPush(scriptInfo, scriptListData, allParams, execDir)
+				// 結果のパースと返却
+				var jsonData map[string]interface{}
+				if err := json.Unmarshal([]byte(result), &jsonData); err != nil {
+					respondWithError(c, http.StatusInternalServerError, "Failed to parse JavaScript response", err)
+					return
+				}
+				status, ok := jsonData["status"].(float64)
+				if !ok {
+					respondWithError(c, http.StatusInternalServerError, "Status field not found in JavaScript response", nil)
+					return
+				}
 
-			c.JSON(int(status), jsonData)
-		})
+				// push 処理
+				performPush(scriptInfo, scriptListData, allParams, execDir)
+
+				c.JSON(int(status), jsonData)
+			}
+		}
+
+		r.Any("/"+currentAPIName, registerHandler(currentAPIName))
+		if !strings.HasPrefix(currentAPIName, "api/") {
+			r.Any("/api/"+currentAPIName, registerHandler(currentAPIName))
+		}
 	}
 	return nil
 }
@@ -1548,6 +1599,37 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 	})
 
 	vm.Set("nyanGetFile", newNyanGetFile(vm))
+
+	vm.Set("nyanCallSelfAPI", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			panic(vm.ToValue("api name is required"))
+		}
+		apiName := call.Argument(0).String()
+
+		var params map[string]interface{}
+		if len(call.Arguments) >= 2 {
+			if raw := call.Argument(1).Export(); raw != nil {
+				if rawMap, ok := raw.(map[string]interface{}); ok {
+					params = rawMap
+				} else if rawObj, ok := call.Argument(1).(*goja.Object); ok {
+					if exported, err := rawObj.Export(); err == nil {
+						if rawMap, ok := exported.(map[string]interface{}); ok {
+							params = rawMap
+						}
+					}
+				}
+			}
+		}
+		if params == nil {
+			params = map[string]interface{}{}
+		}
+
+		result, err := callNyanAPIFromVM(apiName, params, ginCtx)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(result)
+	})
 
 	/* ===============================================================
 	   nyanSendMail

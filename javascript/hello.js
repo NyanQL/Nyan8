@@ -1,18 +1,19 @@
+function main () {
+  let name = 'Nyan8'
+  if (typeof nyanAllParams.name !== 'undefined') {
+    name = nyanAllParams.name
+  }
 
-function main(){
+  let log = nyanCallMe({ api: 'hello2' })
+  console.log(log)
 
-    let name = "Nyan8";
-    if(typeof nyanAllParams.name !== "undefined")
-    {
-        name = nyanAllParams.name;
+  return JSON.stringify({
+    success: true,
+    status: 200,
+    data: {
+      message: 'hello! ' + name
     }
-    return JSON.stringify({
-        "success": true,
-        "status": 200,
-        "data": {
-           "message": "hello! " + name
-        },
-    });
+  })
 }
 
-main();
+main()
