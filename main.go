@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
-	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -61,7 +60,6 @@ type Config struct {
 	JavaScriptInclude []string           `json:"javascript_include"`
 	Log               LogConfig          `json:"log"`
 	SMTP              SMTPConfig         `json:"smtp"`
-	PushReceiver      PushReceiverConfig `json:"push_receiver"`
 }
 
 // LogConfig はログ設定データを表します。
@@ -115,11 +113,6 @@ type SMTPConfig struct {
 	FromName   string   `json:"from_name"`
 	TLS        bool     `json:"tls"`
 	DefaultBCC []string `json:"default_bcc"`
-}
-
-type PushReceiverConfig struct {
-	Enabled bool   `json:"enabled"`
-	Secret  string `json:"secret"`
 }
 
 type MailAttachment struct {
@@ -231,7 +224,6 @@ func main() {
 	r.POST("/nyan-toolbox", handleMCP)                // JSON-RPC 全メソッド
 	r.GET("/nyan-toolbox", handleMCPGet)              // SSEしない場合は 405
 	r.DELETE("/nyan-toolbox", handleMCPDeleteSession) // 任意: セッション明示終了
-	r.POST("/push-in/:target", handlePushIn)
 
 	r.Any("/nyan", handleNyan)
 	r.Any("/nyan/:apiName", handleNyanDetail)
@@ -989,7 +981,6 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 		"nyan":         {},
 		"nyan-rpc":     {},
 		"nyan-toolbox": {},
-		"push-in":      {},
 	}
 
 	for apiName, apiRaw := range apiConf {
@@ -1311,62 +1302,6 @@ func performPush(scriptInfo map[string]interface{}, scriptListData map[string]in
 			}
 		}
 	}
-}
-
-// handlePushIn は外部からの push 受信を処理し、指定 target の WebSocket 接続へ転送する
-func handlePushIn(c *gin.Context) {
-	if !globalConfig.PushReceiver.Enabled {
-		respondWithError(c, http.StatusNotFound, "push receiver disabled", nil)
-		return
-	}
-
-	secret := strings.TrimSpace(globalConfig.PushReceiver.Secret)
-	if secret == "" {
-		respondWithError(c, http.StatusForbidden, "push receiver secret not configured", nil)
-		return
-	}
-
-	auth := c.GetHeader("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") {
-		respondWithError(c, http.StatusUnauthorized, "missing or invalid authorization header", nil)
-		return
-	}
-	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
-	if subtle.ConstantTimeCompare([]byte(token), []byte(secret)) != 1 {
-		respondWithError(c, http.StatusUnauthorized, "invalid token", nil)
-		return
-	}
-
-	target := c.Param("target")
-	if target == "" {
-		respondWithError(c, http.StatusBadRequest, "missing target", nil)
-		return
-	}
-
-	payload, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		respondWithError(c, http.StatusInternalServerError, "failed to read request body", err)
-		return
-	}
-
-	rawConn, ok := pushConnections.Load(target)
-	if !ok {
-		respondWithError(c, http.StatusNotFound, fmt.Sprintf("no active push connection for %s", target), nil)
-		return
-	}
-	conn, ok := rawConn.(*websocket.Conn)
-	if !ok {
-		respondWithError(c, http.StatusInternalServerError, "invalid push connection", nil)
-		return
-	}
-
-	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
-		respondWithError(c, http.StatusInternalServerError, "failed to deliver push message", err)
-		return
-	}
-
-	logger.Printf("Push-in delivered to %s (%d bytes)", target, len(payload))
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
 // handleNyan は /nyan エンドポイントを処理します。

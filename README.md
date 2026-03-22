@@ -56,10 +56,6 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
     "Compress": true,               // 圧縮
     "EnableLogging": true           // false=コンソールのみ
   },
-  "push_receiver": {
-    "enabled": true,               // false で無効化
-    "secret": "changeme"           // Authorization: Bearer <secret>
-  },
   "smtp": {
     "host": "smtp.example.com",
     "port": 465,
@@ -82,21 +78,6 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 * **MaxAge** – 保持日数
 * **Compress** – 過去ファイルを gzip 圧縮
 * **EnableLogging** – false で標準出力のみ
-
-</details>
-
-### Push-In 受信（外部からの中継）
-
-- 設定: `push_receiver.enabled=true` で有効化、`secret` を Bearer トークンに設定。
-- エンドポイント: `POST /push-in/:target` （`Authorization: Bearer <secret>` 必須）。`target` は WebSocket のパス名（例: `hello`）。
-- 動作: 受信ボディをそのまま `target` に接続中の WebSocket へテキストで転送。
-- 例:
-  ```bash
-  curl -X POST http://localhost:8889/push-in/hello \
-    -H "Authorization: Bearer changeme" \
-    -d '{"msg":"hi"}'
-  ```
-  ※送信先の WebSocket (`ws://localhost:8889/hello`) が接続済みであることが前提です。
 
 </details>
 
@@ -156,8 +137,9 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 | 9  | `nyanGetRemoteIP()`                   | リモートIPを取得                         |
 | 10 | `nyanGetUserAgent()`                  | UserAgentを取得                      |
 | 11 | `nyanGetRequestHeaders()`             | Header情報を取得できます。                  |
-| 12 | **`nyanSendMail()`**                  | メール送信（添付可）                        |
-| 13 | **`nyanFileToBase64()`**              | ファイル → Base64 変換                  |
+| 12 | **`nyanCallMe()`**                     | 自分自身のAPIを内部実行で呼び出す                      |
+| 13 | **`nyanSendMail()`**                  | メール送信（添付可）                        |
+| 14 | **`nyanFileToBase64()`**              | ファイル → Base64 変換                  |
 
 ### 4‑1 nyanAllParams
 GET/POST/JSON 受信パラメータをまとめたオブジェクトです。
@@ -382,6 +364,38 @@ if (base64Str !== null) {
 ```javascript
 let b64 = "SGVsbG8sIFdvcmxkIQ=="; // "Hello, World!" の Base64
 nyanSaveFile(b64, "./storage/hello.txt");
+```
+
+### 4‑15 nyanCallMe
+`nyanCallMe` は同一 Nyan8 プロセス内で、自身のAPIを直接実行します。  
+既存の `nyanGetAPI` / `nyanJsonAPI` と異なり、HTTP/HTTPS 経由を使わないため、証明書や `port` に依存しません（localhost前提の内部呼び出しで有効）。
+
+```javascript
+let result = nyanCallMe({ api: "hello2" });
+console.log(result); // { success: true, status: 200, data: ...}
+```
+
+#### 挙動
+- `data.api` でAPI名を指定します。指定が無い場合は `hello2` が呼ばれます。
+- 引数オブジェクトは、そのまま呼び出し先 API の `nyanAllParams` に渡されます。
+- 実行に失敗すると `{ success: false, status: 500, error: {...} }` 形式で返ります。
+
+#### よくある使い方
+自分自身の API から別 API を呼び出して結果をマージする用途です。
+
+```javascript
+function main() {
+  let child = nyanCallMe({ api: "hello2", name: "Nyan" });
+  return JSON.stringify({
+    success: true,
+    status: 200,
+    data: {
+      message: "wrapper",
+      child: child
+    }
+  });
+}
+main();
 ```
 
 ### 5  API エンドポイント

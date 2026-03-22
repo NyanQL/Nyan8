@@ -28,9 +28,5 @@
     "default_bcc": [
       ""
     ]
-  },
-  "push_receiver": {
-    "enabled": true,
-    "secret": "changeme"
   }
 }
