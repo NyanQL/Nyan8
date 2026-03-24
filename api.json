@@ -8,6 +8,10 @@
     "script": "./javascript/hello.js",
     "description": "挨拶をしてくれるAPIです。/helloにwebsocketで接続するとaddにリクエストがあるとpush通知を受信できます。"
   },
+  "hello2" : {
+    "script": "./javascript/hello2.js",
+    "description": "helloと返すだけです"
+  },
   "websocket_clients_local": {
     "type": "ws_client",
     "script": "./javascript/ws/receiver_main.js",
