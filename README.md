@@ -131,7 +131,7 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 | 3  | `nyanGetCookie()` / `nyanSetCookie()` | Cookie 操作                         |
 | 4  | `nyanGetItem()` / `nyanSetItem()`     | メモリ内 key‑value ストレージ              |
 | 5  | `nyanGetAPI()`                        | HTTP GET                          |
-| 6  | `nyanJsonAPI()`                       | HTTP POST（JSON）                   |
+| 6  | `nyanJsonAPI()` / `nyanCallAPI()`    | HTTP POST（JSON）                   |
 | 7  | `nyanHostExec()`                      | ホスト OS でシェル実行し結果取得                |
 | 8  | `nyanGetFile()`                       | サーバー上のファイルを読み込み ファイルが存在しない場合はnull |
 | 9  | `nyanGetRemoteIP()`                   | リモートIPを取得                         |
@@ -177,7 +177,7 @@ console.log("my_key:", val);
 nyanSetItem("my_key", "hello");
 ```
 ### 4‑5 外部APIの呼び出し nyanGetAPI
-nyanGetAPI と nyanJsonAPI は外部 API を呼び出すためのユーティリティです。
+nyanGetAPI と nyanJsonAPI と nyanCallAPI は外部 API を呼び出すためのユーティリティです。
 idとpassはBASIC認証用のIDとパスワードです。必要に応じて設定してください。
 
 ```javascript
@@ -205,8 +205,8 @@ let obj = JSON.parse(res);
 
 ```
 
-### 4‑6 外部APIの呼び出し nyanJsonAPI
-JSONをPOSTするリクエストができます。
+### 4‑6 外部APIの呼び出し nyanJsonAPI / nyanCallAPI
+JSON を POST するリクエストができます。`nyanCallAPI()` は `nyanJsonAPI()` のラッパーで、引数と挙動は同じです。
 idとpassはBASIC認証用のIDとパスワードです。必要に応じて設定してください。
 
 ```javascript
@@ -227,6 +227,15 @@ let headers = {
 
 // オブジェクトをそのまま渡す
 let res2 = nyanJsonAPI(
+  "https://example.com/api",
+  JSON.stringify({ foo: "bar" }),
+  "id",
+  "pass",
+  headers
+);
+
+// nyanCallAPI でも同じように呼び出せる
+let res3 = nyanCallAPI(
   "https://example.com/api",
   JSON.stringify({ foo: "bar" }),
   "id",
@@ -354,7 +363,7 @@ if (base64Str !== null) {
 
 ### 4‑15 nyanCallMe
 `nyanCallMe` は同一 Nyan8 プロセス内で、自身のAPIを直接実行します。  
-既存の `nyanGetAPI` / `nyanJsonAPI` と異なり、HTTP/HTTPS 経由を使わないため、証明書や `port` に依存しません。
+既存の `nyanGetAPI` / `nyanJsonAPI` / `nyanCallAPI` と異なり、HTTP/HTTPS 経由を使わないため、証明書や `port` に依存しません。
 `nyanCallMe` は呼び出した API の結果をそのまま返すため、通常は `JSON.parse` は不要です（必要なら型安全のために `typeof` チェックしてください）。
 
 ```javascript

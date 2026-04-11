@@ -131,7 +131,7 @@ type rpcReq struct {
 var (
 	// BinaryVersion can be set at build time with:
 	// go build -ldflags "-X main.BinaryVersion=vX.Y.Z"
-	BinaryVersion = "v0.0.14"
+	BinaryVersion = "v0.0.15"
 	supportedProto = map[string]bool{"2025-06-18": true, "2025-03-26": true}
 	sessions       sync.Map // sid -> struct{created time.Time}
 )
@@ -1496,7 +1496,7 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		"log": func(args ...interface{}) { logger.Print(args...) },
 	})
 
-	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
+	jsonAPIFunc := func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
 		data := call.Argument(1).String()
 		user := call.Argument(2).String()
@@ -1516,7 +1516,9 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 			panic(vm.ToValue(err.Error()))
 		}
 		return vm.ToValue(res)
-	})
+	}
+	vm.Set("nyanJsonAPI", jsonAPIFunc)
+	vm.Set("nyanCallAPI", jsonAPIFunc)
 
 	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) == 0 {
