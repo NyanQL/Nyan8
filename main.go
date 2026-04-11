@@ -854,6 +854,17 @@ func CORSMiddleware() gin.HandlerFunc {
 	}
 }
 
+func extractHeaders(arg goja.Value) map[string]string {
+	if m, ok := arg.Export().(map[string]interface{}); ok {
+		hdr := make(map[string]string, len(m))
+		for k, v := range m {
+			hdr[k] = fmt.Sprint(v)
+		}
+		return hdr
+	}
+	return nil
+}
+
 func getAPI(url, username, password string) (string, error) {
 	// HTTPクライアントの生成
 	client := &http.Client{}
@@ -1504,12 +1515,7 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 
 		var hdr map[string]string
 		if len(call.Arguments) >= 5 {
-			if m, ok := call.Argument(4).Export().(map[string]interface{}); ok {
-				hdr = make(map[string]string)
-				for k, v := range m {
-					hdr[k] = fmt.Sprint(v)
-				}
-			}
+			hdr = extractHeaders(call.Argument(4))
 		}
 		res, err := jsonAPI(url, []byte(data), user, pass, hdr)
 		if err != nil {

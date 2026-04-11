@@ -178,10 +178,10 @@ nyanSetItem("my_key", "hello");
 ```
 ### 4‑5 外部APIの呼び出し nyanGetAPI
 nyanGetAPI と nyanJsonAPI と nyanCallAPI は外部 API を呼び出すためのユーティリティです。
+`nyanGetAPI(url, username, password)` は GET リクエストを送信します。
 idとpassはBASIC認証用のIDとパスワードです。必要に応じて設定してください。
 
 ```javascript
-// (1) ヘッダー無しのリクエストの場合
 let res = nyanGetAPI(
   "https://example.com/api",
   "id",
@@ -189,20 +189,6 @@ let res = nyanGetAPI(
 );
 
 let obj = JSON.parse(res);
-
-// (2) ヘッダー付きのリクエストの場合
-let res = nyanGetAPI(
-  "https://example.com/api",
-  "id",
-  "pass",
-  {
-    "X-Custom-Token": "abcd1234",
-    "Content-Language": "ja"
-  }
-);
-
-let obj = JSON.parse(res);
-
 ```
 
 ### 4‑6 外部APIの呼び出し nyanJsonAPI / nyanCallAPI
