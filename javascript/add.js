@@ -7,6 +7,7 @@ function main () {
   console.log('nyanHostExec:' + typeof nyanHostExec)
   console.log('nyanGetAPI:' + typeof nyanGetAPI)
   console.log('nyanJsonAPI:' + typeof nyanJsonAPI)
+  console.log('nyanCallAPI:' + typeof nyanCallAPI)
   console.log('nyanGetItem:' + typeof nyanGetItem)
   console.log('nyanSetItem:' + typeof nyanSetItem)
   console.log('nyanSetCookie:' + typeof nyanSetCookie)

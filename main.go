@@ -131,7 +131,7 @@ type rpcReq struct {
 var (
 	// BinaryVersion can be set at build time with:
 	// go build -ldflags "-X main.BinaryVersion=vX.Y.Z"
-	BinaryVersion = "v0.0.14"
+	BinaryVersion = "v0.0.15"
 	supportedProto = map[string]bool{"2025-06-18": true, "2025-03-26": true}
 	sessions       sync.Map // sid -> struct{created time.Time}
 )
@@ -854,6 +854,17 @@ func CORSMiddleware() gin.HandlerFunc {
 	}
 }
 
+func extractHeaders(arg goja.Value) map[string]string {
+	if m, ok := arg.Export().(map[string]interface{}); ok {
+		hdr := make(map[string]string, len(m))
+		for k, v := range m {
+			hdr[k] = fmt.Sprint(v)
+		}
+		return hdr
+	}
+	return nil
+}
+
 func getAPI(url, username, password string) (string, error) {
 	// HTTPクライアントの生成
 	client := &http.Client{}
@@ -1496,7 +1507,7 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		"log": func(args ...interface{}) { logger.Print(args...) },
 	})
 
-	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
+	jsonAPIFunc := func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
 		data := call.Argument(1).String()
 		user := call.Argument(2).String()
@@ -1504,19 +1515,16 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 
 		var hdr map[string]string
 		if len(call.Arguments) >= 5 {
-			if m, ok := call.Argument(4).Export().(map[string]interface{}); ok {
-				hdr = make(map[string]string)
-				for k, v := range m {
-					hdr[k] = fmt.Sprint(v)
-				}
-			}
+			hdr = extractHeaders(call.Argument(4))
 		}
 		res, err := jsonAPI(url, []byte(data), user, pass, hdr)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
 		return vm.ToValue(res)
-	})
+	}
+	vm.Set("nyanJsonAPI", jsonAPIFunc)
+	vm.Set("nyanCallAPI", jsonAPIFunc)
 
 	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) == 0 {

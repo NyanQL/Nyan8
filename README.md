@@ -109,7 +109,7 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 ```jsonc
 "websocket_clients_local": {
   "type": "ws_client",
-  "script": "./javascript/ws/receiver_main.js",
+  "script": "./javascript/ws_client_handler.js",
   "connectURL": "ws://localhost:8889/hello",
   "description": "ローカル動作確認用（自身の /hello に接続）"
 }
@@ -118,7 +118,7 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 受信したメッセージは `script` で指定した JavaScript に `nyanAllParams` として渡され、戻り値がそのまま上流の WebSocket へ送信されます（空文字を返すと返信しません）。
 
 動かし方の例:
-- まずはローカルで挙動を見る場合: 上記 `websocket_clients_local` を有効のままにして `./nyan8ctl.sh start`。別ターミナルで `python3 /tmp/ws-broadcast.py`（同梱のローカル WS サーバー例）や手持ちの WS クライアントから `ws://localhost:8889/hello` に送ると、`receiver_main.js` の応答が見えます。
+- まずはローカルで挙動を見る場合: 上記 `websocket_clients_local` を有効のままにして `./nyan8`（ソースから試す場合は `sh testrun.sh`）を起動します。別ターミナルで手持ちの WebSocket クライアントから `ws://localhost:8889/hello` に送ると、指定した `script` の応答が見えます。
 
 ---
 
@@ -131,7 +131,7 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 | 3  | `nyanGetCookie()` / `nyanSetCookie()` | Cookie 操作                         |
 | 4  | `nyanGetItem()` / `nyanSetItem()`     | メモリ内 key‑value ストレージ              |
 | 5  | `nyanGetAPI()`                        | HTTP GET                          |
-| 6  | `nyanJsonAPI()`                       | HTTP POST（JSON）                   |
+| 6  | `nyanJsonAPI()` / `nyanCallAPI()`    | HTTP POST（JSON）                   |
 | 7  | `nyanHostExec()`                      | ホスト OS でシェル実行し結果取得                |
 | 8  | `nyanGetFile()`                       | サーバー上のファイルを読み込み ファイルが存在しない場合はnull |
 | 9  | `nyanGetRemoteIP()`                   | リモートIPを取得                         |
@@ -177,11 +177,11 @@ console.log("my_key:", val);
 nyanSetItem("my_key", "hello");
 ```
 ### 4‑5 外部APIの呼び出し nyanGetAPI
-nyanGetAPI と nyanJsonAPI は外部 API を呼び出すためのユーティリティです。
+nyanGetAPI と nyanJsonAPI と nyanCallAPI は外部 API を呼び出すためのユーティリティです。
+`nyanGetAPI(url, username, password)` は GET リクエストを送信します。
 idとpassはBASIC認証用のIDとパスワードです。必要に応じて設定してください。
 
 ```javascript
-// (1) ヘッダー無しのリクエストの場合
 let res = nyanGetAPI(
   "https://example.com/api",
   "id",
@@ -189,24 +189,10 @@ let res = nyanGetAPI(
 );
 
 let obj = JSON.parse(res);
-
-// (2) ヘッダー付きのリクエストの場合
-let res = nyanGetAPI(
-  "https://example.com/api",
-  "id",
-  "pass",
-  {
-    "X-Custom-Token": "abcd1234",
-    "Content-Language": "ja"
-  }
-);
-
-let obj = JSON.parse(res);
-
 ```
 
-### 4‑6 外部APIの呼び出し nyanJsonAPI
-JSONをPOSTするリクエストができます。
+### 4‑6 外部APIの呼び出し nyanJsonAPI / nyanCallAPI
+JSON を POST するリクエストができます。`nyanCallAPI()` は `nyanJsonAPI()` のラッパーで、引数と挙動は同じです。
 idとpassはBASIC認証用のIDとパスワードです。必要に応じて設定してください。
 
 ```javascript
@@ -227,6 +213,15 @@ let headers = {
 
 // オブジェクトをそのまま渡す
 let res2 = nyanJsonAPI(
+  "https://example.com/api",
+  JSON.stringify({ foo: "bar" }),
+  "id",
+  "pass",
+  headers
+);
+
+// nyanCallAPI でも同じように呼び出せる
+let res3 = nyanCallAPI(
   "https://example.com/api",
   JSON.stringify({ foo: "bar" }),
   "id",
@@ -254,21 +249,22 @@ console.log(result);
 #### console.log() の出力例： 
 stdout にコマンドの標準出力、 stderr に標準エラー出力が入ります。
 
-エラーが発生した場合はexitCode が 0 以外になります。 
-正常に処理が完了した場合、exitCode が 0 になります。 
+コマンドの実行に失敗した場合や終了コードが 0 以外の場合は、JavaScript 側で例外が投げられます。
+正常に処理が完了した場合、`success` が `true`、`exit_code` が `0` になります。
 ```json
 {
+  "success": true,
   "stdout": "total 8\ndrwxr-xr-x  4 user  staff  128 Aug 15 12:00 .\ndrwxr-xr-x 10 user  staff  320 Aug 15 11:59 ..\n-rw-r--r--  1 user  staff   0 Aug 15 12:00 file1.txt\n-rw-r--r--  1 user  staff   0 Aug 15 12:00 file2.txt\n",
   "stderr": "",
-  "exitCode": 0
+  "exit_code": 0
 }
 ```
 
 ### 4‑8 nyanGetFile
 サーバー上のファイルを読み込み、内容を文字列として取得します。
 
-実行するNyan8バイナリーからの相対パスでも絶対パスでもファイルを指定することができます。
-ファイルが存在しない場合 nullが返却されます。
+実行中の Nyan8 バイナリのディレクトリからの相対パスでファイルを指定します。
+ファイルが存在しない場合やディレクトリを指定した場合は `null` が返却されます。権限エラーなどその他の失敗時は JavaScript 側で例外が投げられます。
 
 ```javascript
 let content = nyanGetFile("./data.txt");
@@ -305,18 +301,19 @@ console.log("Request Headers:", headers);
 強力なメール送信機能を備えています。CC/BCC、添付ファイルもサポートしています。
 
 ```javascript
-let to = ["sample@exsample.com"];
-let subject = "Test Email from Nyan8";
-let body = "This is a test email sent from Nyan8.";
-let attachments = [
-  nyanSendMailAttachment("./mail-body.txt")
-];
-let result = nyanSendMail(to, subject, body, attachments);
+let result = nyanSendMail({
+  to: ["sample@example.com"],
+  subject: "Test Email from Nyan8",
+  body: "This is a test email sent from Nyan8.",
+  attachments: [
+    nyanSendMailAttachment("./mail-body.txt")
+  ]
+});
 console.log(result);
 ```
 
-#### 引数
-| 引数         | 型          | 説明                                      |
+#### オブジェクト形式のキー
+| キー         | 型          | 説明                                      |
 |--------------|-------------|-----------------------------------------|
 | to           | Array       | 宛先メールアドレスの配列                         |
 | subject      | String      | メール件名                                   |
@@ -325,6 +322,9 @@ console.log(result);
 | cc           | Array       | CC 宛先メールアドレスの配列（省略可）               |
 | bcc          | Array       | BCC 宛先メールアドレスの配列（省略可）              |
 | html         | Boolean     | true で HTML メールとして送信（省略可、デフォルト false） |
+
+#### 旧シグネチャ
+`nyanSendMail(to, subject, body, html, cc, bcc)` も利用できます。こちらは添付ファイルを受け取りません。
 
 #### 戻り値
 成功時：`true`
@@ -343,18 +343,17 @@ console.log(result);
 指定したファイルを Base64 文字列に変換します。
 
 ```javascript
-let base64Str = nyanReadFileB64("./image.png");
-       
-if (base64Str !== null) {
+try {
+  let base64Str = nyanReadFileB64("./image.png");
   console.log("Base64 String:", base64Str);
-} else {
-  console.log("File not found.");
+} catch (e) {
+  console.log("read error:", String(e));
 }
 ```
 
 ### 4‑15 nyanCallMe
 `nyanCallMe` は同一 Nyan8 プロセス内で、自身のAPIを直接実行します。  
-既存の `nyanGetAPI` / `nyanJsonAPI` と異なり、HTTP/HTTPS 経由を使わないため、証明書や `port` に依存しません。
+既存の `nyanGetAPI` / `nyanJsonAPI` / `nyanCallAPI` と異なり、HTTP/HTTPS 経由を使わないため、証明書や `port` に依存しません。
 `nyanCallMe` は呼び出した API の結果をそのまま返すため、通常は `JSON.parse` は不要です（必要なら型安全のために `typeof` チェックしてください）。
 
 ```javascript
@@ -363,9 +362,9 @@ console.log(result); // { success: true, status: 200, data: ...}
 ```
 
 #### 挙動
-- `data.api` でAPI名を指定します。指定が無い場合は `hello2` が呼ばれます。
+- `api` でAPI名を指定します。指定が無い場合は `hello2` が呼ばれます。
 - 引数オブジェクトは、そのまま呼び出し先 API の `nyanAllParams` に渡されます。
-- 実行に失敗すると `{ success: false, status: 500, error: {...} }` 形式で返ります。
+- 実行に失敗すると JavaScript 側で例外が投げられます。
 
 #### よくある使い方
 自分自身の API から別 API を呼び出して結果をマージする用途です。
@@ -391,12 +390,21 @@ main();
 **レスポンス例**
 ```json
 {
-  "name": "Nyan8 Server",
-  "profile": "dev",
-  "version": "1.0.0",
+  "nyan": {
+    "name": "Nyan8 Server",
+    "profile": "dev",
+    "version": "vX.Y.Z"
+  },
   "apis": {
-    "add": { "description": "2 に足す API" },
-    "add_push": { "description": "add の結果を push 配信" }
+    "add": {
+      "description": "2 に足す API",
+      "push": "add_push",
+      "type": "api"
+    },
+    "add_push": {
+      "description": "add の結果を push 配信",
+      "type": "api"
+    }
   }
 }
 ```
@@ -406,6 +414,7 @@ main();
 ```json
 {
   "api": "add",
+  "type": "api",
   "description": "2 に足す API",
   "nyanAcceptedParams": { "num": "数値" },
   "nyanOutputColumns": ["result"]
