@@ -1195,9 +1195,22 @@ func runParamCheck(c *gin.Context, apiMap map[string]interface{}, execDir string
 }
 
 func runOutCheck(c *gin.Context, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response APIResponse) bool {
+	handled, checkResponse, err := runOutCheckResponse(apiMap, execDir, allParams, response, c)
+	if !handled {
+		return false
+	}
+	if err != nil {
+		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
+		return true
+	}
+	writeParamCheckResponse(c, checkResponse)
+	return true
+}
+
+func runOutCheckResponse(apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response APIResponse, ginCtx *gin.Context) (bool, ParamCheckResponse, error) {
 	outCheckPath := getAPIString(apiMap, "outCheck", "outcheck")
 	if outCheckPath == "" {
-		return false
+		return false, ParamCheckResponse{}, nil
 	}
 
 	checkParams := cloneParams(allParams)
@@ -1219,24 +1232,20 @@ func runOutCheck(c *gin.Context, apiMap map[string]interface{}, execDir string, 
 
 	fullPath, err := resolvePath(execDir, outCheckPath)
 	if err != nil {
-		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
-		return true
+		return true, ParamCheckResponse{}, err
 	}
-	resultValue, err := runJavaScriptValue(fullPath, checkParams, c)
+	resultValue, err := runJavaScriptValue(fullPath, checkParams, ginCtx)
 	if err != nil {
-		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
-		return true
+		return true, ParamCheckResponse{}, err
 	}
 	checkResponse, err := parseCheckResponse(resultValue, "outCheck")
 	if err != nil {
-		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
-		return true
+		return true, ParamCheckResponse{}, err
 	}
 	if checkResponse.Success && checkResponse.Status == http.StatusOK {
-		return false
+		return false, ParamCheckResponse{}, nil
 	}
-	writeParamCheckResponse(c, checkResponse)
-	return true
+	return true, checkResponse, nil
 }
 
 func registerPublicEndpoint(r *gin.Engine, endpoint string, apiMap map[string]interface{}, execDir string) {
@@ -1376,30 +1385,11 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 					return
 				}
 
-				// リクエストパラメータのマージ
-				allParams := make(map[string]interface{})
-				// URLクエリ
-				for key, values := range c.Request.URL.Query() {
-					allParams[key] = values[0]
+				allParams, err := collectRequestParams(c)
+				if err != nil {
+					respondWithError(c, http.StatusBadRequest, "Invalid JSON data", err)
+					return
 				}
-				// POSTフォーム
-				for key, values := range c.Request.PostForm {
-					allParams[key] = values[0]
-				}
-				// JSONボディ
-				if c.ContentType() == "application/json" {
-					var jsonBody map[string]interface{}
-					if err := c.BindJSON(&jsonBody); err == nil {
-						for k, v := range jsonBody {
-							allParams[k] = v
-						}
-					} else {
-						respondWithError(c, http.StatusBadRequest, "Invalid JSON data", err)
-						return
-					}
-				}
-
-				// エンドポイント名を "api" にセット
 				allParams["api"] = apiName
 
 				// api.json から対象スクリプトを取得
@@ -1417,23 +1407,41 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 					respondWithError(c, http.StatusBadRequest, fmt.Sprintf("API %s is not an HTTP/WebSocket endpoint", apiName), nil)
 					return
 				}
-				scriptPath, ok := scriptInfo["script"].(string)
-				if !ok {
-					respondWithError(c, http.StatusBadRequest, fmt.Sprintf("Script path not found for key: %s", apiName), nil)
+
+				if allowed, handled := runParamCheck(c, scriptInfo, execDir, allParams); handled {
+					return
+				} else if !allowed {
 					return
 				}
 
 				// 実行
-				fullScriptPath := filepath.Join(execDir, scriptPath)
+				scriptPath := getAPIString(scriptInfo, "script")
+				if scriptPath == "" {
+					respondWithError(c, http.StatusBadRequest, fmt.Sprintf("Script path not found for key: %s", apiName), nil)
+					return
+				}
+				fullScriptPath, err := resolvePath(execDir, scriptPath)
+				if err != nil {
+					respondWithError(c, http.StatusBadRequest, fmt.Sprintf("Invalid script path for key: %s", apiName), err)
+					return
+				}
 				result, err := runJavaScript(fullScriptPath, allParams, c)
 				if err != nil {
 					respondWithError(c, http.StatusInternalServerError, "Failed to run JavaScript", err)
 					return
 				}
 
+				responseBody := []byte(result)
+				response := APIResponse{
+					Status:      http.StatusOK,
+					ContentType: "application/json",
+					Headers:     map[string]string{},
+					Body:        responseBody,
+				}
+
 				// 結果のパースと返却
 				var jsonData map[string]interface{}
-				if err := json.Unmarshal([]byte(result), &jsonData); err != nil {
+				if err := json.Unmarshal(responseBody, &jsonData); err != nil {
 					respondWithError(c, http.StatusInternalServerError, "Failed to parse JavaScript response", err)
 					return
 				}
@@ -1442,11 +1450,16 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 					respondWithError(c, http.StatusInternalServerError, "Status field not found in JavaScript response", nil)
 					return
 				}
+				response.Status = int(status)
+
+				if handled := runOutCheck(c, scriptInfo, execDir, allParams, response); handled {
+					return
+				}
 
 				// push 処理
 				performPush(scriptInfo, scriptListData, allParams, execDir)
 
-				c.JSON(int(status), jsonData)
+				c.JSON(response.Status, jsonData)
 			}
 		}
 
@@ -2326,15 +2339,6 @@ func handleJSONRPC(c *gin.Context) {
 		return
 	}
 
-	// スクリプトファイルのパス取得
-	scriptPathRaw, ok := scriptInfo["script"]
-	if !ok {
-		respondJSONRPCError(c, rpcReq.ID, -32603, fmt.Sprintf("No script path for method: %s", rpcReq.Method), nil)
-		return
-	}
-	scriptPath, _ := scriptPathRaw.(string)
-	fullPath := filepath.Join(execDir, scriptPath)
-
 	// JSON-RPCのparamsを元にパラメータマップを構築
 	allParams := make(map[string]interface{})
 	for k, v := range rpcReq.Params {
@@ -2342,6 +2346,63 @@ func handleJSONRPC(c *gin.Context) {
 	}
 	// 既存ロジックが「api」パラメータを参照するために設定
 	allParams["api"] = rpcReq.Method
+
+	checkOnly := isCheckOnlyMode(allParams)
+	paramCheckPath := getAPIString(scriptInfo, "paramCheck", "paramcheck", "check")
+	if paramCheckPath == "" && checkOnly {
+		c.JSON(http.StatusOK, JSONRPCResponse{
+			JSONRPC: "2.0",
+			Result: ParamCheckResponse{
+				Success: true,
+				Status:  http.StatusOK,
+				Result:  nil,
+			},
+			ID: rpcReq.ID,
+		})
+		return
+	}
+	if paramCheckPath != "" {
+		fullCheckPath, err := resolvePath(execDir, paramCheckPath)
+		if err != nil {
+			respondJSONRPCError(c, rpcReq.ID, -32603, "Check script error", err.Error())
+			return
+		}
+		resultValue, err := runJavaScriptValue(fullCheckPath, allParams, c)
+		if err != nil {
+			respondJSONRPCError(c, rpcReq.ID, -32603, "Check script error", err.Error())
+			return
+		}
+		checkResponse, err := parseCheckResponse(resultValue, "paramCheck")
+		if err != nil {
+			respondJSONRPCError(c, rpcReq.ID, -32603, "Check script error", err.Error())
+			return
+		}
+		allowed := checkResponse.Success && checkResponse.Status == http.StatusOK
+		if checkOnly {
+			c.JSON(checkResponse.Status, JSONRPCResponse{
+				JSONRPC: "2.0",
+				Result:  checkResponse,
+				ID:      rpcReq.ID,
+			})
+			return
+		}
+		if !allowed {
+			respondJSONRPCError(c, rpcReq.ID, -32602, "Invalid params", checkResponse)
+			return
+		}
+	}
+
+	// スクリプトファイルのパス取得
+	scriptPath := getAPIString(scriptInfo, "script")
+	if scriptPath == "" {
+		respondJSONRPCError(c, rpcReq.ID, -32603, fmt.Sprintf("No script path for method: %s", rpcReq.Method), nil)
+		return
+	}
+	fullPath, err := resolvePath(execDir, scriptPath)
+	if err != nil {
+		respondJSONRPCError(c, rpcReq.ID, -32603, fmt.Sprintf("Invalid script path for method: %s", rpcReq.Method), err.Error())
+		return
+	}
 
 	// JavaScriptの実行
 	resultStr, err := runJavaScript(fullPath, allParams, c)
@@ -2387,6 +2448,30 @@ func handleJSONRPC(c *gin.Context) {
 				return
 			}
 		}
+	}
+
+	statusCode := http.StatusOK
+	if statusVal, ok := jsResult["status"]; ok {
+		if parsed, ok := parseStatusCode(statusVal); ok {
+			statusCode = parsed
+		}
+	}
+	if handled, checkResponse, err := runOutCheckResponse(scriptInfo, execDir, allParams, APIResponse{
+		Status:      statusCode,
+		ContentType: "application/json",
+		Headers:     map[string]string{},
+		Body:        []byte(resultStr),
+	}, c); handled {
+		if err != nil {
+			respondJSONRPCError(c, rpcReq.ID, -32603, "outCheck script error", err.Error())
+			return
+		}
+		c.JSON(checkResponse.Status, JSONRPCResponse{
+			JSONRPC: "2.0",
+			Result:  checkResponse,
+			ID:      rpcReq.ID,
+		})
+		return
 	}
 
 	// JSON-RPC用に resultフィールドを作る（"status"は除くなどはお好みで）
@@ -2827,13 +2912,6 @@ func callJS(toolName string, args map[string]any, c *gin.Context) string {
 	if getAPIType(api) != apiTypeAPI {
 		return fmt.Sprintf(`{"status":400,"error":"tool is not an API endpoint: %s"}`, toolName)
 	}
-	scriptPath, _ := api["script"].(string)
-	if scriptPath == "" {
-		return `{"status":400,"error":"no script path"}`
-	}
-
-	fullScript := filepath.Join(execDir, scriptPath)
-
 	// 引数＋メタ情報を準備
 	allParams := map[string]any{}
 	for k, v := range args {
@@ -2850,9 +2928,65 @@ func callJS(toolName string, args map[string]any, c *gin.Context) string {
 		allParams["_headers"] = h
 	}
 
+	checkOnly := isCheckOnlyMode(allParams)
+	paramCheckPath := getAPIString(api, "paramCheck", "paramcheck", "check")
+	if paramCheckPath == "" && checkOnly {
+		out, _ := json.Marshal(ParamCheckResponse{Success: true, Status: http.StatusOK, Result: nil})
+		return string(out)
+	}
+	if paramCheckPath != "" {
+		fullCheckPath, err := resolvePath(execDir, paramCheckPath)
+		if err != nil {
+			return fmt.Sprintf(`{"status":500,"error":%q}`, err.Error())
+		}
+		resultValue, err := runJavaScriptValue(fullCheckPath, allParams, c)
+		if err != nil {
+			return fmt.Sprintf(`{"status":500,"error":%q}`, err.Error())
+		}
+		checkResponse, err := parseCheckResponse(resultValue, "paramCheck")
+		if err != nil {
+			return fmt.Sprintf(`{"status":500,"error":%q}`, err.Error())
+		}
+		allowed := checkResponse.Success && checkResponse.Status == http.StatusOK
+		if checkOnly || !allowed {
+			out, _ := json.Marshal(checkResponse)
+			return string(out)
+		}
+	}
+
+	scriptPath := getAPIString(api, "script")
+	if scriptPath == "" {
+		return `{"status":400,"error":"no script path"}`
+	}
+
+	fullScript, err := resolvePath(execDir, scriptPath)
+	if err != nil {
+		return fmt.Sprintf(`{"status":500,"error":%q}`, err.Error())
+	}
+
 	out, err := runJavaScript(fullScript, allParams, c)
 	if err != nil {
 		return fmt.Sprintf(`{"status":500,"error":%q}`, err.Error())
+	}
+
+	statusCode := http.StatusOK
+	var body map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &body); err == nil {
+		if parsed, ok := parseStatusCode(body["status"]); ok {
+			statusCode = parsed
+		}
+	}
+	if handled, checkResponse, err := runOutCheckResponse(api, execDir, allParams, APIResponse{
+		Status:      statusCode,
+		ContentType: "application/json",
+		Headers:     map[string]string{},
+		Body:        []byte(out),
+	}, c); handled {
+		if err != nil {
+			return fmt.Sprintf(`{"status":500,"error":%q}`, err.Error())
+		}
+		out, _ := json.Marshal(checkResponse)
+		return string(out)
 	}
 	return out
 }
