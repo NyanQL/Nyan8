@@ -1,8 +1,6 @@
 module Nyan8
 
-go 1.23.0
-
-toolchain go1.24.0
+go 1.26.3
 
 require (
 	github.com/dop251/goja v0.0.0-20240220182346-e401ed450204
