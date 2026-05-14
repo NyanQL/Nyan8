@@ -12,7 +12,10 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 | 機能 | 概要 |
 |------|------|
 | **JavaScript API** | HTTP/HTTPS 経由で JS ファイルを呼び出し、JSON を返却 |
+| **公開ファイル配信** | `type: "public"` で静的ファイルを API 定義から配信 |
+| **入出力チェック** | `paramCheck` / `outCheck` で実行前・出力前の検査を追加 |
 | **WebSocket Push** | `api.json` の `push` 設定だけで双方向通信を実現 |
+| **定期実行ジョブ** | `type: "schedule"` で cron 形式の JavaScript ジョブを起動時に登録 |
 | **JSON‑RPC 2.0** | `/nyan‑rpc` エンドポイントで RPC を提供（Batch は今後対応） |
 | **メール送信** | `nyanSendMail` で CC/BCC・添付ファイルを含むメールを送信可能 |
 | **ファイル→Base64** | `nyanReadFileB64` でファイルを Base64 文字列へ変換 |
@@ -88,23 +91,73 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
   "add": {
     "script": "apis/add.js",        // 実行する JS
     "description": "2 に足す API",
-    "push": "add_push"              // 省略可
+    "push": "add_push",             // 省略可
+    "paramCheck": "apis/check.js",  // 実行前チェック（省略可）
+    "outCheck": "apis/out_check.js" // 出力前チェック（省略可）
   },
   "add_push": {
     "script": "apis/add_push.js",
     "description": "add の結果を push 配信"
+  },
+  "assets": {
+    "type": "public",
+    "path": "./public",
+    "description": "公開ファイル配信"
+  },
+  "schedule_debug_every_minute": {
+    "type": "schedule",
+    "script": "./javascript/schedule_debug.js",
+    "trigger": {
+      "type": "cron",
+      "value": "* * * * *"
+    },
+    "description": "1分ごとにログへ実行時刻を出力"
   }
 }
 ```
 
 * `/add` に HTTP アクセス → `apis/add.js` が実行
 * WebSocket 接続 `/add_push` を張っておけば、`add` 完了時に push が届きます
+* `/assets/app.js` に HTTP アクセス → `./public/app.js` が配信されます
+* `schedule_debug_every_minute` は起動時にジョブとして登録され、HTTP API としては公開されません
 
-### type と WebSocket クライアント
+### type
 
 - `type` を省略した場合は従来通り HTTP/WS サーバーの API (`"type": "api"`) として動作します。
+- `type: "public"` を指定すると、`path` 配下のファイルを公開エンドポイントとして配信します。
 - `type: "ws_client"` を指定すると Nyan8 自身が WebSocket クライアントになり、起動時に常時接続します。
+- `type: "schedule"` を指定すると Nyan8 の起動時に定期実行ジョブとして登録します。
 - `connectURL` が `env:XXXX` の場合、環境変数 `XXXX` で接続 URL を解決します。
+
+#### 通常 API
+
+```jsonc
+"hello": {
+  "type": "api",
+  "script": "./javascript/hello.js",
+  "description": "hello API"
+}
+```
+
+`type` を省略しても `"api"` として扱われます。HTTP API、WebSocket 接続、JSON-RPC、MCP tools/call の対象になります。
+
+#### 公開ファイル配信
+
+```jsonc
+"assets": {
+  "type": "public",
+  "path": "./public",
+  "paramCheck": "./javascript/check_login.js",
+  "outCheck": "./javascript/check_output.js",
+  "description": "静的ファイル配信"
+}
+```
+
+この例では `/assets/test.txt` が `./public/test.txt` に対応します。リクエストされた相対パスは `nyanAllParams.nyan_public_path`、エンドポイント名は `nyanAllParams.nyan_public_endpoint` で参照できます。
+
+`type: "public"` は JSON-RPC や MCP tools/list には公開されません。認可が必要なファイルを配信する場合は `paramCheck` を指定してください。
+
+#### WebSocket クライアント
 
 ```jsonc
 "websocket_clients_local": {
@@ -119,6 +172,142 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 
 動かし方の例:
 - まずはローカルで挙動を見る場合: 上記 `websocket_clients_local` を有効のままにして `./nyan8`（ソースから試す場合は `sh testrun.sh`）を起動します。別ターミナルで手持ちの WebSocket クライアントから `ws://localhost:8889/hello` に送ると、指定した `script` の応答が見えます。
+
+#### 定期実行ジョブ
+
+```jsonc
+"daily_job": {
+  "type": "schedule",
+  "script": "./javascript/daily_job.js",
+  "trigger": {
+    "type": "cron",
+    "value": "0 10 * * *"
+  },
+  "description": "毎日10:00に実行"
+}
+```
+
+`type: "schedule"` は Nyan8 の起動時に登録され、指定時刻になると `script` の JavaScript を実行します。この定義は HTTP API、WebSocket 接続、JSON-RPC、MCP tools/list には公開されません。
+
+`trigger.type` は現在 `cron` のみ対応しています。cron は5フィールド形式です。
+
+```text
+分 時 日 月 曜日
+```
+
+各フィールドでは `*`、数値、カンマ区切り、範囲、ステップ指定を使えます。
+
+指定例:
+
+| cron | 実行タイミング |
+|------|----------------|
+| `* * * * *` | 1分ごと |
+| `*/10 * * * *` | 10分ごと |
+| `0 10 * * *` | 毎日10:00 |
+| `15,45 * * * *` | 毎時15分と45分 |
+| `0 9-18 * * *` | 9時から18時まで毎時0分 |
+
+秒単位の指定には対応していません。最短の実行間隔は1分です。`*/10` は起動時刻から10分ごとではなく、時計の分が `00, 10, 20, 30, 40, 50` のタイミングで実行されます。
+
+schedule の `script` では通常の API と同じように `nyanAllParams`、`nyanCallMe()`、`nyanGetFile()` などを使えます。加えて、次の値が `nyanAllParams` に入ります。
+
+| 名前 | 内容 |
+|------|------|
+| `nyanAllParams.nyan_job_name` | `api.json` 上のジョブ名 |
+| `nyanAllParams.nyan_schedule_trigger_type` | 現在は `cron` |
+| `nyanAllParams.nyan_schedule_trigger` | cron 式 |
+| `nyanAllParams.nyan_schedule_time` | 実行予定時刻 |
+| `nyanAllParams.nyan_schedule_description` | `api.json` に書いた説明 |
+
+schedule は HTTP リクエストから実行されないため、`nyanGetRemoteIP()`、`nyanGetUserAgent()`、`nyanGetRequestHeaders()` などリクエスト情報に依存する関数は空の値を返します。`javascript_include` に設定した共通 JavaScript は、schedule の `script` 実行時にも毎回読み込まれます。
+
+schedule 定義自体には `paramCheck` / `outCheck` / `push` は適用されません。必要な前処理や通知は、schedule の `script` 内で直接実装するか、`nyanCallMe()` で通常 API を呼び出してください。
+
+このリポジトリには動作確認用として [api.json](./api.json) の `schedule_debug_every_minute` と [javascript/schedule_debug.js](./javascript/schedule_debug.js) を用意しています。起動すると1分ごとにログへ実行時刻が出力されます。
+
+### paramCheck / outCheck
+
+`paramCheck` は API の本体 `script` 実行前、または `type: "public"` のファイル配信前に実行されます。`outCheck` は本体実行後、または公開ファイル送信前に実行されます。
+
+互換性のため、`paramCheck` は `paramcheck` / `check`、`outCheck` は `outcheck` でも指定できます。README では `paramCheck` / `outCheck` を推奨表記とします。
+
+```jsonc
+"secure_add": {
+  "script": "./javascript/add.js",
+  "paramCheck": "./javascript/check_request.js",
+  "outCheck": "./javascript/check_response.js",
+  "description": "入力と出力を検査する API"
+}
+```
+
+#### paramCheck の戻り値
+
+`paramCheck` / `outCheck` の JavaScript は、次の形式のオブジェクトまたは JSON 文字列を返してください。
+
+```javascript
+if (nyanAllParams.token === "secret") {
+  ({ success: true, status: 200, result: { message: "ok" } });
+} else {
+  ({ success: false, status: 401, result: { message: "unauthorized" } });
+}
+```
+
+```json
+{
+  "success": true,
+  "status": 200,
+  "result": {}
+}
+```
+
+`success: true` かつ `status: 200` の場合だけ次の処理へ進みます。それ以外の場合は、本体 `script` やファイル配信を実行せず、チェック結果を JSON として返します。HTTP ステータスも `status` の値になります。
+
+#### checkOnly
+
+`nyan_mode=checkOnly` を指定すると、`paramCheck` だけを実行し、本体 `script` やファイル配信へ進みません。
+
+```bash
+curl "http://localhost:8080/secure_add?token=secret&nyan_mode=checkOnly"
+```
+
+`paramCheck` 未設定の API に `nyan_mode=checkOnly` を指定した場合は、次のレスポンスを返します。
+
+```json
+{
+  "success": true,
+  "status": 200,
+  "result": null
+}
+```
+
+#### outCheck の入力
+
+`outCheck` では、本体の出力内容を `nyanAllParams.nyan_output` で参照できます。
+
+```javascript
+if (nyanAllParams.nyan_output.status === 200 &&
+    nyanAllParams.nyan_output.body.indexOf("expected") >= 0) {
+  ({ success: true, status: 200, result: null });
+} else {
+  ({ success: false, status: 409, result: { message: "output mismatch" } });
+}
+```
+
+`nyan_output` には次の値が入ります。
+
+| キー | 説明 |
+|------|------|
+| `status` | 本体レスポンスの HTTP ステータス |
+| `contentType` | 本体レスポンスの Content-Type |
+| `headers` | 本体レスポンスのヘッダー |
+| `body` | 本体レスポンス本文 |
+| `bodyBase64` | 本体レスポンス本文の Base64 |
+| `bodyLength` | 本体レスポンス本文のバイト長 |
+| `bodyLengthBytes` | `bodyLength` と同じ互換用フィールド |
+
+互換用に `nyan_output_status`, `nyan_output_content_type`, `nyan_output_body`, `nyan_output_body_base64` も利用できます。
+
+通常 API、`type: "public"`、JSON-RPC、MCP tools/call の呼び出しで同じチェック指定を利用できます。ただし `type: "public"` と `type: "ws_client"` は JSON-RPC / MCP tool としては呼び出せません。
 
 ---
 
