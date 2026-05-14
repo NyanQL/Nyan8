@@ -195,6 +195,8 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 分 時 日 月 曜日
 ```
 
+各フィールドでは `*`、数値、カンマ区切り、範囲、ステップ指定を使えます。
+
 指定例:
 
 | cron | 実行タイミング |
@@ -216,6 +218,10 @@ schedule の `script` では通常の API と同じように `nyanAllParams`、`
 | `nyanAllParams.nyan_schedule_trigger` | cron 式 |
 | `nyanAllParams.nyan_schedule_time` | 実行予定時刻 |
 | `nyanAllParams.nyan_schedule_description` | `api.json` に書いた説明 |
+
+schedule は HTTP リクエストから実行されないため、`nyanGetRemoteIP()`、`nyanGetUserAgent()`、`nyanGetRequestHeaders()` などリクエスト情報に依存する関数は空の値を返します。`javascript_include` に設定した共通 JavaScript は、schedule の `script` 実行時にも毎回読み込まれます。
+
+schedule 定義自体には `paramCheck` / `outCheck` / `push` は適用されません。必要な前処理や通知は、schedule の `script` 内で直接実装するか、`nyanCallMe()` で通常 API を呼び出してください。
 
 このリポジトリには動作確認用として [api.json](./api.json) の `schedule_debug_every_minute` と [javascript/schedule_debug.js](./javascript/schedule_debug.js) を用意しています。起動すると1分ごとにログへ実行時刻が出力されます。
 
