@@ -15,6 +15,7 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 | **公開ファイル配信** | `type: "public"` で静的ファイルを API 定義から配信 |
 | **入出力チェック** | `paramCheck` / `outCheck` で実行前・出力前の検査を追加 |
 | **WebSocket Push** | `api.json` の `push` 設定だけで双方向通信を実現 |
+| **定期実行ジョブ** | `type: "schedule"` で cron 形式の JavaScript ジョブを起動時に登録 |
 | **JSON‑RPC 2.0** | `/nyan‑rpc` エンドポイントで RPC を提供（Batch は今後対応） |
 | **メール送信** | `nyanSendMail` で CC/BCC・添付ファイルを含むメールを送信可能 |
 | **ファイル→Base64** | `nyanReadFileB64` でファイルを Base64 文字列へ変換 |
@@ -102,6 +103,15 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
     "type": "public",
     "path": "./public",
     "description": "公開ファイル配信"
+  },
+  "schedule_debug_every_minute": {
+    "type": "schedule",
+    "script": "./javascript/schedule_debug.js",
+    "trigger": {
+      "type": "cron",
+      "value": "* * * * *"
+    },
+    "description": "1分ごとにログへ実行時刻を出力"
   }
 }
 ```
@@ -109,12 +119,14 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 * `/add` に HTTP アクセス → `apis/add.js` が実行
 * WebSocket 接続 `/add_push` を張っておけば、`add` 完了時に push が届きます
 * `/assets/app.js` に HTTP アクセス → `./public/app.js` が配信されます
+* `schedule_debug_every_minute` は起動時にジョブとして登録され、HTTP API としては公開されません
 
 ### type
 
 - `type` を省略した場合は従来通り HTTP/WS サーバーの API (`"type": "api"`) として動作します。
 - `type: "public"` を指定すると、`path` 配下のファイルを公開エンドポイントとして配信します。
 - `type: "ws_client"` を指定すると Nyan8 自身が WebSocket クライアントになり、起動時に常時接続します。
+- `type: "schedule"` を指定すると Nyan8 の起動時に定期実行ジョブとして登録します。
 - `connectURL` が `env:XXXX` の場合、環境変数 `XXXX` で接続 URL を解決します。
 
 #### 通常 API
@@ -160,6 +172,52 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 
 動かし方の例:
 - まずはローカルで挙動を見る場合: 上記 `websocket_clients_local` を有効のままにして `./nyan8`（ソースから試す場合は `sh testrun.sh`）を起動します。別ターミナルで手持ちの WebSocket クライアントから `ws://localhost:8889/hello` に送ると、指定した `script` の応答が見えます。
+
+#### 定期実行ジョブ
+
+```jsonc
+"daily_job": {
+  "type": "schedule",
+  "script": "./javascript/daily_job.js",
+  "trigger": {
+    "type": "cron",
+    "value": "0 10 * * *"
+  },
+  "description": "毎日10:00に実行"
+}
+```
+
+`type: "schedule"` は Nyan8 の起動時に登録され、指定時刻になると `script` の JavaScript を実行します。この定義は HTTP API、WebSocket 接続、JSON-RPC、MCP tools/list には公開されません。
+
+`trigger.type` は現在 `cron` のみ対応しています。cron は5フィールド形式です。
+
+```text
+分 時 日 月 曜日
+```
+
+指定例:
+
+| cron | 実行タイミング |
+|------|----------------|
+| `* * * * *` | 1分ごと |
+| `*/10 * * * *` | 10分ごと |
+| `0 10 * * *` | 毎日10:00 |
+| `15,45 * * * *` | 毎時15分と45分 |
+| `0 9-18 * * *` | 9時から18時まで毎時0分 |
+
+秒単位の指定には対応していません。最短の実行間隔は1分です。`*/10` は起動時刻から10分ごとではなく、時計の分が `00, 10, 20, 30, 40, 50` のタイミングで実行されます。
+
+schedule の `script` では通常の API と同じように `nyanAllParams`、`nyanCallMe()`、`nyanGetFile()` などを使えます。加えて、次の値が `nyanAllParams` に入ります。
+
+| 名前 | 内容 |
+|------|------|
+| `nyanAllParams.nyan_job_name` | `api.json` 上のジョブ名 |
+| `nyanAllParams.nyan_schedule_trigger_type` | 現在は `cron` |
+| `nyanAllParams.nyan_schedule_trigger` | cron 式 |
+| `nyanAllParams.nyan_schedule_time` | 実行予定時刻 |
+| `nyanAllParams.nyan_schedule_description` | `api.json` に書いた説明 |
+
+このリポジトリには動作確認用として [api.json](./api.json) の `schedule_debug_every_minute` と [javascript/schedule_debug.js](./javascript/schedule_debug.js) を用意しています。起動すると1分ごとにログへ実行時刻が出力されます。
 
 ### paramCheck / outCheck
 
