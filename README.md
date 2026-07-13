@@ -34,6 +34,20 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
    ./nyan8   # Windows は nyan8.exe
    ```
 
+### 2-1  設定ファイルのパス指定
+
+Nyan8 は起動時に `api.json` と `config.json` の読み込みパスを指定できます。
+指定がない場合は、従来どおり実行ファイルと同じディレクトリにある `api.json` / `config.json` を読み込みます。
+
+```bash
+./nyan8
+./nyan8 --api /path/to/api.json --config /path/to/config.json
+NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./nyan8
+```
+
+`api.json` 内の `script` / `path` / `paramCheck` / `outCheck` の相対パスは、`api.json` が置かれているディレクトリから解決されます。
+`config.json` 内の `certPath` / `keyPath` / `javascript_include` / `log.Filename` の相対パスは、`config.json` が置かれているディレクトリから解決されます。
+
 ---
 
 ## 3  設定ファイル

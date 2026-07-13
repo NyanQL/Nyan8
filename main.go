@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -145,7 +146,7 @@ type rpcReq struct {
 var (
 	// BinaryVersion can be set at build time with:
 	// go build -ldflags "-X main.BinaryVersion=vX.Y.Z"
-	BinaryVersion  = "v0.0.16"
+	BinaryVersion  = "v0.0.17"
 	supportedProto = map[string]bool{"2025-06-18": true, "2025-03-26": true}
 	sessions       sync.Map // sid -> struct{created time.Time}
 )
@@ -160,6 +161,18 @@ const (
 
 // config格納場所
 var globalConfig Config
+
+type serviceFilePath struct {
+	Path   string
+	Source string
+}
+
+type serviceFilePaths struct {
+	API    serviceFilePath
+	Config serviceFilePath
+}
+
+var servicePaths serviceFilePaths
 
 // ストレージ
 var storage sync.Map
@@ -193,22 +206,26 @@ func main() {
 	execDir := execPath
 	fmt.Println("Executable directory:", execDir)
 
-	// 環境変数から設定ファイルのパスを取得する
-	configPath := os.Getenv("CONFIG_PATH")
-	if configPath == "" {
-		configPath = filepath.Join(execDir, "config.json")
+	paths, err := resolveServiceFilePaths(execDir, os.Args[1:])
+	if err != nil {
+		log.Fatal(err)
 	}
-	fmt.Println("Config file path:", configPath)
+	servicePaths = paths
+	fmt.Printf("Config file path: %s (source: %s)\n", paths.Config.Path, paths.Config.Source)
+	fmt.Printf("API file path: %s (source: %s)\n", paths.API.Path, paths.API.Source)
 
-	config, err := loadConfig(configPath)
+	config, err := loadConfig(paths.Config.Path)
 	if err != nil {
 		// logger はまだ初期化前なので標準ログで終了
-		log.Fatalf("Error loading config from %s: %v", configPath, err)
+		log.Fatalf("Error loading config from %s: %v", paths.Config.Path, err)
 	}
+	configBaseDir := filepath.Dir(paths.Config.Path)
+	apiBaseDir := filepath.Dir(paths.API.Path)
+	adjustConfigPaths(configBaseDir, &config)
 	globalConfig = config
 
 	// ロガーをセットアップ
-	initLogger(execDir)
+	initLogger(configBaseDir)
 	binaryVersion := BinaryVersion
 	if strings.TrimSpace(binaryVersion) == "" {
 		binaryVersion = "unset"
@@ -218,6 +235,9 @@ func main() {
 		configVersion = "unset"
 	}
 	logger.Printf("Binary version: %s", binaryVersion)
+	logger.Printf("Go runtime version: %s", runtime.Version())
+	logger.Printf("Config file: %s (source: %s)", paths.Config.Path, paths.Config.Source)
+	logger.Printf("API file: %s (source: %s)", paths.API.Path, paths.API.Source)
 	logger.Printf("Config version: %s", configVersion)
 
 	r := gin.Default()
@@ -246,25 +266,24 @@ func main() {
 	r.Any("/", handleRequest) // HTTPとWebSocketリクエストを同じエンドポイントで処理
 
 	// 動的エンドポイントの登録
-	execDir, _ = os.Getwd() // または、実行ファイルのディレクトリを使用
-	if err := registerDynamicEndpoints(r, execDir); err != nil {
+	if err := registerDynamicEndpoints(r, apiBaseDir); err != nil {
 		logger.Fatalf("Failed to register dynamic endpoints: %v", err)
 	}
 
-	if err := startWebSocketClients(execDir); err != nil {
+	if err := startWebSocketClients(apiBaseDir); err != nil {
 		logger.Printf("Failed to start WebSocket clients: %v", err)
 	}
-	if err := startScheduleJobs(execDir); err != nil {
+	if err := startScheduleJobs(apiBaseDir); err != nil {
 		logger.Printf("Failed to start schedule jobs: %v", err)
 	}
 
 	// HTTPSサーバーを起動するかどうかを判断
 	// ★★★ 修正：cert/key のパス解決に resolvePath を使用 ★★★
-	certFilePath, err := resolvePath(execDir, config.CertFile)
+	certFilePath, err := resolvePath(configBaseDir, config.CertFile)
 	if err != nil {
 		logger.Fatalf("Invalid certPath %q: %v", config.CertFile, err)
 	}
-	keyFilePath, err := resolvePath(execDir, config.KeyFile)
+	keyFilePath, err := resolvePath(configBaseDir, config.KeyFile)
 	if err != nil {
 		logger.Fatalf("Invalid keyPath %q: %v", config.KeyFile, err)
 	}
@@ -301,6 +320,75 @@ func isTemporaryDirectory(path string) bool {
 	p := filepath.Clean(path) + sep
 	t := filepath.Clean(os.TempDir()) + sep
 	return strings.HasPrefix(p, t)
+}
+
+func resolveServiceFilePaths(execDir string, args []string) (serviceFilePaths, error) {
+	flags := flag.NewFlagSet("Nyan8", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	apiFlag := flags.String("api", "", "path to api.json")
+	configFlag := flags.String("config", "", "path to config.json")
+	if err := flags.Parse(args); err != nil {
+		return serviceFilePaths{}, err
+	}
+
+	apiPath, apiSource := chooseServiceFilePath(*apiFlag, "NYAN_API_PATH", filepath.Join(execDir, "api.json"), "--api")
+	configPath, configSource := chooseServiceFilePath(*configFlag, "NYAN_CONFIG_PATH", filepath.Join(execDir, "config.json"), "--config")
+
+	resolvedAPIPath, err := resolveExistingServiceFilePath(apiPath, "api", apiSource)
+	if err != nil {
+		return serviceFilePaths{}, err
+	}
+	resolvedConfigPath, err := resolveExistingServiceFilePath(configPath, "config", configSource)
+	if err != nil {
+		return serviceFilePaths{}, err
+	}
+
+	return serviceFilePaths{
+		API:    serviceFilePath{Path: resolvedAPIPath, Source: apiSource},
+		Config: serviceFilePath{Path: resolvedConfigPath, Source: configSource},
+	}, nil
+}
+
+func chooseServiceFilePath(cliValue, envName, defaultPath, cliSource string) (string, string) {
+	if strings.TrimSpace(cliValue) != "" {
+		return cliValue, cliSource
+	}
+	if envValue := strings.TrimSpace(os.Getenv(envName)); envValue != "" {
+		return envValue, envName
+	}
+	return defaultPath, "default"
+}
+
+func resolveExistingServiceFilePath(pathValue, label, source string) (string, error) {
+	resolvedPath, err := filepath.Abs(pathValue)
+	if err != nil {
+		return "", fmt.Errorf("%s file path could not be resolved: %s (source: %s): %w", label, pathValue, source, err)
+	}
+	info, err := os.Stat(resolvedPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("%s file not found: %s (source: %s)", label, resolvedPath, source)
+		}
+		return "", fmt.Errorf("%s file cannot be accessed: %s (source: %s): %w", label, resolvedPath, source, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("%s file is a directory: %s (source: %s)", label, resolvedPath, source)
+	}
+	return resolvedPath, nil
+}
+
+func apiJSONPath(fallbackBaseDir string) string {
+	if strings.TrimSpace(servicePaths.API.Path) != "" {
+		return servicePaths.API.Path
+	}
+	return filepath.Join(fallbackBaseDir, "api.json")
+}
+
+func apiBaseDir(fallbackBaseDir string) string {
+	if strings.TrimSpace(servicePaths.API.Path) != "" {
+		return filepath.Dir(servicePaths.API.Path)
+	}
+	return fallbackBaseDir
 }
 
 // ★★★ 追加：ファイルパス解決関数 ★★★
@@ -420,6 +508,36 @@ func loadConfig(filename string) (Config, error) {
 	return config, nil
 }
 
+func adjustConfigPaths(configBaseDir string, config *Config) {
+	config.CertFile = resolvePathFromBase(configBaseDir, config.CertFile)
+	config.KeyFile = resolvePathFromBase(configBaseDir, config.KeyFile)
+	config.Log.Filename = resolvePathFromBase(configBaseDir, config.Log.Filename)
+	for i, includePath := range config.JavaScriptInclude {
+		config.JavaScriptInclude[i] = resolvePathFromBase(configBaseDir, includePath)
+	}
+}
+
+func resolvePathFromBase(baseDir, pathValue string) string {
+	pathValue = strings.TrimSpace(pathValue)
+	if pathValue == "" {
+		return pathValue
+	}
+	pathValue = os.ExpandEnv(pathValue)
+	if strings.HasPrefix(pathValue, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			if pathValue == "~" {
+				pathValue = home
+			} else if strings.HasPrefix(pathValue, "~/") || strings.HasPrefix(pathValue, `~\`) {
+				pathValue = filepath.Join(home, pathValue[2:])
+			}
+		}
+	}
+	if filepath.IsAbs(pathValue) {
+		return pathValue
+	}
+	return filepath.Join(baseDir, pathValue)
+}
+
 func getVersion() string {
 	if strings.TrimSpace(BinaryVersion) != "" {
 		return BinaryVersion
@@ -460,7 +578,7 @@ func handleAPIRequest(c *gin.Context) {
 			logger.Fatalf("Error getting current working directory: %v", err)
 		}
 	}
-	execDir := execPath
+	execDir := apiBaseDir(execPath)
 
 	ginContext = c
 	defer func() {
@@ -468,7 +586,7 @@ func handleAPIRequest(c *gin.Context) {
 	}()
 
 	// スクリプトリストの取り込み
-	apiJsonPath := filepath.Join(execDir, "api.json")
+	apiJsonPath := apiJSONPath(execDir)
 	scriptListData, err := loadJSONFile(apiJsonPath)
 	if err != nil {
 		logger.Fatalf("Error reading user JSON file: %v", err)
@@ -557,7 +675,7 @@ func handleAPIRequest(c *gin.Context) {
 
 	// 絶対パスに変換（相対なら execDir 起点）
 	// ※ scriptPath は通常相対想定だが、絶対指定も許容できるよう resolvePath を使ってもよい
-	scriptPath = filepath.Join(execDir, scriptPath)
+	scriptPath = resolvePathFromBase(execDir, scriptPath)
 
 	// JavaScriptを実行し、結果を取得
 	result, err := runJavaScript(scriptPath, allParams, c)
@@ -615,7 +733,7 @@ func handleWebSocket(c *gin.Context) {
 			logger.Fatalf("Error getting current working directory: %v", err)
 		}
 	}
-	execDir := execPath
+	execDir := apiBaseDir(execPath)
 
 	for {
 		// WebSocket からメッセージを読み取る
@@ -650,7 +768,7 @@ func handleWebSocket(c *gin.Context) {
 		receivedData["_headers"] = headersMap
 
 		// api.json を読み込む
-		apiJsonPath := filepath.Join(execDir, "api.json")
+		apiJsonPath := apiJSONPath(execDir)
 		scriptListData, err := loadJSONFile(apiJsonPath)
 		if err != nil {
 			logger.Printf("Error reading api.json file: %v", err)
@@ -680,7 +798,7 @@ func handleWebSocket(c *gin.Context) {
 		}
 
 		// メインAPIのスクリプトの絶対パス作成
-		javascriptPath := filepath.Join(execDir, scriptPath)
+		javascriptPath := resolvePathFromBase(execDir, scriptPath)
 
 		// WebSocket 用なので gin.Context は nil を渡す
 		result, err := runJavaScript(javascriptPath, receivedData, nil)
@@ -704,7 +822,7 @@ func handleWebSocket(c *gin.Context) {
 					if pushConfig, ok := pushConfigRaw.(map[string]interface{}); ok {
 						pushScript, ok := pushConfig["script"].(string)
 						if ok && pushScript != "" {
-							pushScriptPath := filepath.Join(execDir, pushScript)
+							pushScriptPath := resolvePathFromBase(execDir, pushScript)
 							// push API を実行
 							pushResult, err := runJavaScript(pushScriptPath, receivedData, nil)
 							if err != nil {
@@ -826,8 +944,9 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}, ginCtx 
 	if err != nil {
 		return "", fmt.Errorf("failed to get working directory: %v", err)
 	}
+	execDir = apiBaseDir(execDir)
 
-	apiConf, err := loadJSONFile(filepath.Join(execDir, "api.json"))
+	apiConf, err := loadJSONFile(apiJSONPath(execDir))
 	if err != nil {
 		return "", fmt.Errorf("failed to load api.json: %v", err)
 	}
@@ -856,7 +975,7 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}, ginCtx 
 	}
 	params["api"] = apiName
 
-	fullScriptPath := filepath.Join(execDir, scriptPath)
+	fullScriptPath := resolvePathFromBase(execDir, scriptPath)
 	result, err := runJavaScript(fullScriptPath, params, ginCtx)
 	if err != nil {
 		return "", fmt.Errorf("failed to run API %s: %v", apiName, err)
@@ -975,7 +1094,10 @@ func jsonAPI(url string, jsonData []byte, username, password string, headers map
 
 // loggerの初期化
 func initLogger(execDir string) {
-	logFilePath := filepath.Join(execDir, globalConfig.Log.Filename)
+	logFilePath := globalConfig.Log.Filename
+	if strings.TrimSpace(logFilePath) != "" && !filepath.IsAbs(logFilePath) {
+		logFilePath = filepath.Join(execDir, logFilePath)
+	}
 	if globalConfig.Log.EnableLogging {
 		// EnableLogging が true の場合はファイル出力
 		logger = log.New(&lumberjack.Logger{
@@ -1349,7 +1471,7 @@ func registerPublicEndpoint(r *gin.Engine, endpoint string, apiMap map[string]in
 // registerDynamicEndpoints は api.json の内容に基づいてルート直下のエンドポイントを登録する関数です。
 // registerDynamicEndpoints は api.json の内容に基づいてルート直下のエンドポイントを登録する関数です。
 func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
-	apiConf, err := loadJSONFile(filepath.Join(execDir, "api.json"))
+	apiConf, err := loadJSONFile(apiJSONPath(execDir))
 	if err != nil {
 		return fmt.Errorf("failed to load api.json: %v", err)
 	}
@@ -1398,7 +1520,7 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 				allParams["api"] = apiName
 
 				// api.json から対象スクリプトを取得
-				scriptListData, err := loadJSONFile(filepath.Join(execDir, "api.json"))
+				scriptListData, err := loadJSONFile(apiJSONPath(execDir))
 				if err != nil {
 					respondWithError(c, http.StatusInternalServerError, "Failed to load API configuration", err)
 					return
@@ -1669,7 +1791,7 @@ func getTriggerConfig(entry map[string]interface{}) triggerConfig {
 }
 
 func startScheduleJobs(execDir string) error {
-	apiConf, err := loadJSONFile(filepath.Join(execDir, "api.json"))
+	apiConf, err := loadJSONFile(apiJSONPath(execDir))
 	if err != nil {
 		return fmt.Errorf("failed to load api.json: %w", err)
 	}
@@ -1769,7 +1891,7 @@ func runScheduleJob(cfg scheduleJobConfig) {
 
 // startWebSocketClients は api.json に定義された ws_client を起動する。
 func startWebSocketClients(execDir string) error {
-	apiConf, err := loadJSONFile(filepath.Join(execDir, "api.json"))
+	apiConf, err := loadJSONFile(apiJSONPath(execDir))
 	if err != nil {
 		return fmt.Errorf("failed to load api.json: %w", err)
 	}
@@ -1939,7 +2061,7 @@ func performPush(scriptInfo map[string]interface{}, scriptListData map[string]in
 				if pushConfig, ok := pushConfigRaw.(map[string]interface{}); ok {
 					pushScript, ok := pushConfig["script"].(string)
 					if ok && pushScript != "" {
-						pushScriptPath := filepath.Join(execDir, pushScript)
+						pushScriptPath := resolvePathFromBase(execDir, pushScript)
 						// push 対象の API のスクリプトを実行
 						pushResult, err := runJavaScript(pushScriptPath, allParams, nil)
 						if err != nil {
@@ -1983,9 +2105,10 @@ func handleNyan(c *gin.Context) {
 		respondWithError(c, http.StatusInternalServerError, "Failed to get working directory", err)
 		return
 	}
+	execDir = apiBaseDir(execDir)
 
 	// api.json を読み込み
-	apiJsonPath := filepath.Join(execDir, "api.json")
+	apiJsonPath := apiJSONPath(execDir)
 	apiConf, err := loadJSONFile(apiJsonPath)
 	if err != nil {
 		respondWithError(c, http.StatusInternalServerError, "Failed to load API configuration", err)
@@ -2030,9 +2153,10 @@ func handleNyanDetail(c *gin.Context) {
 		respondWithError(c, http.StatusInternalServerError, "Failed to get working directory", err)
 		return
 	}
+	execDir = apiBaseDir(execDir)
 
 	// api.json を読み込み
-	apiJsonPath := filepath.Join(execDir, "api.json")
+	apiJsonPath := apiJSONPath(execDir)
 	apiConf, err := loadJSONFile(apiJsonPath)
 	if err != nil {
 		respondWithError(c, http.StatusInternalServerError, "Failed to load API configuration", err)
@@ -2063,7 +2187,7 @@ func handleNyanDetail(c *gin.Context) {
 	nyanOutputColumns := []interface{}{}
 
 	if scriptPath != "" {
-		fullScriptPath := filepath.Join(execDir, scriptPath)
+		fullScriptPath := resolvePathFromBase(execDir, scriptPath)
 		scriptContent, err := ioutil.ReadFile(fullScriptPath)
 		if err == nil {
 			// スクリプト内から const nyanAcceptedParams, nyanOutputColumns をパース
@@ -2603,9 +2727,10 @@ func handleJSONRPC(c *gin.Context) {
 			return
 		}
 	}
+	execDir = apiBaseDir(execDir)
 
 	// api.jsonの読み込み
-	apiJsonPath := filepath.Join(execDir, "api.json")
+	apiJsonPath := apiJSONPath(execDir)
 	scriptListData, err := loadJSONFile(apiJsonPath)
 	if err != nil {
 		respondJSONRPCError(c, rpcReq.ID, -32603, "Failed to read api.json", err)
@@ -3112,7 +3237,8 @@ func buildToolsList() map[string]any {
 	if err != nil {
 		return map[string]any{"tools": []any{}, "nextCursor": nil}
 	}
-	apiConfPath := filepath.Join(execDir, "api.json")
+	execDir = apiBaseDir(execDir)
+	apiConfPath := apiJSONPath(execDir)
 	apiConf, err := loadJSONFile(apiConfPath)
 	if err != nil {
 		return map[string]any{"tools": []any{}, "nextCursor": nil}
@@ -3139,7 +3265,7 @@ func buildToolsList() map[string]any {
 
 		// JS 内の const nyanAcceptedParams を Schema 推定に利用
 		if scriptPath != "" {
-			full := filepath.Join(execDir, scriptPath)
+			full := resolvePathFromBase(execDir, scriptPath)
 			if scriptContent, err := os.ReadFile(full); err == nil {
 				params := parseConstObject(scriptContent, "nyanAcceptedParams")
 				if len(params) > 0 {
@@ -3184,7 +3310,8 @@ func callJS(toolName string, args map[string]any, c *gin.Context) string {
 	if err != nil {
 		return `{"status":500,"error":"cwd error"}`
 	}
-	apiConfPath := filepath.Join(execDir, "api.json")
+	execDir = apiBaseDir(execDir)
+	apiConfPath := apiJSONPath(execDir)
 	apiConf, err := loadJSONFile(apiConfPath)
 	if err != nil {
 		return `{"status":500,"error":"api.json load error"}`
