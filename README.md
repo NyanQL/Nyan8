@@ -15,7 +15,7 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 | **公開ファイル配信** | `type: "public"` で静的ファイルを API 定義から配信 |
 | **入出力チェック** | `paramCheck` / `outCheck` で実行前・出力前の検査を追加 |
 | **WebSocket Push** | `api.json` の `push` 設定だけで双方向通信を実現 |
-| **定期実行ジョブ** | `type: "schedule"` で cron 形式の JavaScript ジョブを起動時に登録 |
+| **定期実行ジョブ** | `type: "schedule"` で cron 形式の JavaScript ジョブを登録し、変更も動的反映 |
 | **JSON‑RPC 2.0** | `/nyan‑rpc` エンドポイントで RPC を提供（Batch は今後対応） |
 | **メール送信** | `nyanSendMail` で CC/BCC・添付ファイルを含むメールを送信可能 |
 | **ファイル→Base64** | `nyanReadFileB64` でファイルを Base64 文字列へ変換 |
@@ -65,6 +65,10 @@ NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./nyan8
   "javascript_include": [           // 共通 JS をロード（任意複数可）
     "libs/common.js"
   ],
+  "APIHotReload": {
+    "Enabled": true,                // api.json の変更を動的反映
+    "Interval": "1s"               // Go duration形式の確認間隔
+  },
   "log": {
     "Filename": "nyan.log",        // ログファイル
     "MaxSize": 10,                  // MB
@@ -97,6 +101,16 @@ NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./nyan8
 * **EnableLogging** – false で標準出力のみ
 
 </details>
+
+#### `api.json` のホットリロード
+
+`api.json` は既定で1秒ごとに確認され、内容が変化した場合だけ再解析されます。通常API、public API、JSON-RPC、MCP、schedule、ws_clientの追加・変更・削除が再起動なしで反映されます。
+
+不正なJSONや、不正なschedule／ws_client設定は採用されず、直前の正常な定義で稼働を継続します。同じ不正内容はファイルが再度変化するまで繰り返し解析されません。
+
+`Interval` は `500ms`、`1s`、`1m`、`24h` などのGo duration形式です。空の場合は `1s` になります。0以下または解析できない値は起動エラーです。ホットリロードを無効にする場合は `Enabled` を `false` にします。`APIHotReload` 全体を省略した場合は有効、1秒間隔です。
+
+schedule変更時は同名ジョブを二重起動せず、実行中のスクリプトを完了してから最新設定へ移行します。ws_clientはscript／descriptionだけの変更では接続を維持し、`connectURL` の変更時だけ旧接続を閉じて新しい接続先へ切り替えます。
 
 ### 3‑2  `api.json`
 
@@ -139,8 +153,8 @@ NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./nyan8
 
 - `type` を省略した場合は従来通り HTTP/WS サーバーの API (`"type": "api"`) として動作します。
 - `type: "public"` を指定すると、`path` 配下のファイルを公開エンドポイントとして配信します。
-- `type: "ws_client"` を指定すると Nyan8 自身が WebSocket クライアントになり、起動時に常時接続します。
-- `type: "schedule"` を指定すると Nyan8 の起動時に定期実行ジョブとして登録します。
+- `type: "ws_client"` を指定すると Nyan8 自身が WebSocket クライアントになり、常時接続します。
+- `type: "schedule"` を指定すると定期実行ジョブとして登録します。
 - `connectURL` が `env:XXXX` の場合、環境変数 `XXXX` で接続 URL を解決します。
 
 #### 通常 API
@@ -201,7 +215,7 @@ NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./nyan8
 }
 ```
 
-`type: "schedule"` は Nyan8 の起動時に登録され、指定時刻になると `script` の JavaScript を実行します。この定義は HTTP API、WebSocket 接続、JSON-RPC、MCP tools/list には公開されません。
+`type: "schedule"` は指定時刻になると `script` の JavaScript を実行します。この定義は HTTP API、WebSocket 接続、JSON-RPC、MCP tools/list には公開されません。
 
 `trigger.type` は現在 `cron` のみ対応しています。cron は5フィールド形式です。
 

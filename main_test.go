@@ -5,15 +5,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 )
 
 func initTestLogger() {
@@ -640,5 +643,318 @@ func assertParamCheckResponse(t *testing.T, body []byte, success bool, status in
 	}
 	if response.Status != status {
 		t.Fatalf("status = %d, want %d; body=%q", response.Status, status, string(body))
+	}
+}
+
+func TestParseAPIHotReloadInterval(t *testing.T) {
+	tests := []struct {
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{value: "", want: time.Second},
+		{value: "250ms", want: 250 * time.Millisecond},
+		{value: "later", wantErr: true},
+		{value: "0s", wantErr: true},
+		{value: "-1s", wantErr: true},
+	}
+	for _, tt := range tests {
+		got, err := parseAPIHotReloadInterval(tt.value)
+		if tt.wantErr {
+			if err == nil {
+				t.Fatalf("parseAPIHotReloadInterval(%q) error = nil", tt.value)
+			}
+			continue
+		}
+		if err != nil || got != tt.want {
+			t.Fatalf("parseAPIHotReloadInterval(%q) = %s, %v; want %s", tt.value, got, err, tt.want)
+		}
+	}
+}
+
+func TestConfigAPIHotReloadDefaultsAndOverrides(t *testing.T) {
+	tests := []struct {
+		data string
+		want APIHotReloadConfig
+	}{
+		{data: `{}`, want: APIHotReloadConfig{Enabled: true, Interval: "1s"}},
+		{data: `{"APIHotReload":{"Enabled":false}}`, want: APIHotReloadConfig{Enabled: false, Interval: "1s"}},
+		{data: `{"APIHotReload":{"Enabled":true,"Interval":"2s"}}`, want: APIHotReloadConfig{Enabled: true, Interval: "2s"}},
+	}
+	for _, tt := range tests {
+		var got Config
+		applyConfigDefaults(&got)
+		if err := json.Unmarshal([]byte(tt.data), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.APIHotReload != tt.want {
+			t.Fatalf("APIHotReload = %#v, want %#v", got.APIHotReload, tt.want)
+		}
+	}
+}
+
+func TestReloadAPIFileAppliesChangesAndKeepsLastGoodDefinition(t *testing.T) {
+	initTestLogger()
+	apiDir := t.TempDir()
+	apiPath := filepath.Join(apiDir, "api.json")
+	writeHotReloadTestFile(t, apiPath, `{"old":{"description":"active"}}`)
+	initial, initialHash, err := readAPIFile(apiPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setAPIFiles(apiPath, initial)
+	t.Cleanup(func() { setAPIFiles("", nil) })
+
+	writeHotReloadTestFile(t, apiPath, `{"new":{"description":"updated"}}`)
+	observedHash, reloaded, err := reloadAPIFileIfChanged(apiPath, apiDir, initialHash)
+	if err != nil || !reloaded {
+		t.Fatalf("reload = %t, err = %v", reloaded, err)
+	}
+	if observedHash == initialHash {
+		t.Fatal("observed hash was not updated")
+	}
+	if _, exists := currentAPIFiles()["old"]; exists {
+		t.Fatal("old API remains after reload")
+	}
+
+	writeHotReloadTestFile(t, apiPath, `{"broken":`)
+	invalidHash, reloaded, err := reloadAPIFileIfChanged(apiPath, apiDir, observedHash)
+	if err == nil || reloaded {
+		t.Fatalf("invalid reload = %t, err = %v; want rejected", reloaded, err)
+	}
+	if _, exists := currentAPIFiles()["new"]; !exists {
+		t.Fatal("last good API definition was not retained")
+	}
+	secondHash, reloaded, err := reloadAPIFileIfChanged(apiPath, apiDir, invalidHash)
+	if err != nil || reloaded || secondHash != invalidHash {
+		t.Fatalf("unchanged invalid content was processed again: reload=%t err=%v", reloaded, err)
+	}
+}
+
+func TestReloadAPIFileRejectsInvalidBackgroundConfiguration(t *testing.T) {
+	initTestLogger()
+	apiDir := t.TempDir()
+	apiPath := filepath.Join(apiDir, "api.json")
+	writeHotReloadTestFile(t, apiPath, `{"current":{"description":"active"}}`)
+	initial, initialHash, err := readAPIFile(apiPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setAPIFiles(apiPath, initial)
+	t.Cleanup(func() { setAPIFiles("", nil) })
+	writeHotReloadTestFile(t, apiPath, `{"job":{"type":"schedule","trigger":{"type":"cron","value":"* * * * *"}}}`)
+	_, reloaded, err := reloadAPIFileIfChanged(apiPath, apiDir, initialHash)
+	if err == nil || reloaded {
+		t.Fatalf("invalid background config reload=%t err=%v", reloaded, err)
+	}
+	if _, exists := currentAPIFiles()["current"]; !exists {
+		t.Fatal("current definition changed after rejected candidate")
+	}
+}
+
+func TestDynamicDispatcherServesAPIAddedAfterStartup(t *testing.T) {
+	initTestLogger()
+	gin.SetMode(gin.TestMode)
+	apiDir := t.TempDir()
+	apiPath := filepath.Join(apiDir, "api.json")
+	scriptPath := filepath.Join(apiDir, "added.js")
+	writeHotReloadTestFile(t, scriptPath, `JSON.stringify({status: 200, value: "hot"});`)
+	files := map[string]interface{}{
+		"added": map[string]interface{}{"script": "./added.js"},
+	}
+	setAPIFiles(apiPath, files)
+	servicePaths.API.Path = apiPath
+	t.Cleanup(func() { setAPIFiles("", nil); servicePaths = serviceFilePaths{} })
+
+	router := gin.New()
+	router.NoRoute(func(c *gin.Context) {
+		if !dispatchDynamicEndpoint(c, apiDir) {
+			c.Status(http.StatusNotFound)
+		}
+	})
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/added", nil))
+	if rec.Code != http.StatusOK || !containsJSONValue(rec.Body.Bytes(), "value", "hot") {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDynamicDispatcherServesPublicAPIAddedAfterStartup(t *testing.T) {
+	initTestLogger()
+	gin.SetMode(gin.TestMode)
+	apiDir := t.TempDir()
+	apiPath := filepath.Join(apiDir, "api.json")
+	publicDir := filepath.Join(apiDir, "public")
+	if err := os.Mkdir(publicDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeHotReloadTestFile(t, filepath.Join(publicDir, "hello.txt"), "hello hot reload")
+	setAPIFiles(apiPath, map[string]interface{}{
+		"assets": map[string]interface{}{"type": "public", "path": "./public"},
+	})
+	servicePaths.API.Path = apiPath
+	t.Cleanup(func() { setAPIFiles("", nil); servicePaths = serviceFilePaths{} })
+
+	router := gin.New()
+	router.NoRoute(func(c *gin.Context) {
+		if !dispatchDynamicEndpoint(c, apiDir) {
+			c.Status(http.StatusNotFound)
+		}
+	})
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/assets/hello.txt", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "hello hot reload" {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleNyanDoesNotMutatePublishedAPIFiles(t *testing.T) {
+	initTestLogger()
+	gin.SetMode(gin.TestMode)
+	apiDir := t.TempDir()
+	apiPath := filepath.Join(apiDir, "api.json")
+	setAPIFiles(apiPath, map[string]interface{}{
+		"hello": map[string]interface{}{"script": "./hello.js", "description": "hello"},
+	})
+	servicePaths.API.Path = apiPath
+	t.Cleanup(func() { setAPIFiles("", nil); servicePaths = serviceFilePaths{} })
+
+	router := gin.New()
+	router.GET("/nyan", handleNyan)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nyan", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	hello := currentAPIFiles()["hello"].(map[string]interface{})
+	if hello["script"] != "./hello.js" {
+		t.Fatal("handleNyan mutated the published API definition")
+	}
+}
+
+func TestAPIFilesConcurrentReadAndReplace(t *testing.T) {
+	setAPIFiles("/tmp/api.json", map[string]interface{}{"api": map[string]interface{}{"description": "initial"}})
+	t.Cleanup(func() { setAPIFiles("", nil) })
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				_ = currentAPIFiles()["api"]
+			}
+		}()
+	}
+	for i := 0; i < 1000; i++ {
+		setAPIFiles("/tmp/api.json", map[string]interface{}{"api": map[string]interface{}{"description": fmt.Sprintf("updated-%d", i)}})
+	}
+	wg.Wait()
+}
+
+func TestBackgroundRuntimeManagerUpdatesAndStopsSchedule(t *testing.T) {
+	initTestLogger()
+	manager := newBackgroundRuntimeManager()
+	firstSchedule, _ := parseCronSchedule("0 0 1 1 *")
+	first := scheduleJobConfig{name: "job", scriptPath: "/tmp/job-v1.js", trigger: triggerConfig{Type: "cron", Value: "0 0 1 1 *"}, schedule: firstSchedule}
+	manager.reconcile(map[string]scheduleJobConfig{"job": first}, nil)
+	manager.mu.Lock()
+	runtime := manager.schedules["job"]
+	manager.mu.Unlock()
+	if runtime == nil {
+		t.Fatal("schedule runtime was not started")
+	}
+	secondSchedule, _ := parseCronSchedule("0 0 2 1 *")
+	second := scheduleJobConfig{name: "job", scriptPath: "/tmp/job-v2.js", trigger: triggerConfig{Type: "cron", Value: "0 0 2 1 *"}, schedule: secondSchedule}
+	manager.reconcile(map[string]scheduleJobConfig{"job": second}, nil)
+	manager.mu.Lock()
+	updatedRuntime := manager.schedules["job"]
+	manager.mu.Unlock()
+	if updatedRuntime != runtime {
+		t.Fatal("schedule update created a second runtime")
+	}
+	if got, active := runtime.currentConfig(); !active || got.scriptPath != second.scriptPath {
+		t.Fatalf("runtime config = %#v, active=%t", got, active)
+	}
+	manager.reconcile(nil, nil)
+	waitForHotReloadSignal(t, runtime.done, "schedule stop")
+}
+
+func TestBackgroundRuntimeManagerReconnectsWebSocketOnlyForURLChange(t *testing.T) {
+	initTestLogger()
+	firstURL, firstConnected, firstDisconnected := newHotReloadWebSocketServer(t)
+	secondURL, secondConnected, secondDisconnected := newHotReloadWebSocketServer(t)
+	manager := newBackgroundRuntimeManager()
+	first := wsClientConfig{name: "client", scriptPath: "/tmp/client-v1.js", connectURL: firstURL, description: "first"}
+	manager.reconcile(nil, map[string]wsClientConfig{"client": first})
+	waitForHotReloadSignal(t, firstConnected, "first connect")
+	manager.mu.Lock()
+	runtime := manager.wsClients["client"]
+	manager.mu.Unlock()
+
+	softUpdate := first
+	softUpdate.scriptPath = "/tmp/client-v2.js"
+	softUpdate.description = "second"
+	manager.reconcile(nil, map[string]wsClientConfig{"client": softUpdate})
+	select {
+	case <-firstDisconnected:
+		t.Fatal("script/description update closed the connection")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	reconnectUpdate := softUpdate
+	reconnectUpdate.connectURL = secondURL
+	manager.reconcile(nil, map[string]wsClientConfig{"client": reconnectUpdate})
+	waitForHotReloadSignal(t, firstDisconnected, "old disconnect")
+	waitForHotReloadSignal(t, secondConnected, "second connect")
+	manager.reconcile(nil, nil)
+	waitForHotReloadSignal(t, secondDisconnected, "second disconnect")
+	waitForHotReloadSignal(t, runtime.done, "ws client stop")
+}
+
+func writeHotReloadTestFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func containsJSONValue(data []byte, key, want string) bool {
+	var value map[string]interface{}
+	return json.Unmarshal(data, &value) == nil && value[key] == want
+}
+
+func newHotReloadWebSocketServer(t *testing.T) (string, <-chan struct{}, <-chan struct{}) {
+	t.Helper()
+	connected := make(chan struct{}, 1)
+	disconnected := make(chan struct{}, 1)
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("local TCP listener is unavailable: %v", err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		connected <- struct{}{}
+		defer func() { disconnected <- struct{}{}; _ = conn.Close() }()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	server.Listener = listener
+	server.Start()
+	t.Cleanup(server.Close)
+	return "ws" + server.URL[len("http"):], connected, disconnected
+}
+
+func waitForHotReloadSignal(t *testing.T, signal <-chan struct{}, label string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for %s", label)
 	}
 }
