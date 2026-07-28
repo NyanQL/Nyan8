@@ -45,7 +45,7 @@ Nyan8 は起動時に `api.json` と `config.json` の読み込みパスを指�
 NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./nyan8
 ```
 
-`api.json` 内の `script` / `path` / `paramCheck` / `outCheck` の相対パスは、`api.json` が置かれているディレクトリから解決されます。
+各 `api.json` 内の `script` / `path` / `paramCheck` / `outCheck` の相対パスは、その定義を書いた `api.json` が置かれているディレクトリから解決されます。
 `config.json` 内の `certPath` / `keyPath` / `javascript_include` / `log.Filename` の相対パスは、`config.json` が置かれているディレクトリから解決されます。
 
 ---
@@ -104,13 +104,67 @@ NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./nyan8
 
 #### `api.json` のホットリロード
 
-`api.json` は既定で1秒ごとに確認され、内容が変化した場合だけ再解析されます。通常API、public API、JSON-RPC、MCP、schedule、ws_clientの追加・変更・削除が再起動なしで反映されます。
+ルートの `api.json` と、そこから `include` されたすべての `api.json` は既定で1秒ごとに確認され、内容が変化した場合だけルートから再解析されます。通常API、public API、JSON-RPC、MCP、schedule、ws_clientの追加・変更・削除が再起動なしで反映されます。
 
-不正なJSONや、不正なschedule／ws_client設定は採用されず、直前の正常な定義で稼働を継続します。同じ不正内容はファイルが再度変化するまで繰り返し解析されません。
+不正なJSON、存在しないinclude先、不正なschedule／ws_client設定などは採用されず、直前の正常な定義で稼働を継続します。失敗した候補内で新しく見つかったinclude先も監視されるため、ファイルの作成や修正だけで自動的に再試行されます。同じファイル状態とエラーは繰り返しログ出力されません。
 
 `Interval` は `500ms`、`1s`、`1m`、`24h` などのGo duration形式です。空の場合は `1s` になります。0以下または解析できない値は起動エラーです。ホットリロードを無効にする場合は `Enabled` を `false` にします。`APIHotReload` 全体を省略した場合は有効、1秒間隔です。
 
 schedule変更時は同名ジョブを二重起動せず、実行中のスクリプトを完了してから最新設定へ移行します。ws_clientはscript／descriptionだけの変更では接続を維持し、`connectURL` の変更時だけ旧接続を閉じて新しい接続先へ切り替えます。
+
+`script`、`paramCheck`、`outCheck`、publicの配信ファイル自体は監視対象ではありません。これらは従来どおり実行時またはリクエスト時に読み込まれます。
+
+#### `api.json` の分割と多段include
+
+API定義は `type: "include"` で複数の `api.json` に分割できます。includeした定義名がマウント名となり、子ファイル内のAPI名へ `/` 区切りで付加されます。includeの深さに制限はありません。
+
+ルートの `api.json`:
+
+```jsonc
+{
+  "health": {
+    "script": "./javascript/health.js"
+  },
+  "sub": {
+    "type": "include",
+    "path": "./sub/api.json"
+  }
+}
+```
+
+`sub/api.json`:
+
+```jsonc
+{
+  "getItem": {
+    "script": "./javascript/get_item.js"
+  },
+  "admin": {
+    "type": "include",
+    "path": "./admin/api.json"
+  }
+}
+```
+
+`sub/admin/api.json`:
+
+```jsonc
+{
+  "getUser": {
+    "script": "./javascript/get_user.js"
+  }
+}
+```
+
+この構成では `health`、`sub/getItem`、`sub/admin/getUser` として公開されます。展開後の名前はHTTP、WebSocket、JSON-RPC、MCP、push、schedule、ws_clientで共通して使用されます。include定義そのものはAPIとして公開されません。
+
+includeには次の制約があります。
+
+- include定義に指定できるフィールドは `type` と `path` だけです。
+- マウント名は空文字、`.`、`..`、前後に空白がある名前、`/` を含む名前にはできません。
+- 同じ階層でマウント名と衝突するAPI名は定義できません。
+- 循環参照と、展開後に重複するAPI名はエラーになります。
+- includeされない既存API名に `/` を含める従来の書き方は、マウント名と衝突しない限り使用できます。
 
 ### 3‑2  `api.json`
 

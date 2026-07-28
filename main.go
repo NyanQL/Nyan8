@@ -26,9 +26,11 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dop251/goja"
@@ -158,6 +160,7 @@ var (
 const defaultProto = "2025-03-26"
 const (
 	apiTypeAPI      = "api"
+	apiTypeInclude  = "include"
 	apiTypeWSClient = "ws_client"
 	apiTypePublic   = "public"
 	apiTypeSchedule = "schedule"
@@ -248,24 +251,16 @@ func main() {
 	logger.Printf("API file: %s (source: %s)", paths.API.Path, paths.API.Source)
 	logger.Printf("Config version: %s", configVersion)
 
-	initialAPIFiles, initialAPIHash, err := readAPIFile(paths.API.Path)
+	initialAPIConfig, err := readAPIConfigFile(paths.API.Path, apiBaseDir)
 	if err != nil {
 		logger.Fatalf("Failed to load api.json: %v", err)
 	}
-	initialSchedules, err := buildScheduleJobConfigs(initialAPIFiles, apiBaseDir)
-	if err != nil {
-		logger.Fatalf("Failed to load schedule configuration: %v", err)
-	}
-	initialWSClients, err := buildWSClientConfigs(initialAPIFiles, apiBaseDir)
-	if err != nil {
-		logger.Fatalf("Failed to load WebSocket client configuration: %v", err)
-	}
-	setAPIFiles(paths.API.Path, initialAPIFiles)
+	publishAPISnapshot(initialAPIConfig.Snapshot)
 	backgroundRuntimes = newBackgroundRuntimeManager()
-	backgroundRuntimes.reconcile(initialSchedules, initialWSClients)
+	backgroundRuntimes.reconcile(initialAPIConfig.Snapshot.Schedules, initialAPIConfig.Snapshot.WSClients)
 	if config.APIHotReload.Enabled {
 		logger.Printf("API hot reload enabled: interval=%s", apiHotReloadInterval)
-		go watchAPIFile(paths.API.Path, apiBaseDir, apiHotReloadInterval, initialAPIHash)
+		go watchAPIFile(paths.API.Path, apiBaseDir, apiHotReloadInterval, initialAPIConfig.Hash)
 	} else {
 		logger.Printf("API hot reload disabled")
 	}
@@ -898,7 +893,11 @@ func sendErrorMessage(conn *websocket.Conn, message string) {
 // runJavaScript はJavaScriptを実行します。
 // runJavaScript は、指定された JavaScript コードを goja で実行します。
 func runJavaScript(scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (string, error) {
-	value, err := runJavaScriptValue(scriptPath, allParams, ginCtx)
+	return runJavaScriptWithSnapshot(currentAPISnapshot(), scriptPath, allParams, ginCtx)
+}
+
+func runJavaScriptWithSnapshot(snapshot *APIConfigSnapshot, scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (string, error) {
+	value, err := runJavaScriptValueWithSnapshot(snapshot, scriptPath, allParams, ginCtx)
 	if err != nil {
 		return "", err
 	}
@@ -906,10 +905,14 @@ func runJavaScript(scriptPath string, allParams map[string]interface{}, ginCtx *
 }
 
 func runJavaScriptValue(scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (goja.Value, error) {
+	return runJavaScriptValueWithSnapshot(currentAPISnapshot(), scriptPath, allParams, ginCtx)
+}
+
+func runJavaScriptValueWithSnapshot(snapshot *APIConfigSnapshot, scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (goja.Value, error) {
 	// 新たな goja の VM を生成
 	vm := goja.New()
 	// 必要なグローバル関数等を登録する
-	setupGojaVM(vm, ginCtx)
+	setupGojaVMWithSnapshot(vm, snapshot, ginCtx)
 
 	// ★★★ 追加：include の基準ディレクトリを取得（mainと同じロジック） ★★★
 	basePath, err := filepath.Abs(filepath.Dir(os.Args[0]))
@@ -965,6 +968,10 @@ func runJavaScriptValue(scriptPath string, allParams map[string]interface{}, gin
 
 // callNyanAPIFromVM は、main.go 側から自身のAPI定義(js)を直接実行します。
 func callNyanAPIFromVM(apiName string, allParams map[string]interface{}, ginCtx *gin.Context) (string, error) {
+	return callNyanAPIFromVMWithSnapshot(currentAPISnapshot(), apiName, allParams, ginCtx)
+}
+
+func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allParams map[string]interface{}, ginCtx *gin.Context) (string, error) {
 	if strings.TrimSpace(apiName) == "" {
 		return "", fmt.Errorf("api name is required")
 	}
@@ -975,12 +982,10 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}, ginCtx 
 	}
 	execDir = apiBaseDir(execDir)
 
-	apiConf, err := loadJSONFile(apiJSONPath(execDir))
-	if err != nil {
-		return "", fmt.Errorf("failed to load api.json: %v", err)
+	if snapshot == nil {
+		return "", fmt.Errorf("API configuration is not loaded")
 	}
-
-	apiRaw, ok := apiConf[apiName]
+	apiRaw, ok := snapshot.Definitions[apiName]
 	if !ok {
 		return "", fmt.Errorf("API config not found: %s", apiName)
 	}
@@ -1005,7 +1010,7 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}, ginCtx 
 	params["api"] = apiName
 
 	fullScriptPath := resolvePathFromBase(execDir, scriptPath)
-	result, err := runJavaScript(fullScriptPath, params, ginCtx)
+	result, err := runJavaScriptWithSnapshot(snapshot, fullScriptPath, params, ginCtx)
 	if err != nil {
 		return "", fmt.Errorf("failed to run API %s: %v", apiName, err)
 	}
@@ -2079,6 +2084,10 @@ func parseConstArray(scriptContent []byte, constName string) []interface{} {
 
 // gojaのVMのセットアップ
 func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
+	setupGojaVMWithSnapshot(vm, currentAPISnapshot(), ginCtx)
+}
+
+func setupGojaVMWithSnapshot(vm *goja.Runtime, snapshot *APIConfigSnapshot, ginCtx *gin.Context) {
 
 	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
@@ -2179,7 +2188,7 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 		}
 		params["api"] = apiName
 
-		result, err := callNyanAPIFromVM(apiName, params, ginCtx)
+		result, err := callNyanAPIFromVMWithSnapshot(snapshot, apiName, params, ginCtx)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
@@ -3255,11 +3264,30 @@ type APIHotReloadConfig struct {
 }
 
 var (
-	apiFilesMu         sync.RWMutex
-	apiFiles           map[string]interface{}
-	activeAPIFilePath  string
+	apiSnapshot        atomic.Pointer[APIConfigSnapshot]
 	backgroundRuntimes *backgroundRuntimeManager
 )
+
+type APIConfigSnapshot struct {
+	RootPath    string
+	Definitions map[string]interface{}
+	Sources     map[string]string
+	FileStates  map[string]APIFileState
+	Schedules   map[string]scheduleJobConfig
+	WSClients   map[string]wsClientConfig
+}
+
+type APIFileState struct {
+	Path   string
+	Exists bool
+	Hash   [sha256.Size]byte
+	Error  string
+}
+
+type apiConfigLoadResult struct {
+	Snapshot *APIConfigSnapshot
+	Hash     [sha256.Size]byte
+}
 
 func applyConfigDefaults(target *Config) {
 	target.APIHotReload.Enabled = true
@@ -3282,54 +3310,709 @@ func parseAPIHotReloadInterval(value string) (time.Duration, error) {
 }
 
 func readAPIFile(apiFilePath string) (map[string]interface{}, [sha256.Size]byte, error) {
-	data, err := os.ReadFile(apiFilePath)
+	result, err := readAPIConfigFile(apiFilePath, filepath.Dir(apiFilePath))
 	if err != nil {
-		return nil, [sha256.Size]byte{}, fmt.Errorf("read api file: %w", err)
+		return nil, [sha256.Size]byte{}, err
 	}
-	files, err := decodeAPIFile(data)
+	return result.Snapshot.Definitions, result.Hash, nil
+}
+
+func readAPIConfigFile(apiFilePath, apiBaseDir string) (*apiConfigLoadResult, error) {
+	result, _, err := readAPIConfigFileAttempt(apiFilePath, apiBaseDir)
 	if err != nil {
-		return nil, sha256.Sum256(data), err
+		return nil, err
 	}
-	return files, sha256.Sum256(data), nil
+	if err := verifyAPIFileStates(result.Snapshot.FileStates); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func loadAPIConfigData(apiFilePath, apiBaseDir string, data []byte) (*apiConfigLoadResult, error) {
+	result, _, err := loadAPIConfigDataAttempt(apiFilePath, apiBaseDir, data)
+	return result, err
+}
+
+func readAPIConfigFileAttempt(apiFilePath, apiBaseDir string) (*apiConfigLoadResult, map[string]APIFileState, error) {
+	normalizedPath, err := normalizeAPIFilePath(apiFilePath)
+	if err != nil {
+		return nil, nil, err
+	}
+	identity, state, data, err := inspectAPIFile(normalizedPath)
+	discovered := map[string]APIFileState{identity: state}
+	if err != nil {
+		return nil, discovered, fmt.Errorf("read api file %s: %w", normalizedPath, err)
+	}
+	result, states, err := loadAPIConfigDataAttempt(normalizedPath, apiBaseDir, data)
+	return result, mergeAPIFileStates(discovered, states), err
+}
+
+func loadAPIConfigDataAttempt(apiFilePath, apiBaseDir string, data []byte) (*apiConfigLoadResult, map[string]APIFileState, error) {
+	definitions, sources, fileStates, err := expandAPIFileGraphWithMetadata(apiFilePath, data)
+	if err != nil {
+		return nil, fileStates, err
+	}
+	schedules, err := buildScheduleJobConfigs(definitions, apiBaseDir)
+	if err != nil {
+		return nil, fileStates, err
+	}
+	wsClients, err := buildWSClientConfigs(definitions, apiBaseDir)
+	if err != nil {
+		return nil, fileStates, err
+	}
+	return &apiConfigLoadResult{
+		Snapshot: newAPIConfigSnapshot(apiFilePath, definitions, sources, fileStates, schedules, wsClients),
+		Hash:     sha256.Sum256(data),
+	}, fileStates, nil
 }
 
 func decodeAPIFile(data []byte) (map[string]interface{}, error) {
-	var files map[string]interface{}
-	if err := json.Unmarshal(data, &files); err != nil {
-		return nil, fmt.Errorf("decode api JSON: %w", err)
+	rawDefinitions, err := decodeRawAPIDefinitions(data)
+	if err != nil {
+		return nil, err
 	}
-	if files == nil {
-		return nil, fmt.Errorf("decode api JSON: top-level value must be an object")
-	}
-	for name, raw := range files {
-		if _, ok := raw.(map[string]interface{}); !ok {
-			return nil, fmt.Errorf("API %q definition must be an object", name)
+	files := make(map[string]interface{}, len(rawDefinitions))
+	for name, rawDefinition := range rawDefinitions {
+		definitionType, err := rawAPIDefinitionType(rawDefinition)
+		if err != nil {
+			return nil, fmt.Errorf("decode api JSON: definition %q: %w", name, err)
 		}
+		if definitionType == apiTypeInclude {
+			return nil, fmt.Errorf("decode api JSON: include definition %q requires an API file path", name)
+		}
+		definition, err := decodeAPIDefinition(name, rawDefinition, "")
+		if err != nil {
+			return nil, err
+		}
+		files[name] = definition
 	}
 	return files, nil
 }
 
-func currentAPIFiles() map[string]interface{} {
-	apiFilesMu.RLock()
-	files := apiFiles
-	apiFilesMu.RUnlock()
-	return files
+type apiIncludeDefinition struct {
+	Type string `json:"type"`
+	Path string `json:"path"`
 }
 
+type apiIncludeFrame struct {
+	path     string
+	identity string
+}
+
+type apiGraphLoader struct {
+	definitions map[string]interface{}
+	sources     map[string]string
+	fileStates  map[string]APIFileState
+}
+
+func expandAPIFileGraph(rootPath string, rootData []byte) (map[string]interface{}, error) {
+	definitions, _, err := expandAPIFileGraphWithSources(rootPath, rootData)
+	return definitions, err
+}
+
+func expandAPIFileGraphWithSources(rootPath string, rootData []byte) (map[string]interface{}, map[string]string, error) {
+	definitions, sources, _, err := expandAPIFileGraphWithMetadata(rootPath, rootData)
+	return definitions, sources, err
+}
+
+func expandAPIFileGraphWithMetadata(rootPath string, rootData []byte) (map[string]interface{}, map[string]string, map[string]APIFileState, error) {
+	normalizedRoot, err := normalizeAPIFilePath(rootPath)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	rootIdentity, err := canonicalExistingAPIFilePath(normalizedRoot)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	loader := &apiGraphLoader{
+		definitions: make(map[string]interface{}),
+		sources:     make(map[string]string),
+		fileStates:  make(map[string]APIFileState),
+	}
+	if err := loader.loadFile(normalizedRoot, rootIdentity, rootData, "", nil); err != nil {
+		return nil, nil, loader.fileStates, err
+	}
+	return loader.definitions, loader.sources, loader.fileStates, nil
+}
+
+func (loader *apiGraphLoader) loadFile(filePath, identity string, data []byte, mountPrefix string, stack []apiIncludeFrame) error {
+	if includeFrameIndex(stack, identity) >= 0 {
+		return includeCycleError(stack, filePath)
+	}
+	stack = append(stack, apiIncludeFrame{path: filePath, identity: identity})
+	loader.fileStates[identity] = APIFileState{Path: identity, Exists: true, Hash: sha256.Sum256(data)}
+	rawDefinitions, err := decodeRawAPIDefinitions(data)
+	if err != nil {
+		return fmt.Errorf("API file %s: %w", filePath, err)
+	}
+	definitionTypes, mounts, err := inspectAPIDefinitionTypes(rawDefinitions, filePath)
+	if err != nil {
+		return err
+	}
+	if err := validateMountNamespaceConflicts(rawDefinitions, definitionTypes, mounts, filePath); err != nil {
+		return err
+	}
+
+	for _, name := range sortedRawDefinitionNames(rawDefinitions) {
+		rawDefinition := rawDefinitions[name]
+		if definitionTypes[name] != apiTypeInclude {
+			fullName := joinAPIName(mountPrefix, name)
+			definition, err := decodeAPIDefinition(fullName, rawDefinition, filepath.Dir(filePath))
+			if err != nil {
+				return err
+			}
+			if previousSource, exists := loader.sources[fullName]; exists {
+				return fmt.Errorf("duplicate expanded API name %q from %s and %s", fullName, previousSource, filePath)
+			}
+			loader.definitions[fullName] = definition
+			loader.sources[fullName] = filePath
+			continue
+		}
+
+		include, err := decodeIncludeDefinition(name, rawDefinition)
+		if err != nil {
+			return fmt.Errorf("API file %s: %w", filePath, err)
+		}
+		includePath, err := resolveIncludePath(filePath, include.Path)
+		if err != nil {
+			return fmt.Errorf("include %q in %s: %w", name, filePath, err)
+		}
+		includeIdentity, includeState, includeData, err := inspectAPIFile(includePath)
+		loader.fileStates[includeIdentity] = includeState
+		if err != nil {
+			return fmt.Errorf("include %q in %s: %w", name, filePath, err)
+		}
+		if includeFrameIndex(stack, includeIdentity) >= 0 {
+			return includeCycleError(stack, includePath)
+		}
+		if err := loader.loadFile(includePath, includeIdentity, includeData, joinAPIName(mountPrefix, name), stack); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func decodeRawAPIDefinitions(data []byte) (map[string]json.RawMessage, error) {
+	if err := validateNoDuplicateJSONKeys(data); err != nil {
+		return nil, fmt.Errorf("decode api JSON: %w", err)
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, fmt.Errorf("decode api JSON: top-level value must be an object")
+	}
+	var definitions map[string]json.RawMessage
+	if err := json.Unmarshal(data, &definitions); err != nil {
+		return nil, fmt.Errorf("decode api JSON: %w", err)
+	}
+	if definitions == nil {
+		return nil, fmt.Errorf("decode api JSON: top-level value must be an object")
+	}
+	for name, rawDefinition := range definitions {
+		definition := bytes.TrimSpace(rawDefinition)
+		if len(definition) == 0 || definition[0] != '{' {
+			return nil, fmt.Errorf("decode api JSON: definition %q must be an object", name)
+		}
+	}
+	return definitions, nil
+}
+
+func rawAPIDefinitionType(rawDefinition json.RawMessage) (string, error) {
+	var typeOnly struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(rawDefinition, &typeOnly); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(typeOnly.Type), nil
+}
+
+func decodeAPIDefinition(name string, rawDefinition json.RawMessage, sourceDir string) (map[string]interface{}, error) {
+	var definition map[string]interface{}
+	if err := json.Unmarshal(rawDefinition, &definition); err != nil {
+		return nil, fmt.Errorf("decode api JSON: definition %q: %w", name, err)
+	}
+	if sourceDir == "" {
+		return definition, nil
+	}
+	for _, key := range []string{"script", "path", "paramCheck", "paramcheck", "check", "outCheck", "outcheck"} {
+		rawPath, exists := definition[key]
+		if !exists {
+			continue
+		}
+		pathValue, ok := rawPath.(string)
+		if !ok || strings.TrimSpace(pathValue) == "" {
+			continue
+		}
+		resolved, err := resolvePath(sourceDir, pathValue)
+		if err != nil {
+			return nil, fmt.Errorf("decode api JSON: definition %q: invalid %s path %q: %w", name, key, pathValue, err)
+		}
+		definition[key] = resolved
+	}
+	return definition, nil
+}
+
+func inspectAPIDefinitionTypes(rawDefinitions map[string]json.RawMessage, filePath string) (map[string]string, map[string]struct{}, error) {
+	definitionTypes := make(map[string]string, len(rawDefinitions))
+	mounts := make(map[string]struct{})
+	for _, name := range sortedRawDefinitionNames(rawDefinitions) {
+		definitionType, err := rawAPIDefinitionType(rawDefinitions[name])
+		if err != nil {
+			return nil, nil, fmt.Errorf("API file %s: definition %q: %w", filePath, name, err)
+		}
+		definitionTypes[name] = definitionType
+		if definitionType == apiTypeInclude {
+			if err := validateMountName(name); err != nil {
+				return nil, nil, fmt.Errorf("API file %s: %w", filePath, err)
+			}
+			mounts[name] = struct{}{}
+		}
+	}
+	return definitionTypes, mounts, nil
+}
+
+func validateMountNamespaceConflicts(rawDefinitions map[string]json.RawMessage, definitionTypes map[string]string, mounts map[string]struct{}, filePath string) error {
+	for _, name := range sortedRawDefinitionNames(rawDefinitions) {
+		if definitionTypes[name] == apiTypeInclude {
+			continue
+		}
+		for _, mountName := range sortedStringSet(mounts) {
+			if name == mountName || strings.HasPrefix(name, mountName+"/") {
+				return fmt.Errorf("API file %s: API name %q conflicts with mount namespace %q", filePath, name, mountName)
+			}
+		}
+	}
+	return nil
+}
+
+func validateMountName(name string) error {
+	if name == "" || name != strings.TrimSpace(name) || name == "." || name == ".." || strings.Contains(name, "/") {
+		return fmt.Errorf("invalid include mount name %q", name)
+	}
+	return nil
+}
+
+func decodeIncludeDefinition(mountName string, rawDefinition json.RawMessage) (apiIncludeDefinition, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(rawDefinition, &fields); err != nil {
+		return apiIncludeDefinition{}, fmt.Errorf("include %q: %w", mountName, err)
+	}
+	for field := range fields {
+		if field != "type" && field != "path" {
+			return apiIncludeDefinition{}, fmt.Errorf("include %q: unsupported field %q; only type and path are allowed", mountName, field)
+		}
+	}
+	var include apiIncludeDefinition
+	if err := json.Unmarshal(rawDefinition, &include); err != nil {
+		return apiIncludeDefinition{}, fmt.Errorf("include %q: %w", mountName, err)
+	}
+	if strings.TrimSpace(include.Type) != apiTypeInclude {
+		return apiIncludeDefinition{}, fmt.Errorf("include %q: type must be %q", mountName, apiTypeInclude)
+	}
+	if strings.TrimSpace(include.Path) == "" {
+		return apiIncludeDefinition{}, fmt.Errorf("include %q: path is empty", mountName)
+	}
+	return include, nil
+}
+
+func sortedRawDefinitionNames(definitions map[string]json.RawMessage) []string {
+	names := make([]string, 0, len(definitions))
+	for name := range definitions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func sortedStringSet(values map[string]struct{}) []string {
+	items := make([]string, 0, len(values))
+	for value := range values {
+		items = append(items, value)
+	}
+	sort.Strings(items)
+	return items
+}
+
+func joinAPIName(prefix, name string) string {
+	if prefix == "" {
+		return name
+	}
+	return prefix + "/" + name
+}
+
+func includeFrameIndex(stack []apiIncludeFrame, identity string) int {
+	for index, frame := range stack {
+		if frame.identity == identity {
+			return index
+		}
+	}
+	return -1
+}
+
+func includeCycleError(stack []apiIncludeFrame, repeatedPath string) error {
+	cycle := make([]string, 0, len(stack)+1)
+	for _, frame := range stack {
+		cycle = append(cycle, frame.path)
+	}
+	cycle = append(cycle, repeatedPath)
+	return fmt.Errorf("include cycle detected:\n%s", strings.Join(cycle, "\n-> "))
+}
+
+func normalizeAPIFilePath(path string) (string, error) {
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve api file path %q: %w", path, err)
+	}
+	return filepath.Clean(absolutePath), nil
+}
+
+func inspectAPIFile(path string) (string, APIFileState, []byte, error) {
+	normalizedPath, err := normalizeAPIFilePath(path)
+	if err != nil {
+		state := APIFileState{Path: path, Error: "invalid_path"}
+		return path, state, nil, err
+	}
+	info, err := os.Stat(normalizedPath)
+	if err != nil {
+		state := APIFileState{Path: normalizedPath}
+		if os.IsNotExist(err) {
+			state.Error = "not_found"
+			return normalizedPath, state, nil, fmt.Errorf("file not found: %s", normalizedPath)
+		}
+		state.Error = "stat_error"
+		return normalizedPath, state, nil, fmt.Errorf("file cannot be accessed: %s: %w", normalizedPath, err)
+	}
+	if !info.Mode().IsRegular() {
+		state := APIFileState{Path: normalizedPath, Exists: true, Error: "not_regular"}
+		return normalizedPath, state, nil, fmt.Errorf("path is not a regular file: %s", normalizedPath)
+	}
+	evaluatedPath, err := filepath.EvalSymlinks(normalizedPath)
+	if err != nil {
+		state := APIFileState{Path: normalizedPath, Exists: true, Error: "symlink_error"}
+		return normalizedPath, state, nil, fmt.Errorf("resolve symlinks for %s: %w", normalizedPath, err)
+	}
+	identity, err := normalizeAPIFilePath(evaluatedPath)
+	if err != nil {
+		state := APIFileState{Path: normalizedPath, Exists: true, Error: "invalid_path"}
+		return normalizedPath, state, nil, err
+	}
+	data, err := os.ReadFile(normalizedPath)
+	if err != nil {
+		state := APIFileState{Path: identity, Exists: true, Error: "read_error"}
+		return identity, state, nil, fmt.Errorf("file cannot be read: %s: %w", normalizedPath, err)
+	}
+	state := APIFileState{Path: identity, Exists: true, Hash: sha256.Sum256(data)}
+	return identity, state, data, nil
+}
+
+func canonicalExistingAPIFilePath(path string) (string, error) {
+	normalizedPath, err := normalizeAPIFilePath(path)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(normalizedPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("file not found: %s", normalizedPath)
+		}
+		return "", fmt.Errorf("file cannot be accessed: %s: %w", normalizedPath, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("path is not a regular file: %s", normalizedPath)
+	}
+	evaluatedPath, err := filepath.EvalSymlinks(normalizedPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve symlinks for %s: %w", normalizedPath, err)
+	}
+	return normalizeAPIFilePath(evaluatedPath)
+}
+
+func resolveIncludePath(parentAPIPath, includePath string) (string, error) {
+	resolvedPath := includePath
+	if !filepath.IsAbs(resolvedPath) {
+		resolvedPath = filepath.Join(filepath.Dir(parentAPIPath), resolvedPath)
+	}
+	return normalizeAPIFilePath(resolvedPath)
+}
+
+func validateNoDuplicateJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := consumeJSONValue(decoder, "$"); err != nil {
+		return err
+	}
+	if token, err := decoder.Token(); err != io.EOF {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("unexpected token after top-level value: %v", token)
+	}
+	return nil
+}
+
+func consumeJSONValue(decoder *json.Decoder, path string) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("object key at %s is not a string", path)
+			}
+			if _, exists := seen[key]; exists {
+				return fmt.Errorf("duplicate key %q at %s", key, path)
+			}
+			seen[key] = struct{}{}
+			if err := consumeJSONValue(decoder, path+"["+strconv.Quote(key)+"]"); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim('}') {
+			return fmt.Errorf("object at %s is not closed", path)
+		}
+	case '[':
+		for index := 0; decoder.More(); index++ {
+			if err := consumeJSONValue(decoder, fmt.Sprintf("%s[%d]", path, index)); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim(']') {
+			return fmt.Errorf("array at %s is not closed", path)
+		}
+	default:
+		return fmt.Errorf("unexpected delimiter %q at %s", delimiter, path)
+	}
+	return nil
+}
+
+func newAPIConfigSnapshot(rootPath string, definitions map[string]interface{}, sources map[string]string, fileStates map[string]APIFileState, schedules map[string]scheduleJobConfig, wsClients map[string]wsClientConfig) *APIConfigSnapshot {
+	normalizedRoot, err := normalizeAPIFilePath(rootPath)
+	if err != nil {
+		normalizedRoot = filepath.Clean(rootPath)
+	}
+	return &APIConfigSnapshot{
+		RootPath:    normalizedRoot,
+		Definitions: cloneAPIDefinitions(definitions),
+		Sources:     cloneStringMap(sources),
+		FileStates:  cloneAPIFileStates(fileStates),
+		Schedules:   cloneScheduleJobConfigs(schedules),
+		WSClients:   cloneWSClientConfigs(wsClients),
+	}
+}
+
+func cloneAPIDefinitions(definitions map[string]interface{}) map[string]interface{} {
+	if definitions == nil {
+		return nil
+	}
+	cloned := make(map[string]interface{}, len(definitions))
+	for name, definition := range definitions {
+		cloned[name] = cloneJSONCompatibleValue(definition)
+	}
+	return cloned
+}
+
+func cloneJSONCompatibleValue(value interface{}) interface{} {
+	switch value := value.(type) {
+	case map[string]interface{}:
+		cloned := make(map[string]interface{}, len(value))
+		for key, item := range value {
+			cloned[key] = cloneJSONCompatibleValue(item)
+		}
+		return cloned
+	case []interface{}:
+		cloned := make([]interface{}, len(value))
+		for index, item := range value {
+			cloned[index] = cloneJSONCompatibleValue(item)
+		}
+		return cloned
+	default:
+		return value
+	}
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneAPIFileStates(states map[string]APIFileState) map[string]APIFileState {
+	if states == nil {
+		return nil
+	}
+	cloned := make(map[string]APIFileState, len(states))
+	for path, state := range states {
+		cloned[path] = state
+	}
+	return cloned
+}
+
+func cloneScheduleJobConfigs(configs map[string]scheduleJobConfig) map[string]scheduleJobConfig {
+	if configs == nil {
+		return nil
+	}
+	cloned := make(map[string]scheduleJobConfig, len(configs))
+	for name, config := range configs {
+		cloned[name] = cloneScheduleJobConfig(config)
+	}
+	return cloned
+}
+
+func cloneScheduleJobConfig(config scheduleJobConfig) scheduleJobConfig {
+	cloned := config
+	cloned.schedule.minutes = cloneCronField(config.schedule.minutes)
+	cloned.schedule.hours = cloneCronField(config.schedule.hours)
+	cloned.schedule.days = cloneCronField(config.schedule.days)
+	cloned.schedule.months = cloneCronField(config.schedule.months)
+	cloned.schedule.weekdays = cloneCronField(config.schedule.weekdays)
+	return cloned
+}
+
+func cloneCronField(field cronField) cronField {
+	if field == nil {
+		return nil
+	}
+	cloned := make(cronField, len(field))
+	for value, included := range field {
+		cloned[value] = included
+	}
+	return cloned
+}
+
+func cloneWSClientConfigs(configs map[string]wsClientConfig) map[string]wsClientConfig {
+	if configs == nil {
+		return nil
+	}
+	cloned := make(map[string]wsClientConfig, len(configs))
+	for name, config := range configs {
+		cloned[name] = config
+	}
+	return cloned
+}
+
+func currentAPISnapshot() *APIConfigSnapshot {
+	return apiSnapshot.Load()
+}
+
+func publishAPISnapshot(snapshot *APIConfigSnapshot) {
+	apiSnapshot.Store(snapshot)
+}
+
+func currentAPIFiles() map[string]interface{} {
+	snapshot := currentAPISnapshot()
+	if snapshot == nil {
+		return nil
+	}
+	return snapshot.Definitions
+}
+
+// setAPIFiles is retained for focused tests and callers that only need API definitions.
+// Production config loads publish a complete snapshot through publishAPISnapshot.
 func setAPIFiles(path string, files map[string]interface{}) {
-	apiFilesMu.Lock()
-	activeAPIFilePath = filepath.Clean(path)
-	apiFiles = files
-	apiFilesMu.Unlock()
+	if files == nil && strings.TrimSpace(path) == "" {
+		publishAPISnapshot(nil)
+		return
+	}
+	publishAPISnapshot(newAPIConfigSnapshot(path, files, nil, nil, nil, nil))
 }
 
 func cachedAPIFilesFor(path string) (map[string]interface{}, bool) {
-	apiFilesMu.RLock()
-	defer apiFilesMu.RUnlock()
-	if apiFiles == nil || activeAPIFilePath == "" || filepath.Clean(path) != activeAPIFilePath {
+	snapshot := currentAPISnapshot()
+	if snapshot == nil || snapshot.Definitions == nil || snapshot.RootPath == "" {
 		return nil, false
 	}
-	return apiFiles, true
+	normalizedPath, err := normalizeAPIFilePath(path)
+	if err != nil || normalizedPath != snapshot.RootPath {
+		return nil, false
+	}
+	return snapshot.Definitions, true
+}
+
+func sameAPIConfigSnapshot(current, candidate *APIConfigSnapshot) bool {
+	if current == nil || candidate == nil {
+		return current == candidate
+	}
+	return current.RootPath == candidate.RootPath &&
+		reflect.DeepEqual(current.Definitions, candidate.Definitions) &&
+		(current.Sources == nil || reflect.DeepEqual(current.Sources, candidate.Sources)) &&
+		(current.Schedules == nil || reflect.DeepEqual(current.Schedules, candidate.Schedules)) &&
+		(current.WSClients == nil || reflect.DeepEqual(current.WSClients, candidate.WSClients))
+}
+
+func publishLoadedAPIConfig(loaded *apiConfigLoadResult) bool {
+	current := currentAPISnapshot()
+	configChanged := !sameAPIConfigSnapshot(current, loaded.Snapshot)
+	fileStatesChanged := current == nil || !reflect.DeepEqual(current.FileStates, loaded.Snapshot.FileStates)
+	if !configChanged && !fileStatesChanged {
+		return false
+	}
+	publishAPISnapshot(loaded.Snapshot)
+	if configChanged && backgroundRuntimes != nil {
+		backgroundRuntimes.reconcile(loaded.Snapshot.Schedules, loaded.Snapshot.WSClients)
+	}
+	return configChanged
+}
+
+func mergeAPIFileStates(stateSets ...map[string]APIFileState) map[string]APIFileState {
+	merged := make(map[string]APIFileState)
+	for _, states := range stateSets {
+		for identity, state := range states {
+			merged[identity] = state
+		}
+	}
+	return merged
+}
+
+func apiFileStatesFingerprint(states map[string]APIFileState) [sha256.Size]byte {
+	identities := make([]string, 0, len(states))
+	for identity := range states {
+		identities = append(identities, identity)
+	}
+	sort.Strings(identities)
+	hasher := sha256.New()
+	for _, identity := range identities {
+		state := states[identity]
+		_, _ = io.WriteString(hasher, identity)
+		_, _ = hasher.Write([]byte{0})
+		_, _ = io.WriteString(hasher, state.Path)
+		_, _ = hasher.Write([]byte{0})
+		if state.Exists {
+			_, _ = hasher.Write([]byte{1})
+		} else {
+			_, _ = hasher.Write([]byte{0})
+		}
+		_, _ = hasher.Write(state.Hash[:])
+		_, _ = io.WriteString(hasher, state.Error)
+		_, _ = hasher.Write([]byte{0})
+	}
+	var fingerprint [sha256.Size]byte
+	copy(fingerprint[:], hasher.Sum(nil))
+	return fingerprint
 }
 
 func reloadAPIFileIfChanged(apiFilePath, apiBaseDir string, lastObservedHash [sha256.Size]byte) ([sha256.Size]byte, bool, error) {
@@ -3342,43 +4025,97 @@ func reloadAPIFileIfChanged(apiFilePath, apiBaseDir string, lastObservedHash [sh
 		return lastObservedHash, false, nil
 	}
 
-	candidate, err := decodeAPIFile(data)
+	loaded, err := loadAPIConfigData(apiFilePath, apiBaseDir, data)
 	if err != nil {
 		return observedHash, false, err
 	}
-	if reflect.DeepEqual(currentAPIFiles(), candidate) {
-		return observedHash, false, nil
-	}
-	schedules, err := buildScheduleJobConfigs(candidate, apiBaseDir)
-	if err != nil {
+	if err := verifyAPIFileStates(loaded.Snapshot.FileStates); err != nil {
 		return observedHash, false, err
 	}
-	wsClients, err := buildWSClientConfigs(candidate, apiBaseDir)
-	if err != nil {
-		return observedHash, false, err
-	}
+	return observedHash, publishLoadedAPIConfig(loaded), nil
+}
 
-	setAPIFiles(apiFilePath, candidate)
-	if backgroundRuntimes != nil {
-		backgroundRuntimes.reconcile(schedules, wsClients)
+func initialAPIFileStates(apiFilePath string, initialHash [sha256.Size]byte) map[string]APIFileState {
+	normalizedPath, err := normalizeAPIFilePath(apiFilePath)
+	if err == nil {
+		if snapshot := currentAPISnapshot(); snapshot != nil && snapshot.RootPath == normalizedPath && len(snapshot.FileStates) > 0 {
+			return cloneAPIFileStates(snapshot.FileStates)
+		}
+		return map[string]APIFileState{normalizedPath: {Path: normalizedPath, Exists: true, Hash: initialHash}}
 	}
-	return observedHash, true, nil
+	return map[string]APIFileState{apiFilePath: {Path: apiFilePath, Exists: true, Hash: initialHash}}
+}
+
+func observeAPIFileStates(watched map[string]APIFileState) map[string]APIFileState {
+	observed := make(map[string]APIFileState, len(watched))
+	for identity, previous := range watched {
+		path := previous.Path
+		if path == "" {
+			path = identity
+		}
+		_, state, _, _ := inspectAPIFile(path)
+		observed[identity] = state
+	}
+	return observed
+}
+
+func verifyAPIFileStates(expected map[string]APIFileState) error {
+	if observed := observeAPIFileStates(expected); !reflect.DeepEqual(observed, expected) {
+		return fmt.Errorf("API files changed while the configuration was being loaded")
+	}
+	return nil
+}
+
+func reloadAPIConfigGraphIfChanged(apiFilePath, apiBaseDir string, lastObservedStates map[string]APIFileState) (map[string]APIFileState, bool, error) {
+	observedStates := observeAPIFileStates(lastObservedStates)
+	if reflect.DeepEqual(observedStates, lastObservedStates) {
+		return lastObservedStates, false, nil
+	}
+	loaded, discoveredStates, err := readAPIConfigFileAttempt(apiFilePath, apiBaseDir)
+	if err != nil {
+		var activeStates map[string]APIFileState
+		if snapshot := currentAPISnapshot(); snapshot != nil {
+			activeStates = snapshot.FileStates
+		}
+		watched := mergeAPIFileStates(activeStates, discoveredStates)
+		return observeAPIFileStates(watched), false, err
+	}
+	if err := verifyAPIFileStates(loaded.Snapshot.FileStates); err != nil {
+		var activeStates map[string]APIFileState
+		if snapshot := currentAPISnapshot(); snapshot != nil {
+			activeStates = snapshot.FileStates
+		}
+		watched := mergeAPIFileStates(activeStates, discoveredStates)
+		return observeAPIFileStates(watched), false, err
+	}
+	configChanged := publishLoadedAPIConfig(loaded)
+	return cloneAPIFileStates(loaded.Snapshot.FileStates), configChanged, nil
 }
 
 func watchAPIFile(apiFilePath, apiBaseDir string, interval time.Duration, initialHash [sha256.Size]byte) {
+	watchAPIFileUntil(apiFilePath, apiBaseDir, interval, initialHash, nil)
+}
+
+func watchAPIFileUntil(apiFilePath, apiBaseDir string, interval time.Duration, initialHash [sha256.Size]byte, done <-chan struct{}) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	lastObservedHash := initialHash
+	lastObservedStates := initialAPIFileStates(apiFilePath, initialHash)
 	lastReloadError := ""
-	for range ticker.C {
-		observedHash, reloaded, err := reloadAPIFileIfChanged(apiFilePath, apiBaseDir, lastObservedHash)
-		lastObservedHash = observedHash
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+		}
+		observedStates, reloaded, err := reloadAPIConfigGraphIfChanged(apiFilePath, apiBaseDir, lastObservedStates)
+		lastObservedStates = observedStates
 		if err != nil {
-			if err.Error() != lastReloadError {
+			errorKey := fmt.Sprintf("%x:%s", apiFileStatesFingerprint(observedStates), err.Error())
+			if errorKey != lastReloadError {
 				logger.Printf("API hot reload failed: %v; current API configuration remains active", err)
 			}
-			lastReloadError = err.Error()
+			lastReloadError = errorKey
 			continue
 		}
 		lastReloadError = ""
