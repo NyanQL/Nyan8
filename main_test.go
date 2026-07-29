@@ -1131,6 +1131,753 @@ func TestIncludedCompleteAPINameIsPreservedForNyanCallMeAndPush(t *testing.T) {
 	}
 }
 
+func TestParseStaticJavaScriptValueConvertsJSONCompatibleLiterals(t *testing.T) {
+	source := `{
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  properties: {
+    id: {type: "integer", minimum: -10},
+    ratio: {type: "number", examples: [1.5, +2]},
+    enabled: {type: "boolean", default: false},
+    note: {default: null},
+    names: {type: "array", items: {type: "string"}}
+  },
+  required: ["id"],
+  additionalProperties: false
+}`
+
+	got, err := parseStaticJavaScriptValue("schema.js", source)
+	if err != nil {
+		t.Fatalf("parseStaticJavaScriptValue() error = %v", err)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	var normalizedGot interface{}
+	if err := json.Unmarshal(encoded, &normalizedGot); err != nil {
+		t.Fatal(err)
+	}
+	var want interface{}
+	if err := json.Unmarshal([]byte(`{
+      "$schema":"https://json-schema.org/draft/2020-12/schema",
+      "type":"object",
+      "properties":{
+        "id":{"type":"integer","minimum":-10},
+        "ratio":{"type":"number","examples":[1.5,2]},
+        "enabled":{"type":"boolean","default":false},
+        "note":{"default":null},
+        "names":{"type":"array","items":{"type":"string"}}
+      },
+      "required":["id"],
+      "additionalProperties":false
+    }`), &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(normalizedGot, want) {
+		t.Fatalf("static value = %#v, want %#v", normalizedGot, want)
+	}
+}
+
+func TestParseStaticJavaScriptValueRejectsDynamicAndNonJSONValues(t *testing.T) {
+	tests := []struct {
+		name   string
+		source string
+		want   string
+	}{
+		{name: "function call", source: `{value: createSchema()}`, want: `$.value: function calls are not supported`},
+		{name: "identifier reference", source: `{type: schemaType}`, want: `$.type: identifier references are not supported`},
+		{name: "object spread", source: `{...commonSchema}`, want: `spread properties are not supported`},
+		{name: "array spread", source: `[...values]`, want: `$[0]: spread elements are not supported`},
+		{name: "conditional", source: `condition ? {} : []`, want: `conditional expressions are not supported`},
+		{name: "computed property", source: `{[key]: 1}`, want: `computed property names are not supported`},
+		{name: "shorthand property", source: `{id}`, want: `shorthand properties are not supported`},
+		{name: "getter", source: `{get id() { return 1; }}`, want: `property kind "get" is not supported`},
+		{name: "template literal", source: "`object`", want: `template literals are not supported`},
+		{name: "array hole", source: `[1,,2]`, want: `$[1]: array holes are not supported`},
+		{name: "bigint", source: `1n`, want: `parse static JavaScript value`},
+		{name: "infinity", source: `1e400`, want: `non-finite numbers are not JSON-compatible`},
+		{name: "duplicate property", source: `{id: 1, id: 2}`, want: `duplicate property "id"`},
+		{name: "numeric property", source: `{1: "value"}`, want: `property names must be strings`},
+		{name: "unsupported unary", source: `!true`, want: `unary operator "!" is not supported`},
+		{name: "unary identifier", source: `-value`, want: `unary "-" requires a numeric literal`},
+		{name: "computed expression", source: `1 + 2`, want: `computed expressions are not supported`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseStaticJavaScriptValue("schema.js", tt.source)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("parseStaticJavaScriptValue() error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseStaticJavaScriptValueReportsParserErrors(t *testing.T) {
+	_, err := parseStaticJavaScriptValue("broken-schema.js", `{type: }`)
+	if err == nil {
+		t.Fatal("parseStaticJavaScriptValue() error = nil, want parser error")
+	}
+	if !strings.Contains(err.Error(), "broken-schema.js") {
+		t.Fatalf("parseStaticJavaScriptValue() error = %v, want filename", err)
+	}
+}
+
+func TestExtractStaticJavaScriptObjectConstantReadsTopLevelConst(t *testing.T) {
+	source := []byte(`
+const helper = "unchanged";
+const nyanInputSchema = {
+  type: "object",
+  properties: {
+    id: {type: "integer", minimum: -1}
+  },
+  required: ["id"],
+  additionalProperties: false
+};
+
+function checkInput() {
+  return nyanAllParams.id !== undefined;
+}
+`)
+
+	got, found, err := extractStaticJavaScriptObjectConstant("param-check.js", source, "nyanInputSchema")
+	if err != nil {
+		t.Fatalf("extractStaticJavaScriptObjectConstant() error = %v", err)
+	}
+	if !found {
+		t.Fatal("extractStaticJavaScriptObjectConstant() found = false, want true")
+	}
+	if got["type"] != "object" || got["additionalProperties"] != false {
+		t.Fatalf("schema = %#v", got)
+	}
+	if _, exists := got["$schema"]; exists {
+		t.Fatal("$schema was added to a schema that omitted it")
+	}
+	properties, ok := got["properties"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("properties = %#v", got["properties"])
+	}
+	id, ok := properties["id"].(map[string]interface{})
+	if !ok || id["type"] != "integer" || id["minimum"] != int64(-1) {
+		t.Fatalf("id schema = %#v", properties["id"])
+	}
+}
+
+func TestReadStaticJavaScriptObjectConstantPreservesSchemaKeyword(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out-check.js")
+	writeHotReloadTestFile(t, path, `
+const ignored = null, nyanOutputSchema = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  properties: {
+    success: {const: true},
+    status: {type: "integer"}
+  },
+  required: ["success", "status"]
+};
+`)
+
+	got, found, err := readStaticJavaScriptObjectConstant(path, "nyanOutputSchema")
+	if err != nil {
+		t.Fatalf("readStaticJavaScriptObjectConstant() error = %v", err)
+	}
+	if !found {
+		t.Fatal("readStaticJavaScriptObjectConstant() found = false, want true")
+	}
+	if got["$schema"] != "https://json-schema.org/draft/2020-12/schema" {
+		t.Fatalf("$schema = %#v", got["$schema"])
+	}
+	properties := got["properties"].(map[string]interface{})
+	if _, exists := properties["result"]; exists {
+		t.Fatal("Nyan8 added a result property to the explicit output schema")
+	}
+}
+
+func TestExtractStaticJavaScriptObjectConstantReturnsNotFound(t *testing.T) {
+	source := []byte(`
+const nyanInputSchemaExample = {type: "object"};
+function makeCheck() {
+  const nyanInputSchema = {type: "array"};
+  return nyanInputSchema;
+}
+`)
+
+	got, found, err := extractStaticJavaScriptObjectConstant("without-schema.js", source, "nyanInputSchema")
+	if err != nil {
+		t.Fatalf("extractStaticJavaScriptObjectConstant() error = %v", err)
+	}
+	if found || got != nil {
+		t.Fatalf("schema = %#v, found=%t; want nil, false", got, found)
+	}
+}
+
+func TestExtractStaticJavaScriptObjectConstantRejectsInvalidDeclarations(t *testing.T) {
+	tests := []struct {
+		name   string
+		source string
+		want   string
+	}{
+		{name: "let declaration", source: `let nyanInputSchema = {};`, want: `must be declared with const`},
+		{name: "var declaration", source: `var nyanInputSchema = {};`, want: `must be declared with const`},
+		{name: "array value", source: `const nyanInputSchema = [];`, want: `must be a static object literal`},
+		{name: "null value", source: `const nyanInputSchema = null;`, want: `must be a static object literal`},
+		{name: "function call", source: `const nyanInputSchema = createSchema();`, want: `function calls are not supported`},
+		{name: "identifier reference", source: `const schema = {}; const nyanInputSchema = schema;`, want: `identifier references are not supported`},
+		{name: "spread", source: `const nyanInputSchema = {...commonSchema};`, want: `spread properties are not supported`},
+		{name: "duplicate", source: `const nyanInputSchema = {}; const nyanInputSchema = {};`, want: `nyanInputSchema`},
+		{name: "syntax error", source: `const nyanInputSchema = {type: };`, want: `invalid-schema.js`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := extractStaticJavaScriptObjectConstant("invalid-schema.js", []byte(tt.source), "nyanInputSchema")
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("extractStaticJavaScriptObjectConstant() error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractStaticJavaScriptObjectConstantValidatesArgumentsAndReadErrors(t *testing.T) {
+	if _, _, err := extractStaticJavaScriptObjectConstant("schema.js", []byte(`const value = {};`), " "); err == nil {
+		t.Fatal("empty constant name error = nil")
+	}
+	missingPath := filepath.Join(t.TempDir(), "missing.js")
+	if _, _, err := readStaticJavaScriptObjectConstant(missingPath, "nyanInputSchema"); err == nil || !strings.Contains(err.Error(), missingPath) {
+		t.Fatalf("missing file error = %v", err)
+	}
+}
+
+func TestResolveAPISchemaAppliesPriorityAndSources(t *testing.T) {
+	dir := t.TempDir()
+	paramCheck := filepath.Join(dir, "param-check.js")
+	outCheck := filepath.Join(dir, "out-check.js")
+	legacyScript := filepath.Join(dir, "legacy.js")
+	writeHotReloadTestFile(t, paramCheck, `
+const nyanInputSchema = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  properties: {explicit_id: {type: "integer"}},
+  required: ["explicit_id"]
+};
+`)
+	writeHotReloadTestFile(t, outCheck, `
+const nyanOutputSchema = {
+  type: "object",
+  properties: {
+    status: {type: "integer"},
+    payload: {type: "string"}
+  },
+  required: ["status", "payload"]
+};
+`)
+	writeHotReloadTestFile(t, legacyScript, `
+const nyanAcceptedParams = {legacy_id:1,price:1.5,enabled:true,tags:["a","b"],nested:{name:"cat"}};
+`)
+
+	explicit, err := resolveAPISchema(map[string]interface{}{
+		"paramCheck": paramCheck,
+		"outCheck":   outCheck,
+		"script":     legacyScript,
+	})
+	if err != nil {
+		t.Fatalf("resolveAPISchema(explicit) error = %v", err)
+	}
+	if explicit.InputSource != schemaSourceParamCheck || explicit.OutputSource != schemaSourceOutCheck {
+		t.Fatalf("explicit sources = input:%q output:%q", explicit.InputSource, explicit.OutputSource)
+	}
+	if explicit.Input["$schema"] != "https://json-schema.org/draft/2020-12/schema" {
+		t.Fatalf("explicit input schema = %#v", explicit.Input)
+	}
+	inputProperties := explicit.Input["properties"].(map[string]interface{})
+	if _, exists := inputProperties["legacy_id"]; exists {
+		t.Fatalf("legacy input unexpectedly replaced explicit schema: %#v", explicit.Input)
+	}
+	outputProperties := explicit.Output["properties"].(map[string]interface{})
+	if _, exists := outputProperties["success"]; exists {
+		t.Fatalf("success was added to explicit output schema: %#v", explicit.Output)
+	}
+	if _, exists := outputProperties["result"]; exists {
+		t.Fatalf("result was added to explicit output schema: %#v", explicit.Output)
+	}
+
+	legacy, err := resolveAPISchema(map[string]interface{}{"script": legacyScript})
+	if err != nil {
+		t.Fatalf("resolveAPISchema(legacy) error = %v", err)
+	}
+	if legacy.InputSource != schemaSourceScriptLegacy || legacy.OutputSource != schemaSourceUnknown {
+		t.Fatalf("legacy sources = input:%q output:%q", legacy.InputSource, legacy.OutputSource)
+	}
+	legacyProperties := legacy.Input["properties"].(map[string]interface{})
+	if legacyProperties["legacy_id"].(map[string]interface{})["type"] != "integer" || legacyProperties["price"].(map[string]interface{})["type"] != "number" {
+		t.Fatalf("legacy input properties = %#v", legacyProperties)
+	}
+	if legacyProperties["nested"].(map[string]interface{})["type"] != "object" {
+		t.Fatalf("nested legacy input = %#v", legacyProperties["nested"])
+	}
+	if _, exists := legacy.Input["required"]; exists {
+		t.Fatalf("legacy input must not infer required: %#v", legacy.Input)
+	}
+
+	unknown, err := resolveAPISchema(map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("resolveAPISchema(unknown) error = %v", err)
+	}
+	if unknown.InputSource != schemaSourceUnknown || unknown.OutputSource != schemaSourceUnknown || len(unknown.Input) != 0 || len(unknown.Output) != 0 {
+		t.Fatalf("unknown schema = %#v", unknown)
+	}
+}
+
+func TestResolveAPISchemaSupportsCheckPathAliases(t *testing.T) {
+	dir := t.TempDir()
+	paramCheck := filepath.Join(dir, "param-check.js")
+	outCheck := filepath.Join(dir, "out-check.js")
+	writeHotReloadTestFile(t, paramCheck, `const nyanInputSchema = {type:"object"};`)
+	writeHotReloadTestFile(t, outCheck, `const nyanOutputSchema = {type:"array"};`)
+
+	for _, inputKey := range []string{"paramcheck", "check"} {
+		t.Run(inputKey, func(t *testing.T) {
+			resolved, err := resolveAPISchema(map[string]interface{}{
+				inputKey:   paramCheck,
+				"outcheck": outCheck,
+			})
+			if err != nil {
+				t.Fatalf("resolveAPISchema() error = %v", err)
+			}
+			if resolved.InputSource != schemaSourceParamCheck || resolved.OutputSource != schemaSourceOutCheck {
+				t.Fatalf("sources = input:%q output:%q", resolved.InputSource, resolved.OutputSource)
+			}
+		})
+	}
+}
+
+func TestResolveAPISchemaRejectsInvalidExplicitSchemaWithoutLegacyFallback(t *testing.T) {
+	dir := t.TempDir()
+	paramCheck := filepath.Join(dir, "param-check.js")
+	legacyScript := filepath.Join(dir, "legacy.js")
+	writeHotReloadTestFile(t, paramCheck, `const nyanInputSchema = createSchema();`)
+	writeHotReloadTestFile(t, legacyScript, `const nyanAcceptedParams = {id: 1};`)
+
+	_, err := resolveAPISchema(map[string]interface{}{
+		"paramCheck": paramCheck,
+		"script":     legacyScript,
+	})
+	if err == nil || !strings.Contains(err.Error(), "input schema from paramCheck") || !strings.Contains(err.Error(), "function calls") {
+		t.Fatalf("resolveAPISchema() error = %v", err)
+	}
+}
+
+func TestResolveAPISchemaIgnoresMissingOptionalSchemaFiles(t *testing.T) {
+	dir := t.TempDir()
+	legacyScript := filepath.Join(dir, "legacy.js")
+	writeHotReloadTestFile(t, legacyScript, `const nyanAcceptedParams = {id: 1};`)
+
+	resolved, err := resolveAPISchema(map[string]interface{}{
+		"paramCheck": filepath.Join(dir, "missing-param-check.js"),
+		"outCheck":   filepath.Join(dir, "missing-out-check.js"),
+		"script":     legacyScript,
+	})
+	if err != nil {
+		t.Fatalf("resolveAPISchema() error = %v", err)
+	}
+	if resolved.InputSource != schemaSourceScriptLegacy || resolved.OutputSource != schemaSourceUnknown {
+		t.Fatalf("sources = input:%q output:%q", resolved.InputSource, resolved.OutputSource)
+	}
+}
+
+func TestResolveAPISchemaIgnoresInvalidLegacyAcceptedParams(t *testing.T) {
+	dir := t.TempDir()
+	legacyScript := filepath.Join(dir, "legacy.js")
+	writeHotReloadTestFile(t, legacyScript, `const nyanAcceptedParams = buildAcceptedParams();`)
+
+	resolved, err := resolveAPISchema(map[string]interface{}{"script": legacyScript})
+	if err != nil {
+		t.Fatalf("resolveAPISchema() error = %v", err)
+	}
+	if resolved.InputSource != schemaSourceUnknown || len(resolved.Input) != 0 {
+		t.Fatalf("input schema = %#v, source = %q", resolved.Input, resolved.InputSource)
+	}
+}
+
+func TestReadStaticLegacyAcceptedParams(t *testing.T) {
+	dir := t.TempDir()
+	validPath := filepath.Join(dir, "valid.js")
+	writeHotReloadTestFile(t, validPath, `const nyanAcceptedParams = {id: 1, names: ["mike", "tama"]};`)
+	params, found, err := readStaticLegacyAcceptedParams(validPath)
+	if err != nil || !found {
+		t.Fatalf("readStaticLegacyAcceptedParams() params=%#v found=%t error=%v", params, found, err)
+	}
+	if params["id"] != int64(1) || !reflect.DeepEqual(params["names"], []interface{}{"mike", "tama"}) {
+		t.Fatalf("params = %#v", params)
+	}
+
+	missingPath := filepath.Join(dir, "missing-declaration.js")
+	writeHotReloadTestFile(t, missingPath, `const somethingElse = {};`)
+	params, found, err = readStaticLegacyAcceptedParams(missingPath)
+	if err != nil || found || len(params) != 0 {
+		t.Fatalf("missing declaration params=%#v found=%t error=%v", params, found, err)
+	}
+
+	invalidPath := filepath.Join(dir, "invalid.js")
+	writeHotReloadTestFile(t, invalidPath, `const nyanAcceptedParams = [1, 2];`)
+	if _, _, err := readStaticLegacyAcceptedParams(invalidPath); err == nil || !strings.Contains(err.Error(), "static object literal") {
+		t.Fatalf("invalid declaration error = %v", err)
+	}
+}
+
+func TestLegacyValueSchemaFallsBackSafelyForMixedArrays(t *testing.T) {
+	schema := legacyInputSchema(map[string]interface{}{
+		"nested":  map[string]interface{}{"name": "cat"},
+		"mixed":   []interface{}{float64(1), "two"},
+		"empty":   []interface{}{},
+		"unknown": nil,
+	})
+	properties := schema["properties"].(map[string]interface{})
+	nested := properties["nested"].(map[string]interface{})
+	if nested["type"] != "object" {
+		t.Fatalf("nested schema = %#v", nested)
+	}
+	mixed := properties["mixed"].(map[string]interface{})
+	if mixed["type"] != "array" || !reflect.DeepEqual(mixed["items"], map[string]interface{}{}) {
+		t.Fatalf("mixed schema = %#v", mixed)
+	}
+	empty := properties["empty"].(map[string]interface{})
+	if empty["type"] != "array" || !reflect.DeepEqual(empty["items"], map[string]interface{}{}) {
+		t.Fatalf("empty schema = %#v", empty)
+	}
+	if got := properties["unknown"]; !reflect.DeepEqual(got, map[string]interface{}{}) {
+		t.Fatalf("unknown value schema = %#v", got)
+	}
+}
+
+func TestHandleNyanDetailPublishesExplicitSchemasForNestedAPI(t *testing.T) {
+	initTestLogger()
+	gin.SetMode(gin.TestMode)
+	dir := t.TempDir()
+	paramCheck := filepath.Join(dir, "param-check.js")
+	outCheck := filepath.Join(dir, "out-check.js")
+	writeHotReloadTestFile(t, paramCheck, `
+const nyanInputSchema = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  properties: {id: {type: "integer"}},
+  required: ["id"]
+};
+`)
+	writeHotReloadTestFile(t, outCheck, `
+const nyanOutputSchema = {
+  type: "object",
+  properties: {status: {const: 200}, payload: {type: "string"}},
+  required: ["status", "payload"]
+};
+`)
+	setAPIFiles(filepath.Join(dir, "api.json"), map[string]interface{}{
+		"sub/items/get": map[string]interface{}{
+			"paramCheck":  paramCheck,
+			"outCheck":    outCheck,
+			"description": "nested API",
+		},
+	})
+	t.Cleanup(func() { setAPIFiles("", nil) })
+
+	router := gin.New()
+	router.GET("/nyan", handleNyan)
+	router.GET("/nyan/*apiName", handleNyanDetail)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/nyan/sub/items/get", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["api"] != "sub/items/get" || response["type"] != apiTypeAPI || response["description"] != "nested API" {
+		t.Fatalf("detail response = %#v", response)
+	}
+	source := response["schemaSource"].(map[string]interface{})
+	if source["input"] != schemaSourceParamCheck || source["output"] != schemaSourceOutCheck {
+		t.Fatalf("schemaSource = %#v", source)
+	}
+	input := response["inputSchema"].(map[string]interface{})
+	if input["$schema"] != "https://json-schema.org/draft/2020-12/schema" {
+		t.Fatalf("inputSchema = %#v", input)
+	}
+	output := response["outputSchema"].(map[string]interface{})
+	properties := output["properties"].(map[string]interface{})
+	if _, exists := properties["success"]; exists {
+		t.Fatalf("success was added to outputSchema: %#v", output)
+	}
+	if _, exists := properties["result"]; exists {
+		t.Fatalf("result was added to outputSchema: %#v", output)
+	}
+	if _, exists := response["nyanAcceptedParams"]; exists {
+		t.Fatalf("nyanAcceptedParams must be omitted for an explicit input schema: %#v", response)
+	}
+	if _, exists := response["nyanOutputColumns"]; exists {
+		t.Fatalf("nyanOutputColumns must be removed: %#v", response)
+	}
+}
+
+func TestHandleNyanDetailResolvesSchemaFromMultiStageInclude(t *testing.T) {
+	initTestLogger()
+	gin.SetMode(gin.TestMode)
+	dir := t.TempDir()
+	rootPath := filepath.Join(dir, "api.json")
+	childDir := filepath.Join(dir, "sub")
+	adminDir := filepath.Join(childDir, "admin")
+	if err := os.MkdirAll(adminDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeHotReloadTestFile(t, rootPath, `{"sub":{"type":"include","path":"./sub/api.json"}}`)
+	writeHotReloadTestFile(t, filepath.Join(childDir, "api.json"), `{"admin":{"type":"include","path":"./admin/api.json"}}`)
+	writeHotReloadTestFile(t, filepath.Join(adminDir, "api.json"), `{
+  "getItem": {
+    "paramCheck": "./check.js",
+    "description": "included schema"
+  }
+}`)
+	writeHotReloadTestFile(t, filepath.Join(adminDir, "check.js"), `
+const nyanInputSchema = {type:"object", properties:{id:{type:"integer"}}, required:["id"]};
+`)
+	loaded, err := readAPIConfigFile(rootPath, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishAPISnapshot(loaded.Snapshot)
+	t.Cleanup(func() { publishAPISnapshot(nil) })
+
+	router := gin.New()
+	router.GET("/nyan/*apiName", handleNyanDetail)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/nyan/sub/admin/getItem", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["api"] != "sub/admin/getItem" {
+		t.Fatalf("api = %#v", response["api"])
+	}
+	source := response["schemaSource"].(map[string]interface{})
+	if source["input"] != schemaSourceParamCheck {
+		t.Fatalf("schemaSource = %#v", source)
+	}
+	properties := response["inputSchema"].(map[string]interface{})["properties"].(map[string]interface{})
+	if properties["id"].(map[string]interface{})["type"] != "integer" {
+		t.Fatalf("inputSchema properties = %#v", properties)
+	}
+}
+
+func TestHandleNyanDetailPublishesLegacyAndUnknownSchemas(t *testing.T) {
+	initTestLogger()
+	gin.SetMode(gin.TestMode)
+	dir := t.TempDir()
+	legacyScript := filepath.Join(dir, "legacy.js")
+	writeHotReloadTestFile(t, legacyScript, `
+const nyanAcceptedParams = {id: 1, name: "cat"};
+const nyanOutputColumns = ["obsolete"];
+JSON.stringify({status: 200});
+`)
+	setAPIFiles(filepath.Join(dir, "api.json"), map[string]interface{}{
+		"legacy":  map[string]interface{}{"script": legacyScript, "description": "legacy"},
+		"unknown": map[string]interface{}{"description": "unknown"},
+	})
+	t.Cleanup(func() { setAPIFiles("", nil) })
+
+	router := gin.New()
+	router.GET("/nyan/*apiName", handleNyanDetail)
+
+	legacyRecorder := httptest.NewRecorder()
+	router.ServeHTTP(legacyRecorder, httptest.NewRequest(http.MethodGet, "/nyan/legacy", nil))
+	if legacyRecorder.Code != http.StatusOK {
+		t.Fatalf("legacy status = %d; body=%s", legacyRecorder.Code, legacyRecorder.Body.String())
+	}
+	var legacy map[string]interface{}
+	if err := json.Unmarshal(legacyRecorder.Body.Bytes(), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacySource := legacy["schemaSource"].(map[string]interface{})
+	if legacySource["input"] != schemaSourceScriptLegacy || legacySource["output"] != schemaSourceUnknown {
+		t.Fatalf("legacy schemaSource = %#v", legacySource)
+	}
+	if legacy["nyanAcceptedParams"].(map[string]interface{})["name"] != "cat" {
+		t.Fatalf("nyanAcceptedParams = %#v", legacy["nyanAcceptedParams"])
+	}
+	if _, exists := legacy["nyanOutputColumns"]; exists {
+		t.Fatalf("nyanOutputColumns must be removed: %#v", legacy)
+	}
+
+	unknownRecorder := httptest.NewRecorder()
+	router.ServeHTTP(unknownRecorder, httptest.NewRequest(http.MethodGet, "/nyan/unknown", nil))
+	if unknownRecorder.Code != http.StatusOK {
+		t.Fatalf("unknown status = %d; body=%s", unknownRecorder.Code, unknownRecorder.Body.String())
+	}
+	var unknown map[string]interface{}
+	if err := json.Unmarshal(unknownRecorder.Body.Bytes(), &unknown); err != nil {
+		t.Fatal(err)
+	}
+	unknownSource := unknown["schemaSource"].(map[string]interface{})
+	if unknownSource["input"] != schemaSourceUnknown || unknownSource["output"] != schemaSourceUnknown {
+		t.Fatalf("unknown schemaSource = %#v", unknownSource)
+	}
+	if len(unknown["inputSchema"].(map[string]interface{})) != 0 || len(unknown["outputSchema"].(map[string]interface{})) != 0 {
+		t.Fatalf("unknown schemas = input:%#v output:%#v", unknown["inputSchema"], unknown["outputSchema"])
+	}
+	if _, exists := unknown["nyanAcceptedParams"]; exists {
+		t.Fatalf("unknown nyanAcceptedParams must be omitted: %#v", unknown)
+	}
+}
+
+func TestHandleNyanDetailReloadsSchemaOnEveryRequest(t *testing.T) {
+	initTestLogger()
+	gin.SetMode(gin.TestMode)
+	dir := t.TempDir()
+	checkPath := filepath.Join(dir, "check.js")
+	writeHotReloadTestFile(t, checkPath, `const nyanInputSchema = {type:"object", properties:{id:{type:"integer"}}};`)
+	setAPIFiles(filepath.Join(dir, "api.json"), map[string]interface{}{
+		"item": map[string]interface{}{"paramCheck": checkPath},
+	})
+	t.Cleanup(func() { setAPIFiles("", nil) })
+
+	router := gin.New()
+	router.GET("/nyan/*apiName", handleNyanDetail)
+	first := httptest.NewRecorder()
+	router.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/nyan/item", nil))
+	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), `"id"`) {
+		t.Fatalf("first detail = status %d body %s", first.Code, first.Body.String())
+	}
+
+	writeHotReloadTestFile(t, checkPath, `const nyanInputSchema = {type:"object", properties:{name:{type:"string"}}};`)
+	second := httptest.NewRecorder()
+	router.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/nyan/item", nil))
+	if second.Code != http.StatusOK || !strings.Contains(second.Body.String(), `"name"`) || strings.Contains(second.Body.String(), `"id"`) {
+		t.Fatalf("second detail = status %d body %s", second.Code, second.Body.String())
+	}
+}
+
+func TestHandleNyanDetailReturnsSchemaErrorsAtRequestTime(t *testing.T) {
+	initTestLogger()
+	gin.SetMode(gin.TestMode)
+	dir := t.TempDir()
+	checkPath := filepath.Join(dir, "check.js")
+	writeHotReloadTestFile(t, checkPath, `const nyanInputSchema = createSchema();`)
+	setAPIFiles(filepath.Join(dir, "api.json"), map[string]interface{}{
+		"item": map[string]interface{}{"paramCheck": checkPath},
+	})
+	t.Cleanup(func() { setAPIFiles("", nil) })
+
+	router := gin.New()
+	router.GET("/nyan/*apiName", handleNyanDetail)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/nyan/item", nil))
+	if recorder.Code != http.StatusInternalServerError || !strings.Contains(recorder.Body.String(), "function calls are not supported") {
+		t.Fatalf("detail = status %d body %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestHandleNyanListsOnlyNormalAPIsAndTrailingSlashUsesList(t *testing.T) {
+	initTestLogger()
+	gin.SetMode(gin.TestMode)
+	setAPIFiles("/tmp/nyan8-schema-list-api.json", map[string]interface{}{
+		"normal": map[string]interface{}{"description": "visible", "script": "/tmp/secret.js"},
+		"job":    map[string]interface{}{"type": apiTypeSchedule, "description": "hidden"},
+		"client": map[string]interface{}{"type": apiTypeWSClient, "description": "hidden"},
+		"assets": map[string]interface{}{"type": apiTypePublic, "description": "hidden"},
+	})
+	t.Cleanup(func() { setAPIFiles("", nil) })
+
+	router := gin.New()
+	router.GET("/nyan", handleNyan)
+	router.GET("/nyan/*apiName", handleNyanDetail)
+	for _, requestPath := range []string{"/nyan", "/nyan/"} {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, requestPath, nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s status = %d; body=%s", requestPath, recorder.Code, recorder.Body.String())
+		}
+		var response NyanResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if len(response.Apis) != 1 {
+			t.Fatalf("%s APIs = %#v", requestPath, response.Apis)
+		}
+		normal := response.Apis["normal"].(map[string]interface{})
+		if normal["description"] != "visible" || normal["type"] != apiTypeAPI {
+			t.Fatalf("normal API = %#v", normal)
+		}
+		if _, exists := normal["script"]; exists {
+			t.Fatalf("script was exposed by API list: %#v", normal)
+		}
+	}
+
+	detailRecorder := httptest.NewRecorder()
+	router.ServeHTTP(detailRecorder, httptest.NewRequest(http.MethodGet, "/nyan/job", nil))
+	if detailRecorder.Code != http.StatusNotFound {
+		t.Fatalf("schedule detail status = %d; body=%s", detailRecorder.Code, detailRecorder.Body.String())
+	}
+}
+
+func TestPublishedOutputSchemaDoesNotSupplyMissingRuntimeStatus(t *testing.T) {
+	initTestLogger()
+	gin.SetMode(gin.TestMode)
+	dir := t.TempDir()
+	apiPath := filepath.Join(dir, "api.json")
+	writeHotReloadTestFile(t, filepath.Join(dir, "script.js"), `JSON.stringify({success:true, result:{name:"cat"}});`)
+	writeHotReloadTestFile(t, filepath.Join(dir, "out-check.js"), `
+const nyanOutputSchema = {
+  type: "object",
+  properties: {
+    success: {const: true},
+    status: {const: 200},
+    result: {type: "object"}
+  },
+  required: ["success", "status", "result"]
+};
+({success:true, status:200, result:null});
+`)
+	writeHotReloadTestFile(t, apiPath, `{
+  "item": {
+    "script": "./script.js",
+    "outCheck": "./out-check.js",
+    "description": "runtime status remains required"
+  }
+}`)
+	loaded, err := readAPIConfigFile(apiPath, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishAPISnapshot(loaded.Snapshot)
+	servicePaths.API.Path = apiPath
+	t.Cleanup(func() {
+		publishAPISnapshot(nil)
+		servicePaths = serviceFilePaths{}
+	})
+
+	router := gin.New()
+	router.GET("/nyan", handleNyan)
+	router.GET("/nyan/*apiName", handleNyanDetail)
+	if err := registerDynamicEndpoints(router, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	detail := httptest.NewRecorder()
+	router.ServeHTTP(detail, httptest.NewRequest(http.MethodGet, "/nyan/item", nil))
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"output":"outCheck"`) {
+		t.Fatalf("detail = status %d body %s", detail.Code, detail.Body.String())
+	}
+
+	runtimeResponse := httptest.NewRecorder()
+	router.ServeHTTP(runtimeResponse, httptest.NewRequest(http.MethodGet, "/item", nil))
+	if runtimeResponse.Code != http.StatusInternalServerError || !strings.Contains(runtimeResponse.Body.String(), "Status field not found") {
+		t.Fatalf("runtime response = status %d body %s", runtimeResponse.Code, runtimeResponse.Body.String())
+	}
+}
+
 func TestReadAPIFileRejectsIncludeCycle(t *testing.T) {
 	rootDir := t.TempDir()
 	rootPath := filepath.Join(rootDir, "api.json")

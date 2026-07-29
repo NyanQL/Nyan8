@@ -112,7 +112,7 @@ NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./nyan8
 
 schedule変更時は同名ジョブを二重起動せず、実行中のスクリプトを完了してから最新設定へ移行します。ws_clientはscript／descriptionだけの変更では接続を維持し、`connectURL` の変更時だけ旧接続を閉じて新しい接続先へ切り替えます。
 
-`script`、`paramCheck`、`outCheck`、publicの配信ファイル自体は監視対象ではありません。これらは従来どおり実行時またはリクエスト時に読み込まれます。
+`script`、`paramCheck`、`outCheck`、publicの配信ファイル自体は監視対象ではありません。これらは従来どおり実行時またはリクエスト時に読み込まれます。`paramCheck` / `outCheck` 内の公開用スキーマも `/nyan/{API名}` のリクエストごとに読み直されるため、スキーマだけを変更した場合はNyan8の再起動や `api.json` の更新は不要です。
 
 #### `api.json` の分割と多段include
 
@@ -657,7 +657,7 @@ main();
 
 ### 5  API エンドポイント
 #### `GET /nyan`
-サーバの基本情報と利用可能な API 一覧を取得します。
+サーバの基本情報と利用可能な通常API（`type: "api"`）の一覧を取得します。`public`、`schedule`、`ws_client` は含まれません。多段includeされたAPIは `sub/items/get` のような完全名で表示されます。
 **レスポンス例**
 ```json
 {
@@ -680,7 +680,7 @@ main();
 }
 ```
 #### `GET /nyan/{API名}`
-指定した API の詳細情報（説明、受け入れ可能パラメータ、出力カラム）を取得します。
+指定した通常APIの詳細情報と入出力スキーマを取得します。多段includeされたAPIも `/nyan/sub/items/get` のように完全名を指定できます。
 **レスポンス例**
 ```json
 {
@@ -688,9 +688,104 @@ main();
   "type": "api",
   "description": "2 に足す API",
   "nyanAcceptedParams": { "num": "数値" },
-  "nyanOutputColumns": ["result"]
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "num": {
+        "type": "string",
+        "examples": ["数値"]
+      }
+    },
+    "additionalProperties": true
+  },
+  "outputSchema": {},
+  "schemaSource": {
+    "input": "scriptLegacy",
+    "output": "unknown"
+  }
 }
 ```
+
+`schemaSource.input` は `paramCheck`、`scriptLegacy`、`unknown` のいずれか、`schemaSource.output` は `outCheck`、`unknown` のいずれかです。旧形式の `nyanOutputColumns` は廃止され、JavaScript内に宣言してもAPI詳細には表示されません。
+
+### 入出力スキーマの公開
+
+入力スキーマは `paramCheck` ファイルのトップレベルに `nyanInputSchema`、出力スキーマは `outCheck` ファイルのトップレベルに `nyanOutputSchema` として定義します。JSON Schema Draft 2020-12形式のオブジェクトを想定していますが、`$schema` は任意です。記載された内容をそのまま公開し、省略された項目をNyan8が補いません。
+
+```javascript
+const nyanInputSchema = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  properties: {
+    id: {
+      type: "integer",
+      minimum: 1,
+      description: "取得するID"
+    }
+  },
+  required: ["id"],
+  additionalProperties: false
+};
+
+if (typeof nyanAllParams.id !== "number") {
+  ({success: false, status: 400, result: {message: "idが必要です"}});
+} else {
+  ({success: true, status: 200, result: null});
+}
+```
+
+```javascript
+const nyanOutputSchema = {
+  type: "object",
+  properties: {
+    status: {const: 200},
+    payload: {
+      type: "object",
+      properties: {name: {type: "string"}},
+      required: ["name"]
+    }
+  },
+  required: ["status", "payload"],
+  additionalProperties: false
+};
+
+const output = JSON.parse(nyanAllParams.nyan_output.body);
+({success: output.status === 200, status: output.status === 200 ? 200 : 500, result: null});
+```
+
+公開スキーマと実行時の値は別のものです。Nyan8は公開したJSON Schemaによるリクエスト・レスポンスの自動検証を行いません。実際の入力・出力チェックは従来どおり `paramCheck` / `outCheck` のJavaScriptで行ってください。
+
+また、Nyan8は `success`、`status`、`result` を明示出力スキーマへ自動追加しません。実際のAPIレスポンスも本体JavaScriptが生成する必要があり、`status` がないレスポンスは従来どおり実行エラーになります。
+
+#### スキーマの取得優先順位
+
+入力スキーマは次の順で決まります。
+
+1. `paramCheck` 内の `nyanInputSchema`
+2. 本体 `script` 内の旧形式 `nyanAcceptedParams` から生成
+3. 型不明の空スキーマ `{}`
+
+出力スキーマは次の順で決まります。
+
+1. `outCheck` 内の `nyanOutputSchema`
+2. 型不明の空スキーマ `{}`
+
+明示入力スキーマがある場合、API詳細では `inputSchema` を正として `nyanAcceptedParams` を省略します。明示入力スキーマがなく、`nyanAcceptedParams` を静的に取得できる場合は、後方互換性のため `nyanAcceptedParams` と、それから生成した `inputSchema` の両方を公開します。legacyスキーマでは値から `string`、`boolean`、`integer`、`number`、`object`、`array` を推測しますが、必須項目は推測しません。
+
+#### 静的スキーマ定義の制約
+
+スキーマはJavaScriptを実行せず、構文木から静的に読み取ります。使用できる値はオブジェクト、配列、文字列、数値、真偽値、`null` と、それらのネストです。スキーマ定数はトップレベルで `const` 宣言してください。
+
+関数呼び出し、識別子参照、spread、computed propertyなどを含む動的な定義は取得できません。
+
+```javascript
+// 対応していません
+const nyanInputSchema = createSchema();
+const nyanOutputSchema = {...commonSchema};
+```
+
+動的または不正な明示スキーマがあっても `api.json` の読み込みやホットリロードは妨げません。対象のAPI詳細を取得した時点でスキーマ解決エラーを返します。ファイルを修正すれば、次の詳細取得から反映されます。
+
 ---
 ## 6  レスポンス形式
 ### 成功時

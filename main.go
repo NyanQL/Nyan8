@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net"
@@ -34,6 +35,9 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/dop251/goja/ast"
+	"github.com/dop251/goja/parser"
+	"github.com/dop251/goja/token"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/natefinch/lumberjack"
@@ -123,6 +127,20 @@ type APIResponse struct {
 	ContentType string
 	Headers     map[string]string
 	Body        []byte
+}
+
+const (
+	schemaSourceParamCheck   = "paramCheck"
+	schemaSourceOutCheck     = "outCheck"
+	schemaSourceScriptLegacy = "scriptLegacy"
+	schemaSourceUnknown      = "unknown"
+)
+
+type APISchema struct {
+	Input        map[string]interface{}
+	Output       map[string]interface{}
+	InputSource  string
+	OutputSource string
 }
 
 type SMTPConfig struct {
@@ -288,7 +306,7 @@ func main() {
 	r.DELETE("/nyan-toolbox", handleMCPDeleteSession) // 任意: セッション明示終了
 
 	r.Any("/nyan", handleNyan)
-	r.Any("/nyan/:apiName", handleNyanDetail)
+	r.Any("/nyan/*apiName", handleNyanDetail)
 	r.Any("/", handleRequest) // HTTPとWebSocketリクエストを同じエンドポイントで処理
 
 	// 動的エンドポイントの登録
@@ -1109,10 +1127,8 @@ func jsonAPI(url string, jsonData []byte, username, password string, headers map
 	req.Header.Set("Content-Type", "application/json")
 
 	// 追加のヘッダーが指定されていれば設定（複数指定可能）
-	if headers != nil {
-		for key, value := range headers {
-			req.Header.Set(key, value)
-		}
+	for key, value := range headers {
+		req.Header.Set(key, value)
 	}
 
 	client := &http.Client{}
@@ -1923,37 +1939,30 @@ func performPush(scriptInfo map[string]interface{}, scriptListData map[string]in
 
 // handleNyan は /nyan エンドポイントを処理します。
 func handleNyan(c *gin.Context) {
-	// 作業ディレクトリの取得
-	execDir, err := os.Getwd()
-	if err != nil {
-		respondWithError(c, http.StatusInternalServerError, "Failed to get working directory", err)
-		return
-	}
-	execDir = apiBaseDir(execDir)
+	handleNyanWithSnapshot(c, currentAPISnapshot())
+}
 
-	// api.json を読み込み
-	apiJsonPath := apiJSONPath(execDir)
-	apiConf, err := loadJSONFile(apiJsonPath)
-	if err != nil {
-		respondWithError(c, http.StatusInternalServerError, "Failed to load API configuration", err)
+func handleNyanWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot) {
+	if snapshot == nil {
+		respondWithError(c, http.StatusInternalServerError, "API configuration is not loaded", nil)
 		return
 	}
 
-	// 公開済みのAPI定義mapは変更せず、レスポンス用のコピーからscriptを除外する。
-	responseAPIs := make(map[string]interface{}, len(apiConf))
-	for key, api := range apiConf {
-		if apiMap, ok := api.(map[string]interface{}); ok {
-			responseMap := make(map[string]interface{}, len(apiMap))
-			for field, value := range apiMap {
-				if field != "script" {
-					responseMap[field] = value
-				}
-			}
-			responseMap["type"] = getAPIType(apiMap)
-			responseAPIs[key] = responseMap
+	// 公開済みのAPI定義mapは変更せず、通常APIだけをレスポンス用にコピーする。
+	responseAPIs := make(map[string]interface{})
+	for key, api := range snapshot.Definitions {
+		apiMap, ok := api.(map[string]interface{})
+		if !ok || getAPIType(apiMap) != apiTypeAPI {
 			continue
 		}
-		responseAPIs[key] = api
+		responseMap := make(map[string]interface{}, len(apiMap))
+		for field, value := range apiMap {
+			if field != "script" {
+				responseMap[field] = cloneJSONCompatibleValue(value)
+			}
+		}
+		responseMap["type"] = apiTypeAPI
+		responseAPIs[key] = responseMap
 	}
 
 	// config.json の値は globalConfig に保持されている想定
@@ -1970,33 +1979,24 @@ func handleNyan(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
-// /nyan/:apiName で特定APIの詳細を返す
+// /nyan/*apiName で特定APIの詳細を返す。
 func handleNyanDetail(c *gin.Context) {
-	// パスパラメータの取得
-	apiName := c.Param("apiName")
+	snapshot := currentAPISnapshot()
+	apiName := strings.TrimPrefix(c.Param("apiName"), "/")
 	if apiName == "" {
-		respondWithError(c, http.StatusBadRequest, "No apiName provided", nil)
+		handleNyanWithSnapshot(c, snapshot)
+		return
+	}
+	handleNyanDetailWithSnapshot(c, snapshot, apiName)
+}
+
+func handleNyanDetailWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, apiName string) {
+	if snapshot == nil {
+		respondWithError(c, http.StatusInternalServerError, "API configuration is not loaded", nil)
 		return
 	}
 
-	// カレントディレクトリ(または実行ディレクトリ)取得
-	execDir, err := os.Getwd()
-	if err != nil {
-		respondWithError(c, http.StatusInternalServerError, "Failed to get working directory", err)
-		return
-	}
-	execDir = apiBaseDir(execDir)
-
-	// api.json を読み込み
-	apiJsonPath := apiJSONPath(execDir)
-	apiConf, err := loadJSONFile(apiJsonPath)
-	if err != nil {
-		respondWithError(c, http.StatusInternalServerError, "Failed to load API configuration", err)
-		return
-	}
-
-	// 指定の API があるか確認
-	apiDataRaw, exists := apiConf[apiName]
+	apiDataRaw, exists := snapshot.Definitions[apiName]
 	if !exists {
 		respondWithError(c, http.StatusNotFound, fmt.Sprintf("API not found: %s", apiName), nil)
 		return
@@ -2009,35 +2009,52 @@ func handleNyanDetail(c *gin.Context) {
 		return
 	}
 
-	// api.json に記載された description を取得（なければ空文字）
 	description, _ := apiData["description"].(string)
 	apiType := getAPIType(apiData)
+	if apiType != apiTypeAPI {
+		respondWithError(c, http.StatusNotFound, fmt.Sprintf("API not found: %s", apiName), nil)
+		return
+	}
 
-	// JavaScriptのパスを取得（なければ空文字のまま）
-	scriptPath, _ := apiData["script"].(string)
-	nyanAcceptedParams := map[string]interface{}{}
-	nyanOutputColumns := []interface{}{}
+	apiSchema, err := resolveAPISchema(apiData)
+	if err != nil {
+		respondWithError(c, http.StatusInternalServerError, fmt.Sprintf("Failed to resolve API schemas: %s", apiName), err)
+		return
+	}
 
-	if scriptPath != "" {
-		fullScriptPath := resolvePathFromBase(execDir, scriptPath)
-		scriptContent, err := ioutil.ReadFile(fullScriptPath)
-		if err == nil {
-			// スクリプト内から const nyanAcceptedParams, nyanOutputColumns をパース
-			nyanAcceptedParams = parseConstObject(scriptContent, "nyanAcceptedParams")
-			nyanOutputColumns = parseConstArray(scriptContent, "nyanOutputColumns")
+	var nyanAcceptedParams map[string]interface{}
+	if apiSchema.InputSource == schemaSourceScriptLegacy {
+		scriptPath := getAPIString(apiData, "script")
+		if params, found, readErr := readStaticLegacyAcceptedParams(scriptPath); readErr == nil && found {
+			nyanAcceptedParams = params
 		}
 	}
 
-	// 結果JSONを作成
 	result := map[string]interface{}{
-		"api":                apiName,
-		"type":               apiType,
-		"description":        description,
-		"nyanAcceptedParams": nyanAcceptedParams, // スクリプトに無ければ空のまま
-		"nyanOutputColumns":  nyanOutputColumns,  // スクリプトに無ければ空のまま
+		"api":          apiName,
+		"type":         apiType,
+		"description":  description,
+		"inputSchema":  apiSchema.Input,
+		"outputSchema": apiSchema.Output,
+		"schemaSource": map[string]interface{}{
+			"input":  normalizeSchemaSource(apiSchema.InputSource),
+			"output": normalizeSchemaSource(apiSchema.OutputSource),
+		},
+	}
+	if nyanAcceptedParams != nil {
+		result["nyanAcceptedParams"] = nyanAcceptedParams
 	}
 
 	c.JSON(http.StatusOK, result)
+}
+
+func normalizeSchemaSource(source string) string {
+	switch source {
+	case schemaSourceParamCheck, schemaSourceOutCheck, schemaSourceScriptLegacy:
+		return source
+	default:
+		return schemaSourceUnknown
+	}
 }
 
 // parseConstObject は、scriptContent から「const XXX = {...};」形式のオブジェクトを抜き出してパースします
@@ -2061,25 +2078,377 @@ func parseConstObject(scriptContent []byte, constName string) map[string]interfa
 	return result
 }
 
-// parseConstArray は、scriptContent から「const XXX = [...];」形式の配列を抜き出してパースします
-func parseConstArray(scriptContent []byte, constName string) []interface{} {
-	re := regexp.MustCompile(fmt.Sprintf(`(?m)const\s+%s\s*=\s*(\[[^;]*\]);`, constName))
-	matches := re.FindSubmatch(scriptContent)
-	if len(matches) < 2 {
-		// 見つからなければ空配列
-		return []interface{}{}
+func parseStaticJavaScriptValue(filename, source string) (interface{}, error) {
+	program, err := parser.ParseFile(nil, filename, "("+source+");", 0)
+	if err != nil {
+		return nil, fmt.Errorf("parse static JavaScript value: %w", err)
+	}
+	if len(program.Body) != 1 {
+		return nil, fmt.Errorf("parse static JavaScript value: expected one expression")
+	}
+	statement, ok := program.Body[0].(*ast.ExpressionStatement)
+	if !ok {
+		return nil, fmt.Errorf("parse static JavaScript value: expected an expression, got %T", program.Body[0])
+	}
+	return convertStaticJavaScriptValue(statement.Expression, "$")
+}
+
+func convertStaticJavaScriptValue(expression ast.Expression, path string) (interface{}, error) {
+	switch value := expression.(type) {
+	case *ast.ObjectLiteral:
+		result := make(map[string]interface{}, len(value.Value))
+		for _, rawProperty := range value.Value {
+			property, ok := rawProperty.(*ast.PropertyKeyed)
+			if !ok {
+				return nil, fmt.Errorf("static JavaScript value at %s: %s are not supported", path, staticJavaScriptPropertyDescription(rawProperty))
+			}
+			if property.Computed {
+				return nil, fmt.Errorf("static JavaScript value at %s: computed property names are not supported", path)
+			}
+			if property.Kind != ast.PropertyKindValue {
+				return nil, fmt.Errorf("static JavaScript value at %s: property kind %q is not supported", path, property.Kind)
+			}
+			keyLiteral, ok := property.Key.(*ast.StringLiteral)
+			if !ok {
+				return nil, fmt.Errorf("static JavaScript value at %s: property names must be strings, got %T", path, property.Key)
+			}
+			key := keyLiteral.Value.String()
+			if _, exists := result[key]; exists {
+				return nil, fmt.Errorf("static JavaScript value at %s: duplicate property %q", path, key)
+			}
+			converted, err := convertStaticJavaScriptValue(property.Value, staticJavaScriptChildPath(path, key))
+			if err != nil {
+				return nil, err
+			}
+			result[key] = converted
+		}
+		return result, nil
+	case *ast.ArrayLiteral:
+		result := make([]interface{}, len(value.Value))
+		for index, item := range value.Value {
+			itemPath := fmt.Sprintf("%s[%d]", path, index)
+			if item == nil {
+				return nil, fmt.Errorf("static JavaScript value at %s: array holes are not supported", itemPath)
+			}
+			converted, err := convertStaticJavaScriptValue(item, itemPath)
+			if err != nil {
+				return nil, err
+			}
+			result[index] = converted
+		}
+		return result, nil
+	case *ast.StringLiteral:
+		return value.Value.String(), nil
+	case *ast.NumberLiteral:
+		return staticJavaScriptNumber(value.Value, path)
+	case *ast.BooleanLiteral:
+		return value.Value, nil
+	case *ast.NullLiteral:
+		return nil, nil
+	case *ast.UnaryExpression:
+		if value.Postfix || (value.Operator != token.MINUS && value.Operator != token.PLUS) {
+			return nil, fmt.Errorf("static JavaScript value at %s: unary operator %q is not supported", path, value.Operator)
+		}
+		numberLiteral, ok := value.Operand.(*ast.NumberLiteral)
+		if !ok {
+			return nil, fmt.Errorf("static JavaScript value at %s: unary %q requires a numeric literal", path, value.Operator)
+		}
+		number, err := staticJavaScriptNumber(numberLiteral.Value, path)
+		if err != nil {
+			return nil, err
+		}
+		if value.Operator == token.PLUS {
+			return number, nil
+		}
+		switch number := number.(type) {
+		case int64:
+			return -number, nil
+		case float64:
+			return -number, nil
+		default:
+			return nil, fmt.Errorf("static JavaScript value at %s: unsupported numeric value %T", path, number)
+		}
+	default:
+		return nil, fmt.Errorf("static JavaScript value at %s: %s are not supported", path, staticJavaScriptExpressionDescription(expression))
+	}
+}
+
+func staticJavaScriptNumber(value interface{}, path string) (interface{}, error) {
+	switch number := value.(type) {
+	case int64:
+		return number, nil
+	case float64:
+		if math.IsInf(number, 0) || math.IsNaN(number) {
+			return nil, fmt.Errorf("static JavaScript value at %s: non-finite numbers are not JSON-compatible", path)
+		}
+		return number, nil
+	default:
+		return nil, fmt.Errorf("static JavaScript value at %s: numeric value %T is not JSON-compatible", path, value)
+	}
+}
+
+func staticJavaScriptChildPath(parent, key string) string {
+	if key != "" && !strings.ContainsAny(key, ".[]") {
+		return parent + "." + key
+	}
+	return fmt.Sprintf("%s[%q]", parent, key)
+}
+
+func staticJavaScriptPropertyDescription(property ast.Property) string {
+	switch property.(type) {
+	case *ast.SpreadElement:
+		return "spread properties"
+	case *ast.PropertyShort:
+		return "shorthand properties"
+	default:
+		return fmt.Sprintf("properties of type %T", property)
+	}
+}
+
+func staticJavaScriptExpressionDescription(expression ast.Expression) string {
+	switch expression.(type) {
+	case *ast.CallExpression:
+		return "function calls"
+	case *ast.Identifier:
+		return "identifier references"
+	case *ast.SpreadElement:
+		return "spread elements"
+	case *ast.ConditionalExpression:
+		return "conditional expressions"
+	case *ast.TemplateLiteral:
+		return "template literals"
+	case *ast.FunctionLiteral, *ast.ArrowFunctionLiteral:
+		return "function values"
+	case *ast.BinaryExpression:
+		return "computed expressions"
+	default:
+		return fmt.Sprintf("expressions of type %T", expression)
+	}
+}
+
+func readStaticJavaScriptObjectConstant(filePath, constantName string) (map[string]interface{}, bool, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, false, fmt.Errorf("read JavaScript file %s: %w", filePath, err)
+	}
+	return extractStaticJavaScriptObjectConstant(filePath, data, constantName)
+}
+
+func extractStaticJavaScriptObjectConstant(filename string, source []byte, constantName string) (map[string]interface{}, bool, error) {
+	converted, found, err := extractStaticJavaScriptConstant(filename, source, constantName)
+	if err != nil || !found {
+		return nil, found, err
+	}
+	object, ok := converted.(map[string]interface{})
+	if !ok {
+		return nil, false, fmt.Errorf("JavaScript file %s: %s must be a static object literal, got %T", filename, constantName, converted)
+	}
+	return object, true, nil
+}
+
+func extractStaticJavaScriptConstant(filename string, source []byte, constantName string) (interface{}, bool, error) {
+	if strings.TrimSpace(constantName) == "" {
+		return nil, false, fmt.Errorf("JavaScript constant name is empty")
+	}
+	program, err := parser.ParseFile(nil, filename, source, 0)
+	if err != nil {
+		return nil, false, fmt.Errorf("parse JavaScript file %s: %w", filename, err)
 	}
 
-	// matches[1] に [ ... ] の部分が入る想定
-	jsonStr := matches[1]
-	// 末尾のセミコロン(;)があれば除去
-	jsonStr = bytes.TrimSuffix(jsonStr, []byte(";"))
-
-	var result []interface{}
-	if err := json.Unmarshal(jsonStr, &result); err != nil {
-		return []interface{}{} // パースできなければ空
+	var initializer ast.Expression
+	for _, statement := range program.Body {
+		switch declaration := statement.(type) {
+		case *ast.LexicalDeclaration:
+			for _, binding := range declaration.List {
+				if !staticJavaScriptBindingHasName(binding, constantName) {
+					continue
+				}
+				if declaration.Token != token.CONST {
+					return nil, false, fmt.Errorf("JavaScript file %s: %s must be declared with const", filename, constantName)
+				}
+				if initializer != nil {
+					return nil, false, fmt.Errorf("JavaScript file %s: duplicate declaration of %s", filename, constantName)
+				}
+				if binding.Initializer == nil {
+					return nil, false, fmt.Errorf("JavaScript file %s: %s has no initializer", filename, constantName)
+				}
+				initializer = binding.Initializer
+			}
+		case *ast.VariableStatement:
+			for _, binding := range declaration.List {
+				if staticJavaScriptBindingHasName(binding, constantName) {
+					return nil, false, fmt.Errorf("JavaScript file %s: %s must be declared with const", filename, constantName)
+				}
+			}
+		}
 	}
-	return result
+
+	if initializer == nil {
+		return nil, false, nil
+	}
+	converted, err := convertStaticJavaScriptValue(initializer, constantName)
+	if err != nil {
+		return nil, false, fmt.Errorf("JavaScript file %s: %w", filename, err)
+	}
+	return converted, true, nil
+}
+
+func staticJavaScriptBindingHasName(binding *ast.Binding, constantName string) bool {
+	if binding == nil {
+		return false
+	}
+	identifier, ok := binding.Target.(*ast.Identifier)
+	return ok && identifier.Name.String() == constantName
+}
+
+func resolveAPISchema(apiConfig map[string]interface{}) (APISchema, error) {
+	resolved := unknownAPISchema()
+
+	paramCheckPath := getAPIString(apiConfig, "paramCheck", "paramcheck", "check")
+	if paramCheckPath != "" {
+		input, found, err := readOptionalStaticJavaScriptObjectConstant(paramCheckPath, "nyanInputSchema")
+		if err != nil {
+			return APISchema{}, fmt.Errorf("input schema from paramCheck: %w", err)
+		}
+		if found {
+			resolved.Input = input
+			resolved.InputSource = schemaSourceParamCheck
+		}
+	}
+
+	outCheckPath := getAPIString(apiConfig, "outCheck", "outcheck")
+	if outCheckPath != "" {
+		output, found, err := readOptionalStaticJavaScriptObjectConstant(outCheckPath, "nyanOutputSchema")
+		if err != nil {
+			return APISchema{}, fmt.Errorf("output schema from outCheck: %w", err)
+		}
+		if found {
+			resolved.Output = output
+			resolved.OutputSource = schemaSourceOutCheck
+		}
+	}
+
+	if scriptPath := getAPIString(apiConfig, "script"); scriptPath != "" && resolved.InputSource == schemaSourceUnknown {
+		acceptedParams, found, err := readStaticLegacyAcceptedParams(scriptPath)
+		if err == nil && found {
+			resolved.Input = legacyInputSchema(acceptedParams)
+			resolved.InputSource = schemaSourceScriptLegacy
+		}
+	}
+
+	return resolved, nil
+}
+
+func readStaticLegacyAcceptedParams(filePath string) (map[string]interface{}, bool, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, false, err
+	}
+	acceptedValue, found, err := extractStaticJavaScriptConstant(filePath, data, "nyanAcceptedParams")
+	if err != nil {
+		return nil, false, err
+	}
+	if !found {
+		return map[string]interface{}{}, false, nil
+	}
+	acceptedParams, ok := acceptedValue.(map[string]interface{})
+	if !ok {
+		return nil, false, fmt.Errorf("nyanAcceptedParams must be a static object literal, got %T", acceptedValue)
+	}
+	return acceptedParams, true, nil
+}
+
+func readOptionalStaticJavaScriptObjectConstant(filePath, constantName string) (map[string]interface{}, bool, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, false, nil
+	}
+	return extractStaticJavaScriptObjectConstant(filePath, data, constantName)
+}
+
+func unknownAPISchema() APISchema {
+	return APISchema{
+		Input:        map[string]interface{}{},
+		Output:       map[string]interface{}{},
+		InputSource:  schemaSourceUnknown,
+		OutputSource: schemaSourceUnknown,
+	}
+}
+
+func legacyInputSchema(params map[string]interface{}) map[string]interface{} {
+	properties := make(map[string]interface{}, len(params))
+	for name, value := range params {
+		properties[name] = legacyValueSchema(value)
+	}
+	return map[string]interface{}{
+		"type":                 "object",
+		"properties":           properties,
+		"additionalProperties": true,
+	}
+}
+
+func legacyValueSchema(value interface{}) map[string]interface{} {
+	schema := make(map[string]interface{})
+	switch value := value.(type) {
+	case string:
+		schema["type"] = "string"
+	case bool:
+		schema["type"] = "boolean"
+	case float64:
+		if math.IsInf(value, 0) || math.IsNaN(value) {
+			return schema
+		}
+		if math.Trunc(value) == value {
+			schema["type"] = "integer"
+		} else {
+			schema["type"] = "number"
+		}
+	case float32:
+		number := float64(value)
+		if math.IsInf(number, 0) || math.IsNaN(number) {
+			return schema
+		}
+		if math.Trunc(number) == number {
+			schema["type"] = "integer"
+		} else {
+			schema["type"] = "number"
+		}
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		schema["type"] = "integer"
+	case map[string]interface{}:
+		properties := make(map[string]interface{}, len(value))
+		for name, item := range value {
+			properties[name] = legacyValueSchema(item)
+		}
+		schema["type"] = "object"
+		schema["properties"] = properties
+		schema["additionalProperties"] = true
+	case []interface{}:
+		schema["type"] = "array"
+		schema["items"] = legacyArrayItemsSchema(value)
+	case nil:
+		return schema
+	default:
+		return schema
+	}
+	schema["examples"] = []interface{}{cloneJSONCompatibleValue(value)}
+	return schema
+}
+
+func legacyArrayItemsSchema(values []interface{}) map[string]interface{} {
+	if len(values) == 0 {
+		return map[string]interface{}{}
+	}
+	first := legacyValueSchema(values[0])
+	delete(first, "examples")
+	for _, value := range values[1:] {
+		candidate := legacyValueSchema(value)
+		delete(candidate, "examples")
+		if !reflect.DeepEqual(first, candidate) {
+			return map[string]interface{}{}
+		}
+	}
+	return first
 }
 
 // gojaのVMのセットアップ
