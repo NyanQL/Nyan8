@@ -1,17 +1,28 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/mail"
+	"net/textproto"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -94,6 +105,26 @@ func TestResolveServiceFilePathsPrefersCLIOverEnv(t *testing.T) {
 	}
 }
 
+func TestResolveStartupOptionsForMCPStdio(t *testing.T) {
+	initTestLogger()
+	execDir := t.TempDir()
+	for _, name := range []string{"api.json", "config.json"} {
+		if err := os.WriteFile(filepath.Join(execDir, name), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	options, err := resolveStartupOptions(execDir, []string{"--mcp-server", "local_mcp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.MCPServer != "local_mcp" {
+		t.Fatalf("stdio options = %#v", options)
+	}
+	if _, err := resolveStartupOptions(execDir, []string{"--mcp-stdio"}); err == nil {
+		t.Fatal("removed --mcp-stdio flag was accepted")
+	}
+}
+
 func TestAdjustConfigPathsResolvesFromConfigDir(t *testing.T) {
 	initTestLogger()
 
@@ -103,6 +134,7 @@ func TestAdjustConfigPathsResolvesFromConfigDir(t *testing.T) {
 		KeyFile:           "ssl/localhost.key",
 		JavaScriptInclude: []string{"javascript/base.js"},
 		Log:               LogConfig{Filename: "logs/nyan8.log"},
+		OAuthStateRoot:    "state/oauth",
 	}
 
 	adjustConfigPaths(configBaseDir, &config)
@@ -118,6 +150,9 @@ func TestAdjustConfigPathsResolvesFromConfigDir(t *testing.T) {
 	}
 	if config.Log.Filename != filepath.Join(configBaseDir, "logs/nyan8.log") {
 		t.Fatalf("Log.Filename = %q, want config-relative path", config.Log.Filename)
+	}
+	if config.OAuthStateRoot != filepath.Join(configBaseDir, "state/oauth") {
+		t.Fatalf("OAuthStateRoot = %q, want config-relative path", config.OAuthStateRoot)
 	}
 }
 
@@ -277,11 +312,12 @@ func TestRegisterDynamicEndpointsRegistersPublicAPI(t *testing.T) {
 	}
 }
 
-func TestBuildToolsListSkipsPublicAPI(t *testing.T) {
+func TestMCPToolAllowlistSkipsPublicAndUnlistedAPIs(t *testing.T) {
 	initTestLogger()
 
 	tempDir := t.TempDir()
-	t.Chdir(tempDir)
+	writeHotReloadTestFile(t, filepath.Join(tempDir, "hello.js"), `JSON.stringify({ok: true});`)
+	writeHotReloadTestFile(t, filepath.Join(tempDir, "other.js"), `JSON.stringify({ok: true});`)
 	apiJSON := []byte(`{
   "assets": {
     "type": "public",
@@ -290,22 +326,34 @@ func TestBuildToolsListSkipsPublicAPI(t *testing.T) {
   "hello": {
     "script": "./hello.js",
     "description": "hello API"
+  },
+  "other": {
+    "script": "./other.js",
+    "description": "not exposed"
+  },
+	"connector": {
+    "type": "mcp",
+	"transport": "streamable_http",
+    "allowedOrigins": ["https://chatgpt.com"],
+    "tools": ["hello"]
   }
 }`)
 	if err := os.WriteFile(filepath.Join(tempDir, "api.json"), apiJSON, 0644); err != nil {
 		t.Fatal(err)
 	}
-
-	result := buildToolsList()
-	tools, ok := result["tools"].([]map[string]any)
-	if !ok {
-		t.Fatalf("tools has unexpected type: %T", result["tools"])
+	result, err := loadAPIConfigData(filepath.Join(tempDir, "api.json"), tempDir, apiJSON)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(tools) != 1 {
-		t.Fatalf("tools len = %d, want 1: %#v", len(tools), tools)
+	mcp := result.Snapshot.MCPServers["connector"]
+	if mcp == nil || len(mcp.Tools) != 1 {
+		t.Fatalf("MCP config = %#v", mcp)
 	}
-	if got, want := tools[0]["name"], "hello"; got != want {
-		t.Fatalf("tool name = %v, want %q", got, want)
+	if got, want := mcp.Path, "/connector"; got != want {
+		t.Fatalf("MCP path = %q, want %q", got, want)
+	}
+	if got, want := mcp.Tools[0].Name, "hello"; got != want {
+		t.Fatalf("Tool name = %q, want %q", got, want)
 	}
 }
 
@@ -852,8 +900,6 @@ func TestIncludedAPICallFormsUseCompleteName(t *testing.T) {
 	if rpcResponse.Code != http.StatusOK || !strings.Contains(rpcResponse.Body.String(), `"called":"sub/target"`) {
 		t.Fatalf("included JSON-RPC status=%d body=%q", rpcResponse.Code, rpcResponse.Body.String())
 	}
-	assertMCPToolDescription(t, "sub/target", "included target")
-
 	nyanResponse := httptest.NewRecorder()
 	router.ServeHTTP(nyanResponse, httptest.NewRequest(http.MethodGet, "/nyan", nil))
 	var listed NyanResponse
@@ -1782,13 +1828,18 @@ func TestHandleNyanDetailReturnsSchemaErrorsAtRequestTime(t *testing.T) {
 func TestHandleNyanListsOnlyNormalAPIsAndTrailingSlashUsesList(t *testing.T) {
 	initTestLogger()
 	gin.SetMode(gin.TestMode)
+	originalConfig := globalConfig
+	globalConfig.Name = "Nyan8 test"
+	globalConfig.Profile = "flat response"
+	globalConfig.Version = "test-version"
 	setAPIFiles("/tmp/nyan8-schema-list-api.json", map[string]interface{}{
-		"normal": map[string]interface{}{"description": "visible", "script": "/tmp/secret.js"},
+		"normal": map[string]interface{}{"description": "visible", "script": "/tmp/secret.js", "push": "normal_push", "securitySchemes": []interface{}{map[string]interface{}{"type": "oauth2"}}},
 		"job":    map[string]interface{}{"type": apiTypeSchedule, "description": "hidden"},
 		"client": map[string]interface{}{"type": apiTypeWSClient, "description": "hidden"},
 		"assets": map[string]interface{}{"type": apiTypePublic, "description": "hidden"},
+		"mcp":    map[string]interface{}{"type": apiTypeMCP, "description": "hidden"},
 	})
-	t.Cleanup(func() { setAPIFiles("", nil) })
+	t.Cleanup(func() { setAPIFiles("", nil); globalConfig = originalConfig })
 
 	router := gin.New()
 	router.GET("/nyan", handleNyan)
@@ -1806,12 +1857,26 @@ func TestHandleNyanListsOnlyNormalAPIsAndTrailingSlashUsesList(t *testing.T) {
 		if len(response.Apis) != 1 {
 			t.Fatalf("%s APIs = %#v", requestPath, response.Apis)
 		}
-		normal := response.Apis["normal"].(map[string]interface{})
-		if normal["description"] != "visible" || normal["type"] != apiTypeAPI {
+		if response.Name != "Nyan8 test" || response.Profile != "flat response" || response.Version != "test-version" {
+			t.Fatalf("%s server metadata = %#v", requestPath, response)
+		}
+		normal := response.Apis["normal"]
+		if normal.Description != "visible" || normal.Push != "normal_push" {
 			t.Fatalf("normal API = %#v", normal)
 		}
-		if _, exists := normal["script"]; exists {
-			t.Fatalf("script was exposed by API list: %#v", normal)
+		var raw map[string]interface{}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &raw); err != nil {
+			t.Fatal(err)
+		}
+		if _, exists := raw["nyan"]; exists {
+			t.Fatalf("legacy nyan wrapper was exposed: %s", recorder.Body.String())
+		}
+		rawAPIs := raw["apis"].(map[string]interface{})
+		rawNormal := rawAPIs["normal"].(map[string]interface{})
+		for _, internalField := range []string{"script", "type", "securitySchemes"} {
+			if _, exists := rawNormal[internalField]; exists {
+				t.Fatalf("%s was exposed by API list: %#v", internalField, rawNormal)
+			}
 		}
 	}
 
@@ -2830,7 +2895,7 @@ func TestRegisteredPublicAPITypeChangeToNormalAPI(t *testing.T) {
 	assertDynamicAPIValue(t, router, "/switch", http.StatusOK, "converted")
 }
 
-func TestJSONRPCAndMCPUseUpdatedDefinition(t *testing.T) {
+func TestJSONRPCUsesUpdatedDefinition(t *testing.T) {
 	initTestLogger()
 	gin.SetMode(gin.TestMode)
 	apiDir := t.TempDir()
@@ -2844,16 +2909,8 @@ func TestJSONRPCAndMCPUseUpdatedDefinition(t *testing.T) {
 	router.POST("/nyan-rpc", handleJSONRPC)
 
 	assertJSONRPCValue(t, router, "v1")
-	assertMCPToolDescription(t, "hot", "first")
-	if output := callJS("hot", map[string]interface{}{}, nil); !containsJSONValue([]byte(output), "value", "v1") {
-		t.Fatalf("MCP call output=%q, want v1", output)
-	}
 	setAPIFiles(apiPath, map[string]interface{}{"hot": map[string]interface{}{"script": "./v2.js", "description": "second"}})
 	assertJSONRPCValue(t, router, "v2")
-	assertMCPToolDescription(t, "hot", "second")
-	if output := callJS("hot", map[string]interface{}{}, nil); !containsJSONValue([]byte(output), "value", "v2") {
-		t.Fatalf("MCP call output=%q, want v2", output)
-	}
 }
 
 func TestNyanCallMeUsesUpdatedDefinition(t *testing.T) {
@@ -3193,24 +3250,6 @@ func assertJSONRPCValue(t *testing.T, handler http.Handler, want string) {
 	}
 }
 
-func assertMCPToolDescription(t *testing.T, name, wantDescription string) {
-	t.Helper()
-	result := buildToolsList()
-	tools, ok := result["tools"].([]map[string]interface{})
-	if !ok {
-		t.Fatalf("tools type=%T", result["tools"])
-	}
-	for _, tool := range tools {
-		if tool["name"] == name {
-			if tool["description"] != wantDescription {
-				t.Fatalf("tool description=%v, want %q", tool["description"], wantDescription)
-			}
-			return
-		}
-	}
-	t.Fatalf("tool %q not found in %#v", name, tools)
-}
-
 func containsJSONValue(data []byte, key, want string) bool {
 	var value map[string]interface{}
 	return json.Unmarshal(data, &value) == nil && value[key] == want
@@ -3319,4 +3358,3529 @@ func waitForHotReloadCondition(t *testing.T, label string, condition func() bool
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", label)
+}
+
+func TestMCPPhase12RequiresTypeMCPForDispatch(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	delete(definitions, "custom-mcp")
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Snapshot.MCPServers) != 0 {
+		t.Fatalf("MCP configs = %#v, want none", loaded.Snapshot.MCPServers)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+	recorder := serveMCPPhase12Request(router, newMCPPhase12Request(http.MethodPost, "/custom-mcp", mcpPhase12InitializeBody(mcpProtocol20251125)))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%q", recorder.Code, http.StatusNotFound, recorder.Body.String())
+	}
+}
+
+func TestMCPPhase12UsesAPINameAsPath(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+
+	request := newMCPPhase12Request(http.MethodPost, "/custom-mcp", mcpPhase12InitializeBody(mcpProtocol20251125))
+	request.Header.Set("Origin", "https://chatgpt.com")
+	recorder := serveMCPPhase12Request(router, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("configured MCP status = %d, want %d; body=%q", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	assertMCPPhase12InitializeResponse(t, recorder, mcpProtocol20251125)
+
+	queryRequest := newMCPPhase12Request(http.MethodPost, "/?api=custom-mcp", mcpPhase12InitializeBody(mcpProtocol20251125))
+	queryRequest.Header.Set("Origin", "https://chatgpt.com")
+	queryRecorder := serveMCPPhase12Request(router, queryRequest)
+	if queryRecorder.Code != http.StatusOK {
+		t.Fatalf("query MCP status = %d, want %d; body=%q", queryRecorder.Code, http.StatusOK, queryRecorder.Body.String())
+	}
+	assertMCPPhase12InitializeResponse(t, queryRecorder, mcpProtocol20251125)
+
+	for _, legacyPath := range []string{"/mcp", "/nyan-toolbox"} {
+		recorder = serveMCPPhase12Request(router, newMCPPhase12Request(http.MethodPost, legacyPath, mcpPhase12InitializeBody(mcpProtocol20251125)))
+		if recorder.Code != http.StatusNotFound {
+			t.Errorf("%s status = %d, want %d; body=%q", legacyPath, recorder.Code, http.StatusNotFound, recorder.Body.String())
+		}
+	}
+}
+
+func TestAPIConfigRejectsReservedNyanNamespace(t *testing.T) {
+	for _, reservedName := range []string{"nyan", "nyan-rpc", "nyan-toolbox", "nyan-custom"} {
+		t.Run(reservedName, func(t *testing.T) {
+			dir, definitions := newMCPPhase12Definitions(t)
+			mcp := definitions["custom-mcp"]
+			delete(definitions, "custom-mcp")
+			definitions[reservedName] = mcp
+			_, err := loadMCPPhase12Config(dir, definitions)
+			if err == nil || !strings.Contains(err.Error(), "reserved nyan namespace") {
+				t.Fatalf("error=%v, want reserved nyan namespace", err)
+			}
+		})
+	}
+}
+
+func TestMCPPhase12AllowsMultipleServers(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	second := cloneMCPPhase12Map(t, mcpPhase12Entry(t, definitions))
+	delete(second, "oauth")
+	delete(second, "redirectURIAllowedPrefixes")
+	definitions["second-server"] = second
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Snapshot.MCPServers) != 2 || loaded.Snapshot.MCPServers["custom-mcp"].Path != "/custom-mcp" || loaded.Snapshot.MCPServers["second-server"].Path != "/second-server" {
+		t.Fatalf("MCP servers = %#v", loaded.Snapshot.MCPServers)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+	request := newMCPPhase12Request(http.MethodPost, "/second-server", mcpPhase12InitializeBody(mcpProtocol20251125))
+	response := serveMCPPhase12Request(router, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("second MCP status=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
+func TestMCPAPINameAndToolsHotReloadAtomically(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	initial, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := publishMCPPhase12Snapshot(t, initial)
+	apiPath := filepath.Join(dir, "api.json")
+	states := initial.Snapshot.FileStates
+
+	definitions["sample"].(map[string]interface{})["description"] = "reloaded description"
+	data, err := json.Marshal(definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeHotReloadTestFile(t, apiPath, string(data))
+	states, reloaded, err := reloadAPIConfigGraphIfChanged(apiPath, dir, states)
+	if err != nil || !reloaded {
+		t.Fatalf("Tool metadata reload: reloaded=%v err=%v", reloaded, err)
+	}
+	listRequest := newMCPPhase12Request(http.MethodPost, "/custom-mcp", `{"jsonrpc":"2.0","id":"reload-list","method":"tools/list","params":{}}`)
+	listRequest.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+	listResponse := serveMCPPhase12Request(router, listRequest)
+	if listResponse.Code != http.StatusOK || !strings.Contains(listResponse.Body.String(), "reloaded description") {
+		t.Fatalf("reloaded tools/list status=%d body=%q", listResponse.Code, listResponse.Body.String())
+	}
+
+	definitions["renamed-mcp"] = definitions["custom-mcp"]
+	delete(definitions, "custom-mcp")
+	data, err = json.Marshal(definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeHotReloadTestFile(t, apiPath, string(data))
+	states, reloaded, err = reloadAPIConfigGraphIfChanged(apiPath, dir, states)
+	if err != nil || !reloaded {
+		t.Fatalf("MCP rename reload: reloaded=%v err=%v", reloaded, err)
+	}
+	pingBody := `{"jsonrpc":"2.0","id":"reload-ping","method":"ping","params":{}}`
+	oldRequest := newMCPPhase12Request(http.MethodPost, "/custom-mcp", pingBody)
+	oldRequest.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+	if response := serveMCPPhase12Request(router, oldRequest); response.Code != http.StatusNotFound {
+		t.Fatalf("old MCP endpoint status=%d body=%q", response.Code, response.Body.String())
+	}
+	newRequest := newMCPPhase12Request(http.MethodPost, "/renamed-mcp", pingBody)
+	newRequest.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+	if response := serveMCPPhase12Request(router, newRequest); response.Code != http.StatusOK {
+		t.Fatalf("renamed MCP endpoint status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	definitions["renamed-mcp"].(map[string]interface{})["path"] = "/legacy-path"
+	data, err = json.Marshal(definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeHotReloadTestFile(t, apiPath, string(data))
+	_, reloaded, err = reloadAPIConfigGraphIfChanged(apiPath, dir, states)
+	if err == nil || reloaded {
+		t.Fatalf("invalid candidate: reloaded=%v err=%v", reloaded, err)
+	}
+	newRequest = newMCPPhase12Request(http.MethodPost, "/renamed-mcp", pingBody)
+	newRequest.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+	if response := serveMCPPhase12Request(router, newRequest); response.Code != http.StatusOK {
+		t.Fatalf("active snapshot was lost after invalid reload: status=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
+func TestMCPPhase12RejectsUnknownAndNonAPIBacking(t *testing.T) {
+	tests := []struct {
+		name       string
+		backingAPI string
+	}{
+		{name: "unknown", backingAPI: "missing"},
+		{name: "public", backingAPI: "assets"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir, definitions := newMCPPhase12Definitions(t)
+			mcpPhase12Entry(t, definitions)["tools"] = []interface{}{test.backingAPI}
+			_, err := loadMCPPhase12Config(dir, definitions)
+			if err == nil || !strings.Contains(err.Error(), "invalid backing API") {
+				t.Fatalf("error = %v, want invalid backing API rejection", err)
+			}
+		})
+	}
+}
+
+func TestMCPPhase12RejectsExternalSchemaReferences(t *testing.T) {
+	for _, field := range []string{"paramCheck", "outCheck"} {
+		t.Run(field, func(t *testing.T) {
+			dir, definitions := newMCPPhase12Definitions(t)
+			constant := "nyanInputSchema"
+			if field == "outCheck" {
+				constant = "nyanOutputSchema"
+			}
+			path := filepath.Join(dir, "external-schema-"+field+".js")
+			writeHotReloadTestFile(t, path, fmt.Sprintf(`const %s={"$ref":"https://schemas.example.test/tool.json"}; ({success:true,status:200,result:{}});`, constant))
+			definitions["sample"].(map[string]interface{})[field] = path
+			_, err := loadMCPPhase12Config(dir, definitions)
+			if err == nil || !strings.Contains(err.Error(), "external JSON Schema resource is not allowed") {
+				t.Fatalf("error = %v, want external schema rejection", err)
+			}
+		})
+	}
+}
+
+func TestMCPPhase12InitializeSupportedVersions(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+
+	for _, version := range []string{mcpProtocol20251125, mcpProtocol20250618} {
+		t.Run(version, func(t *testing.T) {
+			request := newMCPPhase12Request(http.MethodPost, "/custom-mcp", mcpPhase12InitializeBody(version))
+			request.Header.Set("Origin", "https://chatgpt.com")
+			recorder := serveMCPPhase12Request(router, request)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%q", recorder.Code, http.StatusOK, recorder.Body.String())
+			}
+			assertMCPPhase12InitializeResponse(t, recorder, version)
+		})
+	}
+}
+
+func TestMCPPhase12InitializeRejectsUnsupportedVersion(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+	recorder := serveMCPPhase12Request(router, newMCPPhase12Request(http.MethodPost, "/custom-mcp", mcpPhase12InitializeBody("2025-03-26")))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if code := mcpPhase12ErrorCode(t, recorder); code != -32602 {
+		t.Fatalf("error code = %d, want -32602; body=%q", code, recorder.Body.String())
+	}
+}
+
+func TestMCPPhase12HTTPBoundaryValidation(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+	validBody := mcpPhase12InitializeBody(mcpProtocol20251125)
+
+	tests := []struct {
+		name       string
+		request    func() *http.Request
+		wantStatus int
+	}{
+		{
+			name: "GET",
+			request: func() *http.Request {
+				return newMCPPhase12Request(http.MethodGet, "/custom-mcp", "")
+			},
+			wantStatus: http.StatusMethodNotAllowed,
+		},
+		{
+			name: "DELETE",
+			request: func() *http.Request {
+				return newMCPPhase12Request(http.MethodDelete, "/custom-mcp", "")
+			},
+			wantStatus: http.StatusMethodNotAllowed,
+		},
+		{
+			name: "Content-Type",
+			request: func() *http.Request {
+				request := newMCPPhase12Request(http.MethodPost, "/custom-mcp", validBody)
+				request.Header.Set("Content-Type", "text/plain")
+				return request
+			},
+			wantStatus: http.StatusUnsupportedMediaType,
+		},
+		{
+			name: "Accept",
+			request: func() *http.Request {
+				request := newMCPPhase12Request(http.MethodPost, "/custom-mcp", validBody)
+				request.Header.Set("Accept", "application/json")
+				return request
+			},
+			wantStatus: http.StatusNotAcceptable,
+		},
+		{
+			name: "Origin",
+			request: func() *http.Request {
+				request := newMCPPhase12Request(http.MethodPost, "/custom-mcp", validBody)
+				request.Header.Set("Origin", "https://attacker.example.test")
+				return request
+			},
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name: "body limit",
+			request: func() *http.Request {
+				return newMCPPhase12Request(http.MethodPost, "/custom-mcp", strings.Repeat("x", int(maxMCPRequestBytes)+1))
+			},
+			wantStatus: http.StatusRequestEntityTooLarge,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := serveMCPPhase12Request(router, test.request())
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%q", recorder.Code, test.wantStatus, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestMCPPhase12JSONRPCValidationAndNotification(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+
+	tests := []struct {
+		name     string
+		body     string
+		protocol string
+		wantCode int
+	}{
+		{
+			name:     "batch",
+			body:     `[{"jsonrpc":"2.0","id":1,"method":"ping"}]`,
+			wantCode: -32600,
+		},
+		{
+			name:     "parse error",
+			body:     `{"jsonrpc":`,
+			wantCode: -32700,
+		},
+		{
+			name:     "unknown method",
+			body:     `{"jsonrpc":"2.0","id":3,"method":"unknown/method","params":{}}`,
+			protocol: mcpProtocol20251125,
+			wantCode: -32601,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := newMCPPhase12Request(http.MethodPost, "/custom-mcp", test.body)
+			if test.protocol != "" {
+				request.Header.Set("MCP-Protocol-Version", test.protocol)
+			}
+			recorder := serveMCPPhase12Request(router, request)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%q", recorder.Code, http.StatusOK, recorder.Body.String())
+			}
+			if code := mcpPhase12ErrorCode(t, recorder); code != test.wantCode {
+				t.Fatalf("error code = %d, want %d; body=%q", code, test.wantCode, recorder.Body.String())
+			}
+		})
+	}
+
+	notification := newMCPPhase12Request(http.MethodPost, "/custom-mcp", `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
+	notification.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+	recorder := serveMCPPhase12Request(router, notification)
+	if recorder.Code != http.StatusAccepted || recorder.Body.Len() != 0 {
+		t.Fatalf("notification status=%d body=%q, want 202 with empty body", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestMCPPhase12ToolsListUsesAllowlistAndSecurityMetadata(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+	request := newMCPPhase12Request(http.MethodPost, "/custom-mcp", `{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}`)
+	request.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+	recorder := serveMCPPhase12Request(router, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var response struct {
+		Result struct {
+			Tools []map[string]interface{} `json:"tools"`
+		} `json:"result"`
+		Error *struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error != nil {
+		t.Fatalf("unexpected MCP error: %#v; body=%q", response.Error, recorder.Body.String())
+	}
+	if len(response.Result.Tools) != 1 {
+		t.Fatalf("tools = %#v, want exactly one allowlisted Tool", response.Result.Tools)
+	}
+	tool := response.Result.Tools[0]
+	if tool["name"] != "sample" {
+		t.Fatalf("tool name = %v, want sample", tool["name"])
+	}
+	if tool["title"] != "Sample Tool" || tool["description"] != "allowlisted sample" {
+		t.Fatalf("Tool metadata = %#v", tool)
+	}
+	inputSchema, ok := tool["inputSchema"].(map[string]interface{})
+	if !ok || inputSchema["type"] != "object" || inputSchema["additionalProperties"] != false {
+		t.Fatalf("inputSchema = %#v", tool["inputSchema"])
+	}
+	securitySchemes, ok := tool["securitySchemes"].([]interface{})
+	if !ok || len(securitySchemes) != 1 {
+		t.Fatalf("securitySchemes = %#v, want one scheme", tool["securitySchemes"])
+	}
+	meta, ok := tool["_meta"].(map[string]interface{})
+	if !ok || !reflect.DeepEqual(meta["securitySchemes"], tool["securitySchemes"]) {
+		t.Fatalf("_meta.securitySchemes = %#v, top-level = %#v", meta["securitySchemes"], tool["securitySchemes"])
+	}
+}
+
+func newMCPPhase12Definitions(t *testing.T) (string, map[string]interface{}) {
+	t.Helper()
+	dir := t.TempDir()
+	writeHotReloadTestFile(t, filepath.Join(dir, "sample.js"), `JSON.stringify({ok:true,service:"Nyan8",items:[1,2,3]});`)
+	writeHotReloadTestFile(t, filepath.Join(dir, "other.js"), `JSON.stringify({ok:true});`)
+	writeHotReloadTestFile(t, filepath.Join(dir, "oauth-hook.js"), `({authenticated:false,forbidden:false});`)
+	writeHotReloadTestFile(t, filepath.Join(dir, "sample-input.js"), `const nyanInputSchema={type:"object",properties:{},additionalProperties:false}; ({success:true,status:200,result:{}});`)
+	writeHotReloadTestFile(t, filepath.Join(dir, "sample-output.js"), `const nyanOutputSchema={type:"object",properties:{ok:{type:"boolean"},service:{const:"Nyan8"},items:{type:"array",items:{type:"integer"}}},required:["ok","service","items"],additionalProperties:false}; ({success:true,status:200,result:{}});`)
+	if err := os.Mkdir(filepath.Join(dir, "public"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	securitySchemes := []interface{}{
+		map[string]interface{}{"type": "oauth2", "scopes": []interface{}{"nyan8:read"}},
+	}
+	definitions := map[string]interface{}{
+		"sample": map[string]interface{}{
+			"script":          "./sample.js",
+			"paramCheck":      "./sample-input.js",
+			"outCheck":        "./sample-output.js",
+			"title":           "Sample Tool",
+			"description":     "allowlisted sample",
+			"securitySchemes": securitySchemes,
+			"annotations": map[string]interface{}{
+				"readOnlyHint":    true,
+				"destructiveHint": false,
+				"openWorldHint":   false,
+			},
+		},
+		"other": map[string]interface{}{
+			"script":      "./other.js",
+			"description": "not allowlisted",
+		},
+		"assets": map[string]interface{}{
+			"type": "public",
+			"path": "./public",
+		},
+		"oauth_authorization_server_metadata": map[string]interface{}{"description": "OAuth authorization server metadata"},
+		"oauth_protected_resource_metadata":   map[string]interface{}{"description": "OAuth protected resource metadata"},
+		"oauth_authorize":                     map[string]interface{}{"script": "./oauth-hook.js"},
+		"oauth_token":                         map[string]interface{}{"script": "./oauth-hook.js"},
+		"oauth_register":                      map[string]interface{}{"script": "./oauth-hook.js"},
+		"oauth_admin_user":                    map[string]interface{}{"script": "./oauth-hook.js"},
+		"oauth_verify_access":                 map[string]interface{}{"script": "./oauth-hook.js", "scopes": []interface{}{"nyan8:read"}},
+		"custom-mcp": map[string]interface{}{
+			"type":                       "mcp",
+			"transport":                  "streamable_http",
+			"protocolVersions":           []interface{}{mcpProtocol20251125, mcpProtocol20250618},
+			"allowedOrigins":             []interface{}{"https://chatgpt.com"},
+			"redirectURIAllowedPrefixes": []interface{}{"https://chatgpt.com/connector/oauth/"},
+			"oauth": map[string]interface{}{
+				"authorizationServerMetadata": "oauth_authorization_server_metadata",
+				"protectedResourceMetadata":   "oauth_protected_resource_metadata",
+				"authorize":                   "oauth_authorize",
+				"token":                       "oauth_token",
+				"register":                    "oauth_register",
+				"adminUser":                   "oauth_admin_user",
+				"verifyAccess":                "oauth_verify_access",
+			},
+			"tools":        []interface{}{"sample"},
+			"instructions": "Phase 1-2 test server",
+		},
+	}
+	return dir, definitions
+}
+
+func newMCPStdioTestConfig(t *testing.T) (*apiConfigLoadResult, *MCPServerConfig) {
+	t.Helper()
+	dir, definitions := newMCPPhase12Definitions(t)
+	mcp := mcpPhase12Entry(t, definitions)
+	mcp["transport"] = "stdio"
+	delete(mcp, "allowedOrigins")
+	delete(mcp, "redirectURIAllowedPrefixes")
+	delete(mcp, "oauth")
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := loaded.Snapshot.MCPServers["custom-mcp"]
+	if server == nil {
+		t.Fatal("stdio MCP server was not loaded")
+	}
+	return loaded, server
+}
+
+func TestMCPStdioTransportConfiguration(t *testing.T) {
+	t.Run("stdio only", func(t *testing.T) {
+		loaded, server := newMCPStdioTestConfig(t)
+		if !mcpSupportsTransport(server, "stdio") || mcpSupportsTransport(server, "streamable_http") {
+			t.Fatalf("transport = %q", server.Transport)
+		}
+		selected, err := selectMCPStdioServer(loaded.Snapshot, "custom-mcp")
+		if err != nil || selected != server {
+			t.Fatalf("selected=%v error=%v", selected, err)
+		}
+		router := publishMCPPhase12Snapshot(t, loaded)
+		response := serveMCPPhase12Request(router, newMCPPhase12Request(http.MethodPost, "/custom-mcp", mcpPhase12InitializeBody(mcpProtocol20251125)))
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("stdio-only HTTP status=%d body=%q", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("separate HTTP and stdio definitions share a Tool", func(t *testing.T) {
+		dir, definitions := newMCPPhase12Definitions(t)
+		definitions["local-mcp"] = map[string]interface{}{
+			"type":      "mcp",
+			"transport": "stdio",
+			"tools":     []interface{}{"sample"},
+		}
+		loaded, err := loadMCPPhase12Config(dir, definitions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		httpServer := loaded.Snapshot.MCPServers["custom-mcp"]
+		stdioServer := loaded.Snapshot.MCPServers["local-mcp"]
+		if !mcpSupportsTransport(httpServer, "streamable_http") || mcpSupportsTransport(httpServer, "stdio") {
+			t.Fatalf("HTTP transport = %q", httpServer.Transport)
+		}
+		if !mcpSupportsTransport(stdioServer, "stdio") || mcpSupportsTransport(stdioServer, "streamable_http") {
+			t.Fatalf("stdio transport = %q", stdioServer.Transport)
+		}
+		if len(httpServer.Tools) != 1 || len(stdioServer.Tools) != 1 || httpServer.Tools[0].API != "sample" || stdioServer.Tools[0].API != "sample" {
+			t.Fatalf("shared Tools: HTTP=%#v stdio=%#v", httpServer.Tools, stdioServer.Tools)
+		}
+	})
+
+	t.Run("multiple servers require selection", func(t *testing.T) {
+		loaded, _ := newMCPStdioTestConfig(t)
+		second := *loaded.Snapshot.MCPServers["custom-mcp"]
+		second.Name = "second-mcp"
+		second.Path = "/second-mcp"
+		loaded.Snapshot.MCPServers[second.Name] = &second
+		if _, err := selectMCPStdioServer(loaded.Snapshot, ""); err == nil || !strings.Contains(err.Error(), "--mcp-server") {
+			t.Fatalf("multiple server selection error = %v", err)
+		}
+		selected, err := selectMCPStdioServer(loaded.Snapshot, "second-mcp")
+		if err != nil || selected.Name != "second-mcp" {
+			t.Fatalf("selected=%v error=%v", selected, err)
+		}
+	})
+
+	tests := []struct {
+		name      string
+		transport interface{}
+		legacy    bool
+		want      string
+	}{
+		{name: "missing", want: "transport is required"},
+		{name: "legacy field", legacy: true, want: "unknown field \"transports\""},
+		{name: "unknown", transport: "socket", want: "unsupported MCP transport"},
+		{name: "blank", transport: " ", want: "transport is required"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir, definitions := newMCPPhase12Definitions(t)
+			mcp := mcpPhase12Entry(t, definitions)
+			delete(mcp, "transport")
+			delete(mcp, "allowedOrigins")
+			delete(mcp, "redirectURIAllowedPrefixes")
+			delete(mcp, "oauth")
+			if test.legacy {
+				mcp["transports"] = []interface{}{"stdio"}
+			}
+			if test.transport != nil {
+				mcp["transport"] = test.transport
+			}
+			_, err := loadMCPPhase12Config(dir, definitions)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestMCPOAuthStateDirectoryUsesRuntimeConfigRoot(t *testing.T) {
+	initTestLogger()
+	dir, definitions := newMCPPhase12Definitions(t)
+	stateRoot := filepath.Join(t.TempDir(), "persistent-oauth")
+	previousConfig := globalConfig
+	globalConfig.OAuthStateRoot = stateRoot
+	t.Cleanup(func() { globalConfig = previousConfig })
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(stateRoot, "custom-mcp")
+	if got := loaded.Snapshot.MCPServers["custom-mcp"].OAuth.StateDirectory; got != want {
+		t.Fatalf("OAuth state directory=%q, want %q", got, want)
+	}
+}
+
+func TestMCPStdioProtocolAndToolExecution(t *testing.T) {
+	initTestLogger()
+	loaded, server := newMCPStdioTestConfig(t)
+	previousConfig := globalConfig
+	globalConfig.Name = "Nyan8 stdio Test"
+	t.Cleanup(func() { globalConfig = previousConfig })
+
+	input := strings.Join([]string{
+		mcpPhase12InitializeBody(mcpProtocol20251125),
+		`{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`,
+		`{"jsonrpc":"2.0","id":"list","method":"tools/list","params":{}}`,
+		`{"jsonrpc":"2.0","id":"call","method":"tools/call","params":{"name":"sample","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":"ping","method":"ping","params":{}}`,
+	}, "\n") + "\n"
+	var output bytes.Buffer
+	if err := serveMCPStdio(strings.NewReader(input), &output, loaded.Snapshot, server); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("response lines=%d, want 4; output=%q", len(lines), output.String())
+	}
+	responses := make(map[string]map[string]interface{})
+	for _, line := range lines {
+		var response map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &response); err != nil {
+			t.Fatalf("stdout contains non-JSON MCP data %q: %v", line, err)
+		}
+		responses[fmt.Sprint(response["id"])] = response
+	}
+	listResult := responses["list"]["result"].(map[string]interface{})
+	tools := listResult["tools"].([]interface{})
+	tool := tools[0].(map[string]interface{})
+	if _, exists := tool["securitySchemes"]; exists {
+		t.Fatalf("stdio tools/list exposed HTTP security metadata: %#v", tool)
+	}
+	if _, exists := tool["_meta"]; exists {
+		t.Fatalf("stdio tools/list exposed HTTP _meta security metadata: %#v", tool)
+	}
+	callResult := responses["call"]["result"].(map[string]interface{})
+	structured := callResult["structuredContent"].(map[string]interface{})
+	if structured["ok"] != true || structured["service"] != "Nyan8" {
+		t.Fatalf("stdio Tool result = %#v", callResult)
+	}
+}
+
+func TestMCPStdioLifecycleAndInvalidMessages(t *testing.T) {
+	initTestLogger()
+	loaded, server := newMCPStdioTestConfig(t)
+	input := strings.Join([]string{
+		``,
+		`{"jsonrpc":"2.0","id":"early","method":"tools/list","params":{}}`,
+		`[{"jsonrpc":"2.0","id":"batch","method":"ping"}]`,
+		`{"jsonrpc":"2.0","id":"duplicate","id":"duplicate2","method":"ping"}`,
+		`{"jsonrpc":"2.0","id":"trailing","method":"ping"} {}`,
+		mcpPhase12InitializeBody("2099-01-01"),
+		mcpPhase12InitializeBody(mcpProtocol20251125),
+		`{"jsonrpc":"2.0","id":"waiting","method":"tools/list","params":{}}`,
+		`{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`,
+		`{"jsonrpc":"2.0","id":"second","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{}}}`,
+		`{"jsonrpc":"2.0","id":"missing-tool","method":"tools/call","params":{"name":"missing","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":"unknown","method":"unknown/method","params":{}}`,
+	}, "\n") + "\n"
+	var output bytes.Buffer
+	if err := serveMCPStdio(strings.NewReader(input), &output, loaded.Snapshot, server); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(strings.TrimSpace(output.String()), "\n") + 1; got != 11 {
+		t.Fatalf("response count=%d, want 11; output=%q", got, output.String())
+	}
+	for _, wantCode := range []string{`"code":-32700`, `"code":-32002`, `"code":-32600`, `"code":-32601`, `"code":-32602`} {
+		if !strings.Contains(output.String(), wantCode) {
+			t.Errorf("output does not contain %s: %q", wantCode, output.String())
+		}
+	}
+}
+
+func TestMCPStdioToolValidationAndReservedArguments(t *testing.T) {
+	initTestLogger()
+	loaded, server := newMCPStdioTestConfig(t)
+	tool := findMCPTool(server, "sample")
+	if tool == nil {
+		t.Fatal("sample Tool is missing")
+	}
+	tool.InputSchema = map[string]interface{}{"type": "object", "additionalProperties": true}
+	principal := map[string]interface{}{"transport": "stdio"}
+	if _, message := executeMCPTool(loaded.Snapshot, tool, map[string]interface{}{"mcp_principal": "spoofed"}, principal); message != "Tool arguments contain a reserved parameter." {
+		t.Fatalf("reserved argument error = %q", message)
+	}
+	tool.InputSchema = map[string]interface{}{"type": "object", "required": []interface{}{"required_value"}}
+	if _, message := executeMCPTool(loaded.Snapshot, tool, map[string]interface{}{}, principal); message != "Tool arguments do not match inputSchema." {
+		t.Fatalf("schema argument error = %q", message)
+	}
+}
+
+func TestMCPStdioRejectsOversizedMessage(t *testing.T) {
+	initTestLogger()
+	loaded, server := newMCPStdioTestConfig(t)
+	input := strings.NewReader(strings.Repeat("x", maxMCPRequestBytes+2) + "\n")
+	var output bytes.Buffer
+	err := serveMCPStdio(input, &output, loaded.Snapshot, server)
+	if err == nil || !strings.Contains(err.Error(), "exceeded") {
+		t.Fatalf("oversize error = %v", err)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("oversize input produced output %q", output.String())
+	}
+}
+
+func TestMCPStdioCommandProcessEndToEnd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping stdio child-process E2E in short mode")
+	}
+	dir := t.TempDir()
+	binaryPath := filepath.Join(dir, "Nyan8-stdio-test")
+	build := exec.Command("go", "build", "-o", binaryPath, ".")
+	build.Dir = "."
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build stdio test binary: %v\n%s", err, output)
+	}
+	configPath := filepath.Join(dir, "config.json")
+	configJSON := `{
+  "name":"Nyan8 stdio process test",
+  "version":"test",
+  "Port":-1,
+  "bindAddress":"invalid bind address",
+  "log":{"EnableLogging":false},
+  "APIHotReload":{"Enabled":true,"Interval":"not-a-duration"},
+  "websocket":{"maxConnections":128}
+}`
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "echo.js"), []byte(`(function () {
+  console.log("stdio-process-log");
+  return {ok:true,transport:nyanAllParams.mcp_principal.transport};
+})()`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	apiPath := filepath.Join(dir, "api.json")
+	apiJSON := `{
+  "echo": {
+    "script":"./echo.js",
+    "title":"Echo",
+    "description":"stdio process Tool"
+  },
+  "local_mcp": {
+    "type":"mcp",
+	"transport":"stdio",
+    "tools":["echo"]
+  },
+  "background_job": {
+    "type":"schedule",
+    "script":"./echo.js",
+    "trigger":{"type":"cron","value":"* * * * *"}
+  },
+  "background_socket": {
+    "type":"ws_client",
+    "script":"./echo.js",
+    "connectURL":"ws://127.0.0.1:1"
+  }
+}`
+	if err := os.WriteFile(apiPath, []byte(apiJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	input := strings.Join([]string{
+		mcpPhase12InitializeBody(mcpProtocol20251125),
+		`{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`,
+		`{"jsonrpc":"2.0","id":"list","method":"tools/list","params":{}}`,
+		`{"jsonrpc":"2.0","id":"call","method":"tools/call","params":{"name":"echo","arguments":{}}}`,
+	}, "\n") + "\n"
+	command := exec.Command(binaryPath,
+		"--mcp-server", "local_mcp",
+		"--api", apiPath,
+		"--config", configPath,
+	)
+	command.Stdin = strings.NewReader(input)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		t.Fatalf("stdio command: %v\nstderr=%s\nstdout=%s", err, stderr.String(), stdout.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("stdout response lines=%d, want 3; stdout=%q stderr=%q", len(lines), stdout.String(), stderr.String())
+	}
+	for _, line := range lines {
+		var response map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &response); err != nil || response["jsonrpc"] != "2.0" {
+			t.Fatalf("stdout is not MCP-only: line=%q error=%v", line, err)
+		}
+	}
+	if strings.Contains(stdout.String(), "Executable directory") || strings.Contains(stdout.String(), "stdio-process-log") {
+		t.Fatalf("stdout was polluted: %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "Starting stdio MCP server: local_mcp") || !strings.Contains(stderr.String(), "stdio-process-log") {
+		t.Fatalf("stderr did not receive startup/JavaScript logs: %q", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "Starting schedule job") || strings.Contains(stderr.String(), "Starting WebSocket client") || strings.Contains(stderr.String(), "API hot reload enabled") {
+		t.Fatalf("stdio mode started background services: %q", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"transport":"stdio"`) {
+		t.Fatalf("stdio principal was not passed to Tool: %q", stdout.String())
+	}
+}
+
+func loadMCPPhase12Config(dir string, definitions map[string]interface{}) (*apiConfigLoadResult, error) {
+	data, err := json.Marshal(definitions)
+	if err != nil {
+		return nil, err
+	}
+	apiPath := filepath.Join(dir, "api.json")
+	if err := os.WriteFile(apiPath, data, 0o644); err != nil {
+		return nil, err
+	}
+	return loadAPIConfigData(apiPath, dir, data)
+}
+
+func publishMCPPhase12Snapshot(t *testing.T, loaded *apiConfigLoadResult) *gin.Engine {
+	t.Helper()
+	previousSnapshot := currentAPISnapshot()
+	previousConfig := globalConfig
+	previousPaths := servicePaths
+	previousLogger := logger
+	initTestLogger()
+	globalConfig.Name = "Nyan8 Phase 1-2 Test"
+	servicePaths.API.Path = loaded.Snapshot.RootPath
+	publishAPISnapshot(loaded.Snapshot)
+	t.Cleanup(func() {
+		publishAPISnapshot(previousSnapshot)
+		globalConfig = previousConfig
+		servicePaths = previousPaths
+		logger = previousLogger
+	})
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.NoRoute(func(c *gin.Context) {
+		if dispatchMCPOrOAuth(c) {
+			return
+		}
+		c.Status(http.StatusNotFound)
+	})
+	return router
+}
+
+func newMCPPhase12Request(method, path, body string) *http.Request {
+	request := httptest.NewRequest(method, "https://nyan8.test"+path, strings.NewReader(body))
+	request.Host = "nyan8.test"
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	return request
+}
+
+func serveMCPPhase12Request(handler http.Handler, request *http.Request) *httptest.ResponseRecorder {
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	return recorder
+}
+
+func mcpPhase12InitializeBody(version string) string {
+	return fmt.Sprintf(`{"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{"protocolVersion":%q,"capabilities":{},"clientInfo":{"name":"phase12-test","version":"1.0"},"_meta":{}}}`, version)
+}
+
+func assertMCPPhase12InitializeResponse(t *testing.T, recorder *httptest.ResponseRecorder, version string) {
+	t.Helper()
+	var response struct {
+		Result struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		} `json:"result"`
+		Error *struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error != nil {
+		t.Fatalf("unexpected MCP error: %#v; body=%q", response.Error, recorder.Body.String())
+	}
+	if response.Result.ProtocolVersion != version {
+		t.Fatalf("protocolVersion = %q, want %q", response.Result.ProtocolVersion, version)
+	}
+	if got := recorder.Header().Get("MCP-Protocol-Version"); got != version {
+		t.Fatalf("MCP-Protocol-Version header = %q, want %q", got, version)
+	}
+}
+
+func mcpPhase12ErrorCode(t *testing.T, recorder *httptest.ResponseRecorder) int {
+	t.Helper()
+	var response struct {
+		Error *struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error == nil {
+		t.Fatalf("response has no JSON-RPC error: %q", recorder.Body.String())
+	}
+	return response.Error.Code
+}
+
+func mcpPhase12Entry(t *testing.T, definitions map[string]interface{}) map[string]interface{} {
+	t.Helper()
+	mcp, ok := definitions["custom-mcp"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("custom-mcp definition type = %T", definitions["custom-mcp"])
+	}
+	return mcp
+}
+
+func cloneMCPPhase12Map(t *testing.T, source map[string]interface{}) map[string]interface{} {
+	t.Helper()
+	data, err := json.Marshal(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clone map[string]interface{}
+	if err := json.Unmarshal(data, &clone); err != nil {
+		t.Fatal(err)
+	}
+	return clone
+}
+
+func TestOAuthPhase3Argon2idHashAndVerify(t *testing.T) {
+	hash, err := argon2idHash("correct horse battery staple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPrefix := fmt.Sprintf("$argon2id$v=19$m=%d,t=%d,p=%d$", argon2Memory, argon2Iterations, argon2Parallelism)
+	if !strings.HasPrefix(hash, wantPrefix) {
+		t.Fatalf("hash = %q, want PHC prefix %q", hash, wantPrefix)
+	}
+	parts := strings.Split(hash, "$")
+	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" || parts[2] != "v=19" || parts[4] == "" || parts[5] == "" {
+		t.Fatalf("hash is not a complete Argon2id PHC string: %q", hash)
+	}
+	if !argon2idVerify("correct horse battery staple", hash) {
+		t.Fatal("correct password did not verify")
+	}
+	if argon2idVerify("wrong password", hash) {
+		t.Fatal("wrong password verified")
+	}
+	if argon2idVerify("correct horse battery staple", hash+"x") {
+		t.Fatal("tampered PHC string verified")
+	}
+	if argon2idVerify("correct horse battery staple", "$argon2id$v=19$m=1,t=1,p=1$bad$bad") {
+		t.Fatal("unsupported Argon2 parameters verified")
+	}
+	if _, err := argon2idHash(""); err == nil {
+		t.Fatal("empty password was hashed")
+	}
+}
+
+func TestOAuthPhase3StatePrimitivesAndSafety(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "oauth-state")
+	key := "tokens/access.json"
+	want := `{"token":"one","active":true}`
+	if err := oauthWriteState(root, key, want); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(root, filepath.FromSlash(key))
+	info, err := os.Stat(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Fatalf("state mode = %04o, want 0600", info.Mode().Perm())
+	}
+	got, err := oauthReadState(root, key)
+	if err != nil || got != want || !json.Valid([]byte(got)) {
+		t.Fatalf("read value=%q err=%v, want valid JSON %q", got, err, want)
+	}
+	if err := oauthDeleteState(root, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("deleted state stat error = %v, want not-exist", err)
+	}
+
+	consumeKey := "codes/authorization.json"
+	consumeValue := `{"code":"single-use"}`
+	if err := oauthWriteState(root, consumeKey, consumeValue); err != nil {
+		t.Fatal(err)
+	}
+	consumed, err := oauthConsumeState(root, consumeKey)
+	if err != nil || consumed != consumeValue {
+		t.Fatalf("consume value=%q err=%v, want %q", consumed, err, consumeValue)
+	}
+	if _, err := oauthReadState(root, consumeKey); !os.IsNotExist(err) {
+		t.Fatalf("consumed state read error = %v, want not-exist", err)
+	}
+
+	if err := oauthWriteState(root, "invalid.json", "not JSON"); err == nil {
+		t.Fatal("invalid JSON state was written")
+	}
+	if err := oauthWriteState(root, "duplicate.json", `{"kind":"one","kind":"two"}`); err == nil {
+		t.Fatal("state with duplicate JSON object keys was written")
+	}
+	invalidPath := filepath.Join(root, "invalid-on-disk.json")
+	if err := os.WriteFile(invalidPath, []byte("not JSON"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := oauthReadState(root, "invalid-on-disk.json"); err == nil {
+		t.Fatal("invalid JSON state file was read")
+	}
+	duplicatePath := filepath.Join(root, "duplicate-on-disk.json")
+	if err := os.WriteFile(duplicatePath, []byte(`{"kind":"one","kind":"two"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := oauthReadState(root, "duplicate-on-disk.json"); err == nil {
+		t.Fatal("state file with duplicate JSON object keys was read")
+	}
+	if runtime.GOOS != "windows" {
+		broadPath := filepath.Join(root, "broad.json")
+		if err := os.WriteFile(broadPath, []byte(`{"ok":true}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := oauthReadState(root, "broad.json"); err == nil {
+			t.Fatal("overly broad state file permissions were accepted")
+		}
+	}
+
+	for _, invalidKey := range []string{"../escape.json", "nested/../../escape.json", "no-json-extension"} {
+		if err := oauthWriteState(root, invalidKey, `{"ok":true}`); err == nil {
+			t.Errorf("invalid state key %q was accepted", invalidKey)
+		}
+	}
+	absoluteKey := filepath.Join(t.TempDir(), "absolute.json")
+	if err := oauthWriteState(root, absoluteKey, `{"ok":true}`); err == nil {
+		t.Errorf("absolute state key %q was accepted", absoluteKey)
+	}
+
+	testOAuthPhase3SymlinkRejection(t, root)
+}
+
+func TestOAuthPhase3ConcurrentConsumeSucceedsOnce(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "oauth-state")
+	const key = "codes/once.json"
+	const value = `{"nonce":"consume-once"}`
+	if err := oauthWriteState(root, key, value); err != nil {
+		t.Fatal(err)
+	}
+
+	type consumeResult struct {
+		value string
+		err   error
+	}
+	const consumers = 24
+	start := make(chan struct{})
+	results := make(chan consumeResult, consumers)
+	var wait sync.WaitGroup
+	for index := 0; index < consumers; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			consumed, err := oauthConsumeState(root, key)
+			results <- consumeResult{value: consumed, err: err}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+
+	successes := 0
+	for result := range results {
+		if result.err == nil {
+			successes++
+			if result.value != value {
+				t.Errorf("consumed value = %q, want %q", result.value, value)
+			}
+			continue
+		}
+		if !os.IsNotExist(result.err) {
+			t.Errorf("losing consumer error = %v, want not-exist", result.err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful consumers = %d, want 1", successes)
+	}
+}
+
+func TestOAuthPhase3RuntimeExcludesGeneralNyanCapabilities(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "runtime-check.js")
+	writeHotReloadTestFile(t, scriptPath, `({
+  nyanHostExec: typeof nyanHostExec,
+  nyanGetAPI: typeof nyanGetAPI,
+  nyanGetFile: typeof nyanGetFile,
+  nyanSendMail: typeof nyanSendMail,
+  nyanOAuthRead: typeof nyanOAuthRead,
+  nyanOAuthWrite: typeof nyanOAuthWrite,
+  nyanOAuthConsume: typeof nyanOAuthConsume
+});`)
+	mcp := &MCPServerConfig{OAuth: MCPOAuthConfig{StateDirectory: filepath.Join(dir, "state")}}
+	value, err := runOAuthHookJavaScript(nil, mcp, scriptPath, map[string]interface{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, ok := value.(map[string]interface{})
+	if !ok {
+		t.Fatalf("runtime result type = %T", value)
+	}
+	for _, forbidden := range []string{"nyanHostExec", "nyanGetAPI", "nyanGetFile", "nyanSendMail"} {
+		if result[forbidden] != "undefined" {
+			t.Errorf("%s typeof = %v, want undefined", forbidden, result[forbidden])
+		}
+	}
+	for _, allowed := range []string{"nyanOAuthRead", "nyanOAuthWrite", "nyanOAuthConsume"} {
+		if result[allowed] != "function" {
+			t.Errorf("%s typeof = %v, want function", allowed, result[allowed])
+		}
+	}
+}
+
+func TestOAuthPhase3UsesAPINameRoutesAndRequestOrigin(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+
+	metadata := newMCPPhase12Request(http.MethodGet, "/oauth_authorization_server_metadata", "")
+	metadata.Host = "Connector.EXAMPLE.test:8443"
+	recorder := serveMCPPhase12Request(router, metadata)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("metadata status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	var metadataBody map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &metadataBody); err != nil {
+		t.Fatal(err)
+	}
+	if metadataBody["issuer"] != "https://connector.example.test:8443" ||
+		metadataBody["authorization_endpoint"] != "https://connector.example.test:8443/oauth_authorize" ||
+		metadataBody["token_endpoint"] != "https://connector.example.test:8443/oauth_token" ||
+		metadataBody["registration_endpoint"] != "https://connector.example.test:8443/oauth_register" {
+		t.Fatalf("custom metadata = %#v", metadataBody)
+	}
+	resourceMetadata := newMCPPhase12Request(http.MethodGet, "/?api=oauth_protected_resource_metadata", "")
+	resourceRecorder := serveMCPPhase12Request(router, resourceMetadata)
+	if resourceRecorder.Code != http.StatusOK {
+		t.Fatalf("resource metadata status=%d body=%q", resourceRecorder.Code, resourceRecorder.Body.String())
+	}
+	var resourceBody map[string]interface{}
+	if err := json.Unmarshal(resourceRecorder.Body.Bytes(), &resourceBody); err != nil {
+		t.Fatal(err)
+	}
+	if resourceBody["resource"] != "https://nyan8.test/custom-mcp" {
+		t.Fatalf("query resource metadata = %#v", resourceBody)
+	}
+
+	for _, route := range []string{"/oauth_authorize", "/oauth_token", "/oauth_register", "/oauth_admin_user"} {
+		recorder = serveMCPPhase12Request(router, newMCPPhase12Request(http.MethodPut, route, ""))
+		if recorder.Code != http.StatusMethodNotAllowed {
+			t.Errorf("configured route %s status=%d, want 405; body=%q", route, recorder.Code, recorder.Body.String())
+		}
+	}
+	for _, staleRoute := range []string{"/.well-known/oauth-authorization-server", "/oauth/authorize", "/oauth/token", "/oauth/register", "/oauth/admin/users"} {
+		recorder = serveMCPPhase12Request(router, newMCPPhase12Request(http.MethodGet, staleRoute, ""))
+		if recorder.Code != http.StatusNotFound {
+			t.Errorf("stale route %s status=%d, want 404; body=%q", staleRoute, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func TestOAuthPhase3HTTPBoundaryValidation(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+
+	tests := []struct {
+		name       string
+		request    func() *http.Request
+		wantStatus int
+	}{
+		{
+			name: "Host",
+			request: func() *http.Request {
+				request := newMCPPhase12Request(http.MethodGet, "/oauth_authorization_server_metadata", "")
+				request.Host = "bad_host.example.test"
+				return request
+			},
+			wantStatus: http.StatusMisdirectedRequest,
+		},
+		{
+			name: "Origin",
+			request: func() *http.Request {
+				request := newMCPPhase12Request(http.MethodGet, "/oauth_authorization_server_metadata", "")
+				request.Header.Set("Origin", "https://attacker.example.test")
+				return request
+			},
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name: "method",
+			request: func() *http.Request {
+				return newMCPPhase12Request(http.MethodGet, "/oauth_token", "")
+			},
+			wantStatus: http.StatusMethodNotAllowed,
+		},
+		{
+			name: "Content-Type",
+			request: func() *http.Request {
+				return newMCPPhase12Request(http.MethodPost, "/oauth_token", `{"grant_type":"authorization_code"}`)
+			},
+			wantStatus: http.StatusUnsupportedMediaType,
+		},
+		{
+			name: "body limit",
+			request: func() *http.Request {
+				request := newMCPPhase12Request(http.MethodPost, "/oauth_token", strings.Repeat("x", int(maxMCPRequestBytes)+1))
+				request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				return request
+			},
+			wantStatus: http.StatusRequestEntityTooLarge,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := serveMCPPhase12Request(router, test.request())
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status=%d, want %d; body=%q", recorder.Code, test.wantStatus, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestOAuthPhase3HookRequestAndResponseContract(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	writeHotReloadTestFile(t, filepath.Join(dir, "oauth-hook.js"), oauthPhase3EchoHookScript())
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+
+	t.Run("query headers and cookie", func(t *testing.T) {
+		request := newMCPPhase12Request(http.MethodGet, "/oauth_authorize?prompt=login", "")
+		request.Header.Set("Authorization", "Bearer request-token")
+		request.AddCookie(&http.Cookie{Name: "session", Value: "cookie-value"})
+		body := assertOAuthPhase3EchoResponse(t, serveMCPPhase12Request(router, request), "oauthAuthorize")
+		if got := oauthPhase3NestedFirstString(body, "query", "prompt"); got != "login" {
+			t.Fatalf("query prompt=%q, want login", got)
+		}
+		if body["authorization"] != "Bearer request-token" || body["cookie"] != "cookie-value" {
+			t.Fatalf("header/cookie echo = %#v", body)
+		}
+		if body["path"] != "/oauth_authorize" {
+			t.Fatalf("authorize path=%v, want /oauth_authorize", body["path"])
+		}
+	})
+
+	t.Run("form", func(t *testing.T) {
+		request := newMCPPhase12Request(http.MethodPost, "/?api=oauth_token&source=query", "grant_type=authorization_code&code=abc123")
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		body := assertOAuthPhase3EchoResponse(t, serveMCPPhase12Request(router, request), "oauthToken")
+		if got := oauthPhase3NestedFirstString(body, "form", "grant_type"); got != "authorization_code" {
+			t.Fatalf("form grant_type=%q, want authorization_code", got)
+		}
+		if got := oauthPhase3NestedFirstString(body, "form", "code"); got != "abc123" {
+			t.Fatalf("form code=%q, want abc123", got)
+		}
+		if body["path"] != "/oauth_token" {
+			t.Fatalf("query-form token path=%v, want /oauth_token", body["path"])
+		}
+	})
+
+	t.Run("JSON", func(t *testing.T) {
+		request := newMCPPhase12Request(http.MethodPost, "/oauth_register", `{"client_name":"phase3-client"}`)
+		body := assertOAuthPhase3EchoResponse(t, serveMCPPhase12Request(router, request), "oauthRegister")
+		jsonBody, ok := body["json"].(map[string]interface{})
+		if !ok || jsonBody["client_name"] != "phase3-client" {
+			t.Fatalf("JSON body echo = %#v", body["json"])
+		}
+		if body["path"] != "/oauth_register" {
+			t.Fatalf("register path=%v, want /oauth_register", body["path"])
+		}
+	})
+}
+
+func TestOAuthPhase3RejectsUnsafeHookResponseHeaders(t *testing.T) {
+	tests := []struct {
+		name      string
+		headersJS string
+	}{
+		{name: "unapproved header", headersJS: `{"X-Not-Allowed":"value"}`},
+		{name: "CRLF value", headersJS: `{"Location":"https://client.example.test/callback\r\nInjected: true"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir, definitions := newMCPPhase12Definitions(t)
+			script := fmt.Sprintf(`({status:200,contentType:"application/json",headers:%s,body:{ok:true}});`, test.headersJS)
+			writeHotReloadTestFile(t, filepath.Join(dir, "oauth-hook.js"), script)
+			loaded, err := loadMCPPhase12Config(dir, definitions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			router := publishMCPPhase12Snapshot(t, loaded)
+			request := newMCPPhase12Request(http.MethodPost, "/oauth_register", `{}`)
+			recorder := serveMCPPhase12Request(router, request)
+			if recorder.Code != http.StatusInternalServerError || !strings.Contains(recorder.Body.String(), "invalid response") {
+				t.Fatalf("status=%d body=%q, want rejected hook response", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestOAuthPhase3AdminBasicCredential(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	writeHotReloadTestFile(t, filepath.Join(dir, "oauth-hook.js"), `(function () {
+  var authorized = nyanOAuthAdminAuthorized(nyanAllParams.authorization);
+  return {
+    status: authorized ? 201 : 401,
+    contentType: "application/json",
+    headers: {"Cache-Control": "no-store"},
+    body: {authorized: authorized}
+  };
+})()`)
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+	globalConfig.OAuthAdmin = OAuthAdminConfig{Username: "operator", Password: "correct-password"}
+
+	tests := []struct {
+		name       string
+		username   string
+		password   string
+		withBasic  bool
+		wantStatus int
+		wantAuth   bool
+	}{
+		{name: "correct", username: "operator", password: "correct-password", withBasic: true, wantStatus: http.StatusCreated, wantAuth: true},
+		{name: "wrong username", username: "attacker", password: "correct-password", withBasic: true, wantStatus: http.StatusUnauthorized},
+		{name: "wrong password", username: "operator", password: "wrong-password", withBasic: true, wantStatus: http.StatusUnauthorized},
+		{name: "missing", wantStatus: http.StatusUnauthorized},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := newMCPPhase12Request(http.MethodPost, "/oauth_admin_user", `{}`)
+			if test.withBasic {
+				request.SetBasicAuth(test.username, test.password)
+			}
+			recorder := serveMCPPhase12Request(router, request)
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status=%d, want %d; body=%q", recorder.Code, test.wantStatus, recorder.Body.String())
+			}
+			var body map[string]interface{}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body["authorized"] != test.wantAuth {
+				t.Fatalf("authorized=%v, want %t", body["authorized"], test.wantAuth)
+			}
+		})
+	}
+}
+
+func testOAuthPhase3SymlinkRejection(t *testing.T, root string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Log("symlink rejection checks skipped on Windows")
+		return
+	}
+	outside := t.TempDir()
+	nestedLink := filepath.Join(root, "linked-directory")
+	if err := os.Symlink(outside, nestedLink); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := oauthWriteState(root, "linked-directory/state.json", `{"ok":true}`); err == nil {
+		t.Error("state write followed a directory symlink")
+	}
+
+	target := filepath.Join(outside, "target.json")
+	if err := os.WriteFile(target, []byte(`{"outside":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fileLink := filepath.Join(root, "linked-file.json")
+	if err := os.Symlink(target, fileLink); err != nil {
+		t.Fatal(err)
+	}
+	operations := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "read", run: func() error { _, err := oauthReadState(root, "linked-file.json"); return err }},
+		{name: "write", run: func() error { return oauthWriteState(root, "linked-file.json", `{"changed":true}`) }},
+		{name: "delete", run: func() error { return oauthDeleteState(root, "linked-file.json") }},
+		{name: "consume", run: func() error { _, err := oauthConsumeState(root, "linked-file.json"); return err }},
+	}
+	for _, operation := range operations {
+		if err := operation.run(); err == nil {
+			t.Errorf("%s accepted a symlink state file", operation.name)
+		}
+	}
+
+	realRoot := filepath.Join(outside, "real-root")
+	if err := os.Mkdir(realRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rootLink := filepath.Join(t.TempDir(), "state-root-link")
+	if err := os.Symlink(realRoot, rootLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := oauthWriteState(rootLink, "state.json", `{"ok":true}`); err == nil {
+		t.Error("state write accepted a symlink root")
+	}
+}
+
+func oauthPhase3EchoHookScript() string {
+	return `(function () {
+  var requestHeaders = nyanAllParams.headers || {};
+  var requestCookies = nyanAllParams.cookies || {};
+  return {
+    status: 207,
+    contentType: "application/json; charset=utf-8",
+    headers: {
+      "Cache-Control": "no-store",
+      "Pragma": "no-cache",
+      "Location": "https://client.example.test/callback",
+      "Set-Cookie": "phase3=ok; Secure; HttpOnly; SameSite=Lax"
+    },
+    body: {
+      hook: nyanAllParams.oauth_hook,
+      method: nyanAllParams.method,
+      path: nyanAllParams.path,
+      query: nyanAllParams.query || null,
+      form: nyanAllParams.form || null,
+      json: nyanAllParams.body || null,
+      authorization: requestHeaders.Authorization || "",
+      cookie: requestCookies.session || ""
+    }
+  };
+})()`
+}
+
+func assertOAuthPhase3EchoResponse(t *testing.T, recorder *httptest.ResponseRecorder, hook string) map[string]interface{} {
+	t.Helper()
+	if recorder.Code != http.StatusMultiStatus {
+		t.Fatalf("status=%d, want %d; body=%q", recorder.Code, http.StatusMultiStatus, recorder.Body.String())
+	}
+	if contentType := recorder.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "application/json") {
+		t.Fatalf("Content-Type=%q, want application/json", contentType)
+	}
+	if recorder.Header().Get("Cache-Control") != "no-store" || recorder.Header().Get("Location") != "https://client.example.test/callback" {
+		t.Fatalf("response headers = %#v", recorder.Header())
+	}
+	if !strings.Contains(recorder.Header().Get("Set-Cookie"), "phase3=ok") {
+		t.Fatalf("Set-Cookie=%q", recorder.Header().Get("Set-Cookie"))
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["hook"] != hook {
+		t.Fatalf("hook=%v, want %s; body=%#v", body["hook"], hook, body)
+	}
+	return body
+}
+
+func oauthPhase3NestedFirstString(body map[string]interface{}, group, key string) string {
+	nested, _ := body[group].(map[string]interface{})
+	values, _ := nested[key].([]interface{})
+	if len(values) == 0 {
+		return ""
+	}
+	value, _ := values[0].(string)
+	return value
+}
+
+func TestOAuthPhase4EndToEndWithRealHooksAndTool(t *testing.T) {
+	router, stateDirectory := newOAuthPhase4Fixture(t)
+	const (
+		adminUsername = "phase4-operator"
+		adminPassword = "Phase4OperatorPassword123"
+		username      = "phase4.user"
+		password      = "Phase4UserPassword123"
+		redirectURI   = "https://chatgpt.com/connector/oauth/phase4"
+		resource      = "https://nyan8.stamps.necomori.asia/server_mcp_http"
+	)
+	globalConfig.OAuthAdmin = OAuthAdminConfig{Username: adminUsername, Password: adminPassword}
+
+	adminRequest := newOAuthPhase4Request(http.MethodPost, "/oauth_admin_user", fmt.Sprintf(`{"username":%q,"password":%q}`, username, password), "application/json")
+	adminRequest.SetBasicAuth(adminUsername, adminPassword)
+	adminResponse := serveMCPPhase12Request(router, adminRequest)
+	if adminResponse.Code != http.StatusCreated {
+		t.Fatalf("admin bootstrap status=%d, want %d; body=%q", adminResponse.Code, http.StatusCreated, adminResponse.Body.String())
+	}
+	adminBody := oauthPhase4JSONBody(t, adminResponse)
+	if adminBody["username"] != username || adminBody["created"] != true {
+		t.Fatalf("admin bootstrap body=%#v", adminBody)
+	}
+	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, adminPassword)
+
+	registerBody := `{"redirect_uris":["https://chatgpt.com/connector/oauth/phase4"],"client_name":"Phase 4 integration client","token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"],"response_types":["code"],"scope":"nyan8:read"}`
+	registerResponse := serveMCPPhase12Request(router, newOAuthPhase4Request(http.MethodPost, "/oauth_register", registerBody, "application/json"))
+	if registerResponse.Code != http.StatusCreated {
+		t.Fatalf("DCR status=%d, want %d; body=%q", registerResponse.Code, http.StatusCreated, registerResponse.Body.String())
+	}
+	registration := oauthPhase4JSONBody(t, registerResponse)
+	clientID, _ := registration["client_id"].(string)
+	if !strings.HasPrefix(clientID, "cli_") || len(clientID) != len("cli_")+32 {
+		t.Fatalf("DCR client_id=%q, want cli_ plus 32 base64url characters", clientID)
+	}
+	if registration["scope"] != "nyan8:read" || registration["token_endpoint_auth_method"] != "none" {
+		t.Fatalf("DCR response=%#v", registration)
+	}
+	grantTypes, _ := registration["grant_types"].([]interface{})
+	if len(grantTypes) != 2 || grantTypes[0] != "authorization_code" || grantTypes[1] != "refresh_token" {
+		t.Fatalf("DCR grant_types=%#v", registration["grant_types"])
+	}
+	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, adminPassword)
+
+	verifier := strings.Repeat("v", 64)
+	code, csrf := oauthPhase4Authorize(t, router, stateDirectory, clientID, redirectURI, resource, "phase4-state-one", verifier, username, password)
+	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, adminPassword, csrf, code)
+
+	wrongVerifier := strings.Repeat("x", 64)
+	invalidPKCE := serveMCPPhase12Request(router, newOAuthPhase4TokenRequest(code, clientID, redirectURI, resource, wrongVerifier))
+	if invalidPKCE.Code != http.StatusBadRequest {
+		t.Fatalf("invalid PKCE status=%d, want %d; body=%q", invalidPKCE.Code, http.StatusBadRequest, invalidPKCE.Body.String())
+	}
+	if body := oauthPhase4JSONBody(t, invalidPKCE); body["error"] != "invalid_grant" {
+		t.Fatalf("invalid PKCE body=%#v", body)
+	}
+	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, adminPassword, csrf, code, wrongVerifier)
+
+	tokenResponse := serveMCPPhase12Request(router, newOAuthPhase4TokenRequest(code, clientID, redirectURI, resource, verifier))
+	accessToken := oauthPhase4AccessToken(t, tokenResponse)
+	tokenBody := oauthPhase4JSONBody(t, tokenResponse)
+	refreshToken, _ := tokenBody["refresh_token"].(string)
+	if !strings.HasPrefix(refreshToken, "rt_") || len(refreshToken) != len("rt_")+43 {
+		t.Fatalf("authorization-code token response has invalid refresh_token: %#v", tokenBody)
+	}
+	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, adminPassword, csrf, code, accessToken, refreshToken)
+
+	reusedCode := serveMCPPhase12Request(router, newOAuthPhase4TokenRequest(code, clientID, redirectURI, resource, verifier))
+	if reusedCode.Code != http.StatusBadRequest {
+		t.Fatalf("reused code status=%d, want %d; body=%q", reusedCode.Code, http.StatusBadRequest, reusedCode.Body.String())
+	}
+	if body := oauthPhase4JSONBody(t, reusedCode); body["error"] != "invalid_grant" {
+		t.Fatalf("reused code body=%#v", body)
+	}
+
+	refreshResponse := serveMCPPhase12Request(router, newOAuthPhase4RefreshRequest(refreshToken, clientID, resource, ""))
+	accessToken = oauthPhase4AccessToken(t, refreshResponse)
+	refreshBody := oauthPhase4JSONBody(t, refreshResponse)
+	rotatedRefreshToken, _ := refreshBody["refresh_token"].(string)
+	if !strings.HasPrefix(rotatedRefreshToken, "rt_") || rotatedRefreshToken == refreshToken {
+		t.Fatalf("refresh-token rotation response=%#v", refreshBody)
+	}
+	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, adminPassword, refreshToken, rotatedRefreshToken, accessToken)
+
+	toolBody := `{"jsonrpc":"2.0","id":"phase4-tool","method":"tools/call","params":{"name":"mcp_sample","arguments":{}}}`
+	unauthenticatedRequest := newOAuthPhase4Request(http.MethodPost, "/server_mcp_http", toolBody, "application/json")
+	unauthenticatedRequest.Header.Set("Accept", "application/json, text/event-stream")
+	unauthenticatedRequest.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+	unauthenticatedResponse := serveMCPPhase12Request(router, unauthenticatedRequest)
+	if unauthenticatedResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated Tool status=%d, want %d; body=%q", unauthenticatedResponse.Code, http.StatusUnauthorized, unauthenticatedResponse.Body.String())
+	}
+	wantChallenge := `Bearer resource_metadata="https://nyan8.stamps.necomori.asia/oauth_protected_resource_metadata", scope="nyan8:read", error="invalid_token", error_description="Authentication required."`
+	if got := unauthenticatedResponse.Header().Get("WWW-Authenticate"); got != wantChallenge {
+		t.Fatalf("HTTP WWW-Authenticate=%q, want %q", got, wantChallenge)
+	}
+	unauthenticatedBody := oauthPhase4JSONBody(t, unauthenticatedResponse)
+	result, _ := unauthenticatedBody["result"].(map[string]interface{})
+	meta, _ := result["_meta"].(map[string]interface{})
+	challenges, _ := meta["mcp/www_authenticate"].([]interface{})
+	if len(challenges) != 1 || challenges[0] != wantChallenge {
+		t.Fatalf("MCP challenges=%#v, want %#v", challenges, []interface{}{wantChallenge})
+	}
+
+	authenticatedRequest := newOAuthPhase4Request(http.MethodPost, "/server_mcp_http", toolBody, "application/json")
+	authenticatedRequest.Header.Set("Accept", "application/json, text/event-stream")
+	authenticatedRequest.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+	authenticatedRequest.Header.Set("Authorization", "Bearer "+accessToken)
+	authenticatedRequest.Header.Set("X-Phase4-Raw", "phase4-raw-header-secret")
+	authenticatedResponse := serveMCPPhase12Request(router, authenticatedRequest)
+	if authenticatedResponse.Code != http.StatusOK {
+		t.Fatalf("authenticated Tool status=%d, want %d; body=%q", authenticatedResponse.Code, http.StatusOK, authenticatedResponse.Body.String())
+	}
+
+	reusedRefresh := serveMCPPhase12Request(router, newOAuthPhase4RefreshRequest(refreshToken, clientID, resource, ""))
+	if reusedRefresh.Code != http.StatusBadRequest || oauthPhase4JSONBody(t, reusedRefresh)["error"] != "invalid_grant" {
+		t.Fatalf("reused refresh token status=%d body=%q", reusedRefresh.Code, reusedRefresh.Body.String())
+	}
+	revokedFamilyRequest := newOAuthPhase4Request(http.MethodPost, "/server_mcp_http", toolBody, "application/json")
+	revokedFamilyRequest.Header.Set("Accept", "application/json, text/event-stream")
+	revokedFamilyRequest.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+	revokedFamilyRequest.Header.Set("Authorization", "Bearer "+accessToken)
+	revokedFamilyResponse := serveMCPPhase12Request(router, revokedFamilyRequest)
+	if revokedFamilyResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("refresh-token family replay did not revoke access token: status=%d body=%q", revokedFamilyResponse.Code, revokedFamilyResponse.Body.String())
+	}
+	authenticatedBody := oauthPhase4JSONBody(t, authenticatedResponse)
+	authenticatedResult, _ := authenticatedBody["result"].(map[string]interface{})
+	structured, _ := authenticatedResult["structuredContent"].(map[string]interface{})
+	if structured["ok"] != true || structured["service"] != "Nyan8" || !reflect.DeepEqual(structured["items"], []interface{}{float64(1), float64(2), float64(3)}) {
+		t.Fatalf("structuredContent=%#v", structured)
+	}
+	if authenticatedResult["isError"] != false {
+		t.Fatalf("authenticated Tool result=%#v", authenticatedResult)
+	}
+
+	parallelVerifier := strings.Repeat("p", 64)
+	parallelCode, parallelCSRF := oauthPhase4Authorize(t, router, stateDirectory, clientID, redirectURI, resource, "phase4-state-parallel", parallelVerifier, username, password)
+	parallelToken := oauthPhase4ConcurrentTokenExchange(t, router, parallelCode, clientID, redirectURI, resource, parallelVerifier)
+	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, adminPassword, csrf, code, accessToken, parallelCSRF, parallelCode, parallelToken, "phase4-raw-header-secret")
+}
+
+func loadOAuthPhase4TestConfig(t *testing.T, stateDirectory string, serverScopes, toolScopes []string) *apiConfigLoadResult {
+	t.Helper()
+	if len(serverScopes) == 0 {
+		serverScopes = []string{"nyan8:read"}
+	}
+	if len(toolScopes) == 0 {
+		toolScopes = []string{"nyan8:read"}
+	}
+	dir := t.TempDir()
+	hookSourcePath := strings.TrimSpace(os.Getenv("NYAN8_OAUTH_HOOK_TEST_PATH"))
+	if hookSourcePath == "" {
+		t.Skip("OAuth policy E2E requires NYAN8_OAUTH_HOOK_TEST_PATH")
+	}
+	hookSource, err := os.ReadFile(hookSourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "oauth_policy_fixture.js"), hookSource, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "mcp_sample.js"), []byte(`({ok: true, service: "Nyan8", items: [1, 2, 3]});`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "mcp_sample_input.js"), []byte(`const nyanInputSchema={type:"object",properties:{},additionalProperties:false}; ({success:true,status:200,result:{}});`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "mcp_sample_output.js"), []byte(`const nyanOutputSchema={type:"object",properties:{ok:{type:"boolean"},service:{const:"Nyan8"},items:{type:"array",items:{type:"integer"}}},required:["ok","service","items"],additionalProperties:false}; ({success:true,status:200,result:{}});`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	definitions := map[string]interface{}{
+		"mcp_sample": map[string]interface{}{
+			"script":          "./mcp_sample.js",
+			"paramCheck":      "./mcp_sample_input.js",
+			"outCheck":        "./mcp_sample_output.js",
+			"title":           "Nyan8 test data",
+			"description":     "Returns fixed data for MCP tests.",
+			"websocket":       false,
+			"securitySchemes": []interface{}{map[string]interface{}{"type": "oauth2", "scopes": toolScopes}},
+			"annotations":     map[string]interface{}{"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false},
+		},
+		"oauth_authorization_server_metadata": map[string]interface{}{"description": "OAuth authorization server metadata"},
+		"oauth_protected_resource_metadata":   map[string]interface{}{"description": "OAuth protected resource metadata"},
+		"oauth_authorize":                     map[string]interface{}{"script": "./oauth_policy_fixture.js"},
+		"oauth_token":                         map[string]interface{}{"script": "./oauth_policy_fixture.js"},
+		"oauth_register":                      map[string]interface{}{"script": "./oauth_policy_fixture.js"},
+		"oauth_admin_user":                    map[string]interface{}{"script": "./oauth_policy_fixture.js"},
+		"oauth_verify_access":                 map[string]interface{}{"script": "./oauth_policy_fixture.js", "scopes": serverScopes},
+		"server_mcp_http": map[string]interface{}{
+			"type":                       "mcp",
+			"transport":                  "streamable_http",
+			"protocolVersions":           []string{mcpProtocol20251125, mcpProtocol20250618},
+			"allowedOrigins":             []string{"https://chatgpt.com", "https://platform.openai.com"},
+			"redirectURIAllowedPrefixes": []string{"https://chatgpt.com/connector/oauth/"},
+			"rateLimit":                  map[string]interface{}{"requests": 120, "window": "1m"},
+			"maxConcurrent":              8,
+			"oauth": map[string]interface{}{
+				"authorizationServerMetadata": "oauth_authorization_server_metadata",
+				"protectedResourceMetadata":   "oauth_protected_resource_metadata",
+				"authorize":                   "oauth_authorize",
+				"token":                       "oauth_token",
+				"register":                    "oauth_register",
+				"adminUser":                   "oauth_admin_user",
+				"verifyAccess":                "oauth_verify_access",
+			},
+			"tools":        []interface{}{"mcp_sample"},
+			"instructions": "Nyan8 MCP test server.",
+		},
+	}
+	data, err := json.Marshal(definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiPath := filepath.Join(dir, "api.json")
+	if err := os.WriteFile(apiPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readAPIConfigFile(apiPath, dir)
+	if err != nil {
+		t.Fatalf("load OAuth test fixture: %v", err)
+	}
+	mcp := loaded.Snapshot.MCPServers["server_mcp_http"]
+	if stateDirectory != "" && mcp != nil {
+		mcp.OAuth.StateDirectory = stateDirectory
+	}
+	return loaded
+}
+
+func newOAuthPhase4Fixture(t *testing.T) (http.Handler, string) {
+	t.Helper()
+	stateDirectory := filepath.Join(t.TempDir(), "oauth-state")
+	loaded := loadOAuthPhase4TestConfig(t, stateDirectory, nil, nil)
+	mcp := loaded.Snapshot.MCPServers["server_mcp_http"]
+	if mcp == nil || mcp.OAuth.StateDirectory == "" {
+		t.Fatalf("fixture MCP=%v", mcp)
+	}
+	stateDirectory = mcp.OAuth.StateDirectory
+	router := publishMCPPhase12Snapshot(t, loaded)
+
+	guardPath := filepath.Join(t.TempDir(), "phase4_tool_argument_guard.js")
+	writeHotReloadTestFile(t, guardPath, `(function () {
+  var serialized = JSON.stringify(nyanAllParams);
+  var names = Object.keys(nyanAllParams);
+  for (var index = 0; index < names.length; index += 1) {
+    var normalized = names[index].toLowerCase();
+    if (normalized === "authorization" || normalized === "headers" || normalized.indexOf("_headers") === 0) {
+      throw new Error("HTTP authorization or headers reached the Tool backing API");
+    }
+  }
+  if (serialized.indexOf("Bearer ") >= 0 || serialized.indexOf("phase4-raw-header-secret") >= 0) {
+    throw new Error("raw HTTP header value reached the Tool backing API");
+  }
+})();`)
+	globalConfig.JavaScriptInclude = []string{guardPath}
+	return router, stateDirectory
+}
+
+func newOAuthPhase4Request(method, path, body, contentType string) *http.Request {
+	request := httptest.NewRequest(method, "https://nyan8.stamps.necomori.asia"+path, strings.NewReader(body))
+	request.Host = "nyan8.stamps.necomori.asia"
+	if contentType != "" {
+		request.Header.Set("Content-Type", contentType)
+	}
+	request.Header.Set("Accept", "application/json")
+	return request
+}
+
+func oauthPhase4JSONBody(t *testing.T, recorder *httptest.ResponseRecorder) map[string]interface{} {
+	t.Helper()
+	var body map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode status=%d JSON body %q: %v", recorder.Code, recorder.Body.String(), err)
+	}
+	return body
+}
+
+func oauthPhase4Authorize(t *testing.T, router http.Handler, stateDirectory, clientID, redirectURI, resource, state, verifier, username, password string) (string, string) {
+	t.Helper()
+	authorizePath := "/oauth_authorize?response_type=code" +
+		"&client_id=" + clientID +
+		"&redirect_uri=https%3A%2F%2Fchatgpt.com%2Fconnector%2Foauth%2Fphase4" +
+		"&resource=https%3A%2F%2Fnyan8.stamps.necomori.asia%2Fserver_mcp_http" +
+		"&scope=nyan8%3Aread" +
+		"&state=" + state +
+		"&code_challenge=" + sha256Base64URL(verifier) +
+		"&code_challenge_method=S256"
+	getResponse := serveMCPPhase12Request(router, newOAuthPhase4Request(http.MethodGet, authorizePath, "", ""))
+	if getResponse.Code != http.StatusOK {
+		t.Fatalf("authorize GET status=%d, want %d; body=%q", getResponse.Code, http.StatusOK, getResponse.Body.String())
+	}
+	if contentType := getResponse.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/html") {
+		t.Fatalf("authorize GET Content-Type=%q, want text/html", contentType)
+	}
+	requestID := oauthPhase4HiddenValue(t, getResponse.Body.String(), "request_id")
+	csrf := oauthPhase4HiddenValue(t, getResponse.Body.String(), "csrf")
+	if !strings.HasPrefix(requestID, "req_") || len(requestID) != len("req_")+32 || len(csrf) != 43 {
+		t.Fatalf("authorize hidden request_id/CSRF=%q/%q", requestID, csrf)
+	}
+	csrfCookieName := "nyan8_oauth_csrf_" + sha256Base64URL(requestID)
+	var csrfCookie *http.Cookie
+	for _, cookie := range getResponse.Result().Cookies() {
+		if cookie.Name == csrfCookieName {
+			csrfCookie = cookie
+			break
+		}
+	}
+	if csrfCookie == nil || csrfCookie.Value != csrf || csrfCookie.Path != "/oauth_authorize" || !csrfCookie.HttpOnly || !csrfCookie.Secure || csrfCookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("authorize CSRF cookie=%#v, hidden CSRF=%q", csrfCookie, csrf)
+	}
+	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, csrf)
+
+	form := "request_id=" + requestID + "&csrf=" + csrf + "&decision=allow&username=" + username + "&password=" + password
+	postRequest := newOAuthPhase4Request(http.MethodPost, "/oauth_authorize", form, "application/x-www-form-urlencoded")
+	postRequest.AddCookie(csrfCookie)
+	postResponse := serveMCPPhase12Request(router, postRequest)
+	if postResponse.Code != http.StatusSeeOther {
+		t.Fatalf("authorize POST status=%d, want %d; body=%q", postResponse.Code, http.StatusSeeOther, postResponse.Body.String())
+	}
+	location, err := postResponse.Result().Location()
+	if err != nil {
+		t.Fatalf("authorize redirect Location=%q: %v", postResponse.Header().Get("Location"), err)
+	}
+	if location.Scheme+"://"+location.Host+location.Path != redirectURI || location.Query().Get("state") != state {
+		t.Fatalf("authorize redirect=%q", location.String())
+	}
+	code := location.Query().Get("code")
+	if !strings.HasPrefix(code, "code_") || len(code) != len("code_")+43 {
+		t.Fatalf("authorization code=%q", code)
+	}
+	if cookie := postResponse.Header().Get("Set-Cookie"); !strings.Contains(cookie, csrfCookieName+"=") || !strings.Contains(cookie, "Max-Age=0") {
+		t.Fatalf("authorize POST did not clear CSRF cookie: %q", cookie)
+	}
+	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, csrf, code)
+	return code, csrf
+}
+
+func oauthPhase4HiddenValue(t *testing.T, body, name string) string {
+	t.Helper()
+	prefix := `name="` + name + `" value="`
+	start := strings.Index(body, prefix)
+	if start < 0 {
+		t.Fatalf("hidden input %q not found in %q", name, body)
+	}
+	valueStart := start + len(prefix)
+	valueEnd := strings.Index(body[valueStart:], `"`)
+	if valueEnd < 0 {
+		t.Fatalf("hidden input %q has no closing quote", name)
+	}
+	return body[valueStart : valueStart+valueEnd]
+}
+
+func newOAuthPhase4TokenRequest(code, clientID, redirectURI, resource, verifier string) *http.Request {
+	form := "grant_type=authorization_code" +
+		"&code=" + code +
+		"&client_id=" + clientID +
+		"&redirect_uri=https%3A%2F%2Fchatgpt.com%2Fconnector%2Foauth%2Fphase4" +
+		"&resource=https%3A%2F%2Fnyan8.stamps.necomori.asia%2Fserver_mcp_http" +
+		"&code_verifier=" + verifier
+	if redirectURI != "https://chatgpt.com/connector/oauth/phase4" || resource != "https://nyan8.stamps.necomori.asia/server_mcp_http" {
+		panic("Phase 4 token request received an unexpected redirect URI or resource")
+	}
+	return newOAuthPhase4Request(http.MethodPost, "/oauth_token", form, "application/x-www-form-urlencoded")
+}
+
+func newOAuthPhase4RefreshRequest(refreshToken, clientID, resource, scope string) *http.Request {
+	form := "grant_type=refresh_token" +
+		"&refresh_token=" + url.QueryEscape(refreshToken) +
+		"&client_id=" + url.QueryEscape(clientID) +
+		"&resource=" + url.QueryEscape(resource)
+	if scope != "" {
+		form += "&scope=" + url.QueryEscape(scope)
+	}
+	return newOAuthPhase4Request(http.MethodPost, "/oauth_token", form, "application/x-www-form-urlencoded")
+}
+
+func oauthPhase4AccessToken(t *testing.T, recorder *httptest.ResponseRecorder) string {
+	t.Helper()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("token status=%d, want %d; body=%q", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	body := oauthPhase4JSONBody(t, recorder)
+	token, _ := body["access_token"].(string)
+	if !strings.HasPrefix(token, "tok_") || len(token) != len("tok_")+43 || body["token_type"] != "Bearer" || body["scope"] != "nyan8:read" {
+		t.Fatalf("token response=%#v", body)
+	}
+	return token
+}
+
+func oauthPhase4ConcurrentTokenExchange(t *testing.T, router http.Handler, code, clientID, redirectURI, resource, verifier string) string {
+	t.Helper()
+	type exchangeResult struct {
+		status     int
+		body       []byte
+		retryAfter string
+	}
+	const contenders = 12
+	start := make(chan struct{})
+	results := make(chan exchangeResult, contenders)
+	var wait sync.WaitGroup
+	for index := 0; index < contenders; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			response := serveMCPPhase12Request(router, newOAuthPhase4TokenRequest(code, clientID, redirectURI, resource, verifier))
+			results <- exchangeResult{status: response.Code, body: append([]byte(nil), response.Body.Bytes()...), retryAfter: response.Header().Get("Retry-After")}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+
+	successes := 0
+	invalidGrants := 0
+	busyResponses := 0
+	accessToken := ""
+	for result := range results {
+		switch result.status {
+		case http.StatusOK:
+			successes++
+			var body map[string]interface{}
+			if err := json.Unmarshal(result.body, &body); err != nil {
+				t.Fatalf("decode concurrent success %q: %v", result.body, err)
+			}
+			accessToken, _ = body["access_token"].(string)
+		case http.StatusBadRequest:
+			invalidGrants++
+			var body map[string]interface{}
+			if err := json.Unmarshal(result.body, &body); err != nil || body["error"] != "invalid_grant" {
+				t.Errorf("concurrent loser body=%q err=%v", result.body, err)
+			}
+		case http.StatusServiceUnavailable:
+			busyResponses++
+			var body map[string]interface{}
+			if err := json.Unmarshal(result.body, &body); err != nil || body["error"] != "OAuth endpoint is busy" || result.retryAfter != "1" {
+				t.Errorf("concurrent busy body=%q Retry-After=%q err=%v", result.body, result.retryAfter, err)
+			}
+		default:
+			t.Errorf("concurrent exchange status=%d body=%q", result.status, result.body)
+		}
+	}
+	if successes != 1 || invalidGrants < 1 || successes+invalidGrants+busyResponses != contenders || !strings.HasPrefix(accessToken, "tok_") {
+		t.Fatalf("concurrent exchanges successes=%d invalid_grants=%d busy=%d token=%q, want one success and at least one invalid_grant", successes, invalidGrants, busyResponses, accessToken)
+	}
+	return accessToken
+}
+
+func assertOAuthPhase4StateSecretsAbsent(t *testing.T, stateDirectory string, secrets ...string) {
+	t.Helper()
+	if err := filepath.Walk(stateDirectory, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+			t.Errorf("OAuth state file %s mode=%04o, want 0600", path, info.Mode().Perm())
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if !json.Valid(data) {
+			t.Errorf("OAuth state file %s is not valid JSON: %q", path, data)
+		}
+		for _, secret := range secrets {
+			if secret == "" {
+				continue
+			}
+			if strings.Contains(path, secret) || bytes.Contains(data, []byte(secret)) {
+				t.Errorf("OAuth state file %s contains plaintext secret %q", path, secret)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walk OAuth state directory: %v", err)
+	}
+}
+
+func TestMCPPhase2GapOptionsAndCORS(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+
+	tests := []struct {
+		name        string
+		path        string
+		wantMethods string
+		wantHeaders []string
+	}{
+		{
+			name:        "MCP",
+			path:        "/custom-mcp",
+			wantMethods: "POST, OPTIONS",
+			wantHeaders: []string{"Authorization", "MCP-Protocol-Version"},
+		},
+		{
+			name:        "OAuth",
+			path:        "/oauth_token",
+			wantMethods: "GET, POST, OPTIONS",
+			wantHeaders: []string{"Authorization", "Content-Type"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := newMCPPhase12Request(http.MethodOptions, test.path, "")
+			request.Header.Set("Origin", "https://chatgpt.com")
+			response := serveMCPPhase12Request(router, request)
+			if response.Code != http.StatusNoContent || response.Body.Len() != 0 {
+				t.Fatalf("OPTIONS status=%d body=%q, want 204 with empty body", response.Code, response.Body.String())
+			}
+			if got := response.Header().Get("Access-Control-Allow-Origin"); got != "https://chatgpt.com" {
+				t.Fatalf("Access-Control-Allow-Origin=%q", got)
+			}
+			if got := response.Header().Get("Access-Control-Allow-Methods"); got != test.wantMethods {
+				t.Fatalf("Access-Control-Allow-Methods=%q, want %q", got, test.wantMethods)
+			}
+			for _, header := range test.wantHeaders {
+				if !strings.Contains(response.Header().Get("Access-Control-Allow-Headers"), header) {
+					t.Errorf("Access-Control-Allow-Headers=%q, want %s", response.Header().Get("Access-Control-Allow-Headers"), header)
+				}
+			}
+			if response.Header().Get("Vary") != "Origin" || response.Header().Get("Cache-Control") != "no-store" {
+				t.Errorf("OPTIONS headers=%#v", response.Header())
+			}
+		})
+	}
+}
+
+func TestMCPPhase2GapSubsequentRequestRequiresKnownVersionHeader(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+	body := `{"jsonrpc":"2.0","id":"phase2-version","method":"ping","params":{}}`
+	for _, test := range []struct {
+		name    string
+		version string
+	}{
+		{name: "missing"},
+		{name: "unknown", version: "2099-01-01"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := newMCPPhase12Request(http.MethodPost, "/custom-mcp", body)
+			if test.version != "" {
+				request.Header.Set("MCP-Protocol-Version", test.version)
+			}
+			response := serveMCPPhase12Request(router, request)
+			if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "missing or unsupported") {
+				t.Fatalf("status=%d body=%q, want unsupported version rejection", response.Code, response.Body.String())
+			}
+			if got := response.Header().Get("MCP-Protocol-Version"); got != "" {
+				t.Fatalf("rejected response MCP-Protocol-Version=%q", got)
+			}
+		})
+	}
+}
+
+func TestMCPPhase2GapRateLimitAndExecutionBusy(t *testing.T) {
+	t.Run("rate limit", func(t *testing.T) {
+		dir, definitions := newMCPPhase12Definitions(t)
+		mcp := definitions["custom-mcp"].(map[string]interface{})
+		mcp["rateLimit"] = map[string]interface{}{"requests": 1, "window": "1m"}
+		loaded, err := loadMCPPhase12Config(dir, definitions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		router := publishMCPPhase12Snapshot(t, loaded)
+		for attempt := 1; attempt <= 2; attempt++ {
+			request := newMCPPhase12Request(http.MethodPost, "/custom-mcp", `{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}`)
+			request.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+			response := serveMCPPhase12Request(router, request)
+			if attempt == 1 && response.Code != http.StatusOK {
+				t.Fatalf("first request status=%d body=%q", response.Code, response.Body.String())
+			}
+			if attempt == 2 && (response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") == "") {
+				t.Fatalf("second request status=%d Retry-After=%q body=%q", response.Code, response.Header().Get("Retry-After"), response.Body.String())
+			}
+		}
+	})
+
+	t.Run("MCP busy", func(t *testing.T) {
+		dir, definitions := newMCPPhase12Definitions(t)
+		mcp := definitions["custom-mcp"].(map[string]interface{})
+		mcp["maxConcurrent"] = 1
+		loaded, err := loadMCPPhase12Config(dir, definitions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		router := publishMCPPhase12Snapshot(t, loaded)
+		release, acquired := acquireMCPExecutionSlot("custom-mcp", 1)
+		if !acquired {
+			t.Fatal("failed to occupy MCP execution slot")
+		}
+		defer release()
+		request := newMCPPhase12Request(http.MethodPost, "/custom-mcp", `{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}`)
+		request.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+		response := serveMCPPhase12Request(router, request)
+		if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") != "1" || !strings.Contains(response.Body.String(), "MCP server is busy") {
+			t.Fatalf("status=%d Retry-After=%q body=%q", response.Code, response.Header().Get("Retry-After"), response.Body.String())
+		}
+	})
+
+	t.Run("OAuth busy", func(t *testing.T) {
+		dir, definitions := newMCPPhase12Definitions(t)
+		mcp := definitions["custom-mcp"].(map[string]interface{})
+		mcp["maxConcurrent"] = 1
+		loaded, err := loadMCPPhase12Config(dir, definitions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		router := publishMCPPhase12Snapshot(t, loaded)
+		release, acquired := acquireMCPExecutionSlot("custom-mcp:oauth:oauthToken", 1)
+		if !acquired {
+			t.Fatal("failed to occupy OAuth execution slot")
+		}
+		defer release()
+		request := newMCPPhase12Request(http.MethodPost, "/oauth_token", "grant_type=authorization_code")
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response := serveMCPPhase12Request(router, request)
+		if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") != "1" || !strings.Contains(response.Body.String(), "OAuth endpoint is busy") {
+			t.Fatalf("status=%d Retry-After=%q body=%q", response.Code, response.Header().Get("Retry-After"), response.Body.String())
+		}
+	})
+}
+
+func TestMCPPhase2GapAuthenticationPrecedesInputValidation(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+	response := mcpPhase2GapToolCall(router, `{"unexpected":true}`, "")
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d, want authentication failure before schema validation; body=%q", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "inputSchema") || response.Header().Get("WWW-Authenticate") == "" {
+		t.Fatalf("authentication-first response headers=%#v body=%q", response.Header(), response.Body.String())
+	}
+}
+
+func TestMCPPhase2GapToolValidationAndReservedParameters(t *testing.T) {
+	t.Run("input schema", func(t *testing.T) {
+		router := newMCPPhase2GapAuthenticatedFixture(t, nil)
+		response := mcpPhase2GapToolCall(router, `{"unexpected":true}`, "Bearer phase2")
+		assertMCPPhase2GapToolError(t, response, "Tool arguments do not match inputSchema.")
+	})
+
+	t.Run("output schema", func(t *testing.T) {
+		router := newMCPPhase2GapAuthenticatedFixture(t, func(dir string, _ map[string]interface{}) {
+			writeHotReloadTestFile(t, filepath.Join(dir, "sample.js"), `({ok:"wrong",service:"Nyan8",items:[1,2,3]});`)
+		})
+		response := mcpPhase2GapToolCall(router, `{}`, "Bearer phase2")
+		assertMCPPhase2GapToolError(t, response, "Tool result does not match outputSchema.")
+	})
+
+	t.Run("reserved parameters", func(t *testing.T) {
+		router := newMCPPhase2GapAuthenticatedFixture(t, func(dir string, definitions map[string]interface{}) {
+			path := filepath.Join(dir, "allow-any-input.js")
+			writeHotReloadTestFile(t, path, `const nyanInputSchema={type:"object",additionalProperties:true}; ({success:true,status:200,result:{}});`)
+			definitions["sample"].(map[string]interface{})["paramCheck"] = path
+		})
+		for _, key := range []string{"api", "mcp_principal", "mcp_tool", "_headers_raw", "_remote_address"} {
+			response := mcpPhase2GapToolCall(router, fmt.Sprintf(`{%q:"attacker"}`, key), "Bearer phase2")
+			assertMCPPhase2GapToolError(t, response, "Tool arguments contain a reserved parameter.")
+		}
+	})
+}
+
+func TestMCPPhase2GapToolAndResponseSizeLimits(t *testing.T) {
+	if maxMCPToolResultBytes != 2<<20 || maxMCPResponseBytes != 4<<20 {
+		t.Fatalf("size limits Tool/MCP=%d/%d, want 2MiB/4MiB", maxMCPToolResultBytes, maxMCPResponseBytes)
+	}
+
+	t.Run("Tool result over 2 MiB", func(t *testing.T) {
+		router := newMCPPhase2GapAuthenticatedFixture(t, func(dir string, _ map[string]interface{}) {
+			script := fmt.Sprintf(`JSON.stringify({ok:true,service:"Nyan8",items:[],padding:"x".repeat(%d)});`, maxMCPToolResultBytes+1)
+			writeHotReloadTestFile(t, filepath.Join(dir, "sample.js"), script)
+		})
+		response := mcpPhase2GapToolCall(router, `{}`, "Bearer phase2")
+		assertMCPPhase2GapToolError(t, response, "Tool result is too large.")
+	})
+
+	t.Run("MCP response over 4 MiB", func(t *testing.T) {
+		gin.SetMode(gin.TestMode)
+		recorder := httptest.NewRecorder()
+		context, _ := gin.CreateTestContext(recorder)
+		mcpWriteHTTPResult(context, json.RawMessage(`"oversized"`), http.StatusOK, map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      "oversized",
+			"result":  strings.Repeat("x", maxMCPResponseBytes),
+		})
+		if recorder.Code != http.StatusInternalServerError || !strings.Contains(recorder.Body.String(), "MCP response is too large") || recorder.Body.Len() >= maxMCPResponseBytes {
+			t.Fatalf("status=%d bytes=%d body-prefix=%q", recorder.Code, recorder.Body.Len(), recorder.Body.String())
+		}
+	})
+}
+
+func TestMCPPhase2GapRequestUsesCapturedSnapshot(t *testing.T) {
+	oldDir, oldDefinitions := newMCPPhase12Definitions(t)
+	writeHotReloadTestFile(t, filepath.Join(oldDir, "oauth-hook.js"), mcpPhase2GapAuthenticatedHook())
+	writeHotReloadTestFile(t, filepath.Join(oldDir, "sample.js"), `({generation:"old"});`)
+	delete(oldDefinitions["sample"].(map[string]interface{}), "outCheck")
+	oldLoaded, err := loadMCPPhase12Config(oldDir, oldDefinitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newDir, newDefinitions := newMCPPhase12Definitions(t)
+	writeHotReloadTestFile(t, filepath.Join(newDir, "oauth-hook.js"), mcpPhase2GapAuthenticatedHook())
+	writeHotReloadTestFile(t, filepath.Join(newDir, "sample.js"), `({generation:"new"});`)
+	delete(newDefinitions["sample"].(map[string]interface{}), "outCheck")
+	newLoaded, err := loadMCPPhase12Config(newDir, newDefinitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishMCPPhase12Snapshot(t, newLoaded)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/custom-mcp", func(c *gin.Context) {
+		handleMCPHTTP(c, oldLoaded.Snapshot, oldLoaded.Snapshot.MCPServers["custom-mcp"])
+	})
+	response := mcpPhase2GapToolCall(router, `{}`, "Bearer phase2")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+	}
+	body := oauthPhase4JSONBody(t, response)
+	result, _ := body["result"].(map[string]interface{})
+	structured, _ := result["structuredContent"].(map[string]interface{})
+	if structured["generation"] != "old" {
+		t.Fatalf("structuredContent=%#v, want captured old snapshot while current snapshot is new", structured)
+	}
+}
+
+func TestMCPPhase2GapStartupAPIRouteRedispatchesToReloadedMCP(t *testing.T) {
+	initTestLogger()
+	gin.SetMode(gin.TestMode)
+	dir, definitions := newMCPPhase12Definitions(t)
+	apiPath := filepath.Join(dir, "api.json")
+	initialDefinitions := map[string]interface{}{
+		"custom-mcp": map[string]interface{}{"script": "./sample.js"},
+	}
+	initialData, err := json.Marshal(initialDefinitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(apiPath, initialData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	servicePaths.API.Path = apiPath
+	setAPIFiles(apiPath, initialDefinitions)
+	t.Cleanup(func() {
+		setAPIFiles("", nil)
+		servicePaths = serviceFilePaths{}
+	})
+	router := gin.New()
+	if err := registerDynamicEndpoints(router, dir); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishMCPPhase12Snapshot(t, loaded)
+
+	request := newMCPPhase12Request(http.MethodPost, "/custom-mcp", `{"jsonrpc":"2.0","id":"reloaded","method":"ping","params":{}}`)
+	request.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+	response := serveMCPPhase12Request(router, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"result":{}`) {
+		t.Fatalf("reused startup API route status=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
+func TestMCPPhase2GapRejectsHeaderUnsafeScope(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	definitions["oauth_verify_access"].(map[string]interface{})["scopes"] = []interface{}{`nyan8:read"`}
+	_, err := loadMCPPhase12Config(dir, definitions)
+	if err == nil || !strings.Contains(err.Error(), "invalid OAuth scope") {
+		t.Fatalf("unsafe scope load error=%v", err)
+	}
+}
+
+func newMCPPhase2GapAuthenticatedFixture(t *testing.T, mutate func(string, map[string]interface{})) http.Handler {
+	t.Helper()
+	dir, definitions := newMCPPhase12Definitions(t)
+	writeHotReloadTestFile(t, filepath.Join(dir, "oauth-hook.js"), mcpPhase2GapAuthenticatedHook())
+	if mutate != nil {
+		mutate(dir, definitions)
+	}
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return publishMCPPhase12Snapshot(t, loaded)
+}
+
+func mcpPhase2GapAuthenticatedHook() string {
+	return `({authenticated:true,forbidden:false,principal:{user_id:"phase2",client_id:"phase2-client",scope:"nyan8:read",scopes:["nyan8:read"]}});`
+}
+
+func mcpPhase2GapToolCall(router http.Handler, argumentsJSON, authorization string) *httptest.ResponseRecorder {
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":"phase2-tool","method":"tools/call","params":{"name":"sample","arguments":%s}}`, argumentsJSON)
+	request := newMCPPhase12Request(http.MethodPost, "/custom-mcp", body)
+	request.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+	if authorization != "" {
+		request.Header.Set("Authorization", authorization)
+	}
+	return serveMCPPhase12Request(router, request)
+}
+
+func assertMCPPhase2GapToolError(t *testing.T, response *httptest.ResponseRecorder, wantText string) {
+	t.Helper()
+	if response.Code != http.StatusOK {
+		t.Fatalf("Tool error status=%d body=%q", response.Code, response.Body.String())
+	}
+	body := oauthPhase4JSONBody(t, response)
+	result, _ := body["result"].(map[string]interface{})
+	content, _ := result["content"].([]interface{})
+	if result["isError"] != true || len(content) != 1 {
+		t.Fatalf("Tool error result=%#v", result)
+	}
+	entry, _ := content[0].(map[string]interface{})
+	if entry["text"] != wantText {
+		t.Fatalf("Tool error text=%v, want %q; result=%#v", entry["text"], wantText, result)
+	}
+}
+
+type oauthPhase4NegativeFixture struct {
+	router         http.Handler
+	stateDirectory string
+	clientID       string
+	username       string
+	password       string
+	redirectURI    string
+	resource       string
+}
+
+type oauthPhase4PendingAuthorization struct {
+	requestID string
+	csrf      string
+	cookie    *http.Cookie
+	state     string
+	verifier  string
+}
+
+func TestOAuthPhase4NegativeCSRFDoesNotConsumeAuthorizationRequest(t *testing.T) {
+	fixture := newOAuthPhase4NegativeFixture(t, nil, nil)
+	pending := oauthPhase4NegativeBeginAuthorization(t, fixture, "phase4-csrf-state", strings.Repeat("c", 64))
+
+	missingCookie := newOAuthPhase4NegativeAuthorizationPost(fixture, pending, pending.csrf, nil)
+	missingResponse := serveMCPPhase12Request(fixture.router, missingCookie)
+	assertOAuthPhase4NegativeError(t, missingResponse, http.StatusBadRequest, "invalid_request")
+
+	wrongCSRF := strings.Repeat("z", 43)
+	wrongCookie := &http.Cookie{Name: pending.cookie.Name, Value: wrongCSRF}
+	mismatchedRequest := newOAuthPhase4NegativeAuthorizationPost(fixture, pending, wrongCSRF, wrongCookie)
+	mismatchedResponse := serveMCPPhase12Request(fixture.router, mismatchedRequest)
+	assertOAuthPhase4NegativeError(t, mismatchedResponse, http.StatusBadRequest, "invalid_request")
+
+	validResponse := serveMCPPhase12Request(fixture.router, newOAuthPhase4NegativeAuthorizationPost(fixture, pending, pending.csrf, pending.cookie))
+	code := oauthPhase4NegativeAuthorizationCode(t, validResponse, fixture.redirectURI, pending.state)
+	if code == "" {
+		t.Fatal("valid CSRF retry did not produce a code")
+	}
+}
+
+func TestOAuthPhase4NegativeBindingMismatchesDoNotConsumeCode(t *testing.T) {
+	fixture := newOAuthPhase4NegativeFixture(t, nil, nil)
+	verifier := strings.Repeat("b", 64)
+	code, _ := oauthPhase4Authorize(t, fixture.router, fixture.stateDirectory, fixture.clientID, fixture.redirectURI, fixture.resource, "phase4-binding-state", verifier, fixture.username, fixture.password)
+
+	tests := []struct {
+		name        string
+		clientID    string
+		redirectURI string
+		resource    string
+	}{
+		{name: "client", clientID: fixture.clientID + "x", redirectURI: fixture.redirectURI, resource: fixture.resource},
+		{name: "redirect", clientID: fixture.clientID, redirectURI: "https://chatgpt.com/connector/oauth/other", resource: fixture.resource},
+		{name: "resource", clientID: fixture.clientID, redirectURI: fixture.redirectURI, resource: "https://nyan8.stamps.necomori.asia/not-mcp"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := serveMCPPhase12Request(fixture.router, newOAuthPhase4NegativeTokenRequest(code, test.clientID, test.redirectURI, test.resource, verifier))
+			assertOAuthPhase4NegativeError(t, response, http.StatusBadRequest, "invalid_grant")
+		})
+	}
+
+	validResponse := serveMCPPhase12Request(fixture.router, newOAuthPhase4NegativeTokenRequest(code, fixture.clientID, fixture.redirectURI, fixture.resource, verifier))
+	if token := oauthPhase4AccessToken(t, validResponse); token == "" {
+		t.Fatal("valid exchange after binding mismatch did not succeed")
+	}
+
+	for _, redirectURI := range []string{
+		"https://chatgpt.com/connector/oauth/nested/path",
+		"https://chatgpt.com/connector/oauth/phase4?unexpected=query",
+	} {
+		body := fmt.Sprintf(`{"redirect_uris":[%q],"client_name":"unsafe redirect","token_endpoint_auth_method":"none","grant_types":["authorization_code"],"response_types":["code"],"scope":"nyan8:read"}`, redirectURI)
+		response := serveMCPPhase12Request(fixture.router, newOAuthPhase4Request(http.MethodPost, "/oauth_register", body, "application/json"))
+		assertOAuthPhase4NegativeError(t, response, http.StatusBadRequest, "invalid_redirect_uri")
+	}
+}
+
+func TestOAuthPhase4NegativeExpiredRequestCodeAndToken(t *testing.T) {
+	fixture := newOAuthPhase4NegativeFixture(t, nil, nil)
+
+	t.Run("authorization request", func(t *testing.T) {
+		pending := oauthPhase4NegativeBeginAuthorization(t, fixture, "phase4-expired-request", strings.Repeat("r", 64))
+		key := oauthPhase4NegativeExpireState(t, fixture.stateDirectory, "requests", pending.requestID)
+		response := serveMCPPhase12Request(fixture.router, newOAuthPhase4NegativeAuthorizationPost(fixture, pending, pending.csrf, pending.cookie))
+		assertOAuthPhase4NegativeError(t, response, http.StatusBadRequest, "invalid_request")
+		if _, err := oauthReadState(fixture.stateDirectory, key); !os.IsNotExist(err) {
+			t.Fatalf("expired authorization request read error=%v, want lazy deletion", err)
+		}
+	})
+
+	t.Run("authorization code", func(t *testing.T) {
+		verifier := strings.Repeat("d", 64)
+		code, _ := oauthPhase4Authorize(t, fixture.router, fixture.stateDirectory, fixture.clientID, fixture.redirectURI, fixture.resource, "phase4-expired-code", verifier, fixture.username, fixture.password)
+		key := oauthPhase4NegativeExpireState(t, fixture.stateDirectory, "codes", code)
+		response := serveMCPPhase12Request(fixture.router, newOAuthPhase4NegativeTokenRequest(code, fixture.clientID, fixture.redirectURI, fixture.resource, verifier))
+		assertOAuthPhase4NegativeError(t, response, http.StatusBadRequest, "invalid_grant")
+		if _, err := oauthReadState(fixture.stateDirectory, key); !os.IsNotExist(err) {
+			t.Fatalf("expired authorization code read error=%v, want lazy deletion", err)
+		}
+	})
+
+	t.Run("access token", func(t *testing.T) {
+		verifier := strings.Repeat("t", 64)
+		code, _ := oauthPhase4Authorize(t, fixture.router, fixture.stateDirectory, fixture.clientID, fixture.redirectURI, fixture.resource, "phase4-expired-token", verifier, fixture.username, fixture.password)
+		tokenResponse := serveMCPPhase12Request(fixture.router, newOAuthPhase4NegativeTokenRequest(code, fixture.clientID, fixture.redirectURI, fixture.resource, verifier))
+		token := oauthPhase4AccessToken(t, tokenResponse)
+		key := oauthPhase4NegativeExpireState(t, fixture.stateDirectory, "tokens", token)
+		response := oauthPhase4NegativeToolCall(fixture, token)
+		if response.Code != http.StatusUnauthorized || response.Header().Get("WWW-Authenticate") == "" {
+			t.Fatalf("expired token Tool status=%d headers=%#v body=%q", response.Code, response.Header(), response.Body.String())
+		}
+		if _, err := oauthReadState(fixture.stateDirectory, key); !os.IsNotExist(err) {
+			t.Fatalf("expired access token read error=%v, want lazy deletion", err)
+		}
+	})
+}
+
+func TestOAuthPhase4NegativeInsufficientScopeReturns403(t *testing.T) {
+	fixture := newOAuthPhase4NegativeFixture(t, []string{"nyan8:read", "nyan8:write"}, []string{"nyan8:write"})
+	verifier := strings.Repeat("s", 64)
+	code, _ := oauthPhase4Authorize(t, fixture.router, fixture.stateDirectory, fixture.clientID, fixture.redirectURI, fixture.resource, "phase4-scope-state", verifier, fixture.username, fixture.password)
+	tokenResponse := serveMCPPhase12Request(fixture.router, newOAuthPhase4NegativeTokenRequest(code, fixture.clientID, fixture.redirectURI, fixture.resource, verifier))
+	token := oauthPhase4AccessToken(t, tokenResponse)
+	response := oauthPhase4NegativeToolCall(fixture, token)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("insufficient-scope status=%d, want 403; body=%q", response.Code, response.Body.String())
+	}
+	wantChallenge := `Bearer resource_metadata="https://nyan8.stamps.necomori.asia/oauth_protected_resource_metadata", scope="nyan8:write", error="insufficient_scope", error_description="The access token does not grant the required scope."`
+	if got := response.Header().Get("WWW-Authenticate"); got != wantChallenge {
+		t.Fatalf("WWW-Authenticate=%q, want %q", got, wantChallenge)
+	}
+	body := oauthPhase4JSONBody(t, response)
+	result, _ := body["result"].(map[string]interface{})
+	meta, _ := result["_meta"].(map[string]interface{})
+	challenges, _ := meta["mcp/www_authenticate"].([]interface{})
+	if result["isError"] != true || len(challenges) != 1 || challenges[0] != wantChallenge {
+		t.Fatalf("insufficient-scope MCP result=%#v", result)
+	}
+}
+
+func TestOAuthPhase4NegativeParallelAuthorizationCookiesAreIsolated(t *testing.T) {
+	fixture := newOAuthPhase4NegativeFixture(t, nil, nil)
+	first := oauthPhase4NegativeBeginAuthorization(t, fixture, "phase4-parallel-first", strings.Repeat("1", 64))
+	second := oauthPhase4NegativeBeginAuthorization(t, fixture, "phase4-parallel-second", strings.Repeat("2", 64))
+	if first.cookie.Name == second.cookie.Name || first.cookie.Value == second.cookie.Value {
+		t.Fatalf("parallel authorization cookies collided: %#v / %#v", first.cookie, second.cookie)
+	}
+
+	firstRequest := newOAuthPhase4NegativeAuthorizationPost(fixture, first, first.csrf, first.cookie)
+	firstRequest.AddCookie(second.cookie)
+	secondRequest := newOAuthPhase4NegativeAuthorizationPost(fixture, second, second.csrf, second.cookie)
+	secondRequest.AddCookie(first.cookie)
+	type authorizationResult struct {
+		state    string
+		response *httptest.ResponseRecorder
+	}
+	start := make(chan struct{})
+	results := make(chan authorizationResult, 2)
+	var wait sync.WaitGroup
+	for _, item := range []struct {
+		state   string
+		request *http.Request
+	}{
+		{state: first.state, request: firstRequest},
+		{state: second.state, request: secondRequest},
+	} {
+		item := item
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			results <- authorizationResult{state: item.state, response: serveMCPPhase12Request(fixture.router, item.request)}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	for result := range results {
+		if code := oauthPhase4NegativeAuthorizationCode(t, result.response, fixture.redirectURI, result.state); code == "" {
+			t.Errorf("parallel authorization for state %q returned no code", result.state)
+		}
+	}
+}
+
+func TestOAuthPhase4NegativeStateQuotaDuplicateJSONAndRatePolicy(t *testing.T) {
+	t.Run("quota", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "state")
+		namespace := filepath.Join(root, "misc")
+		if err := os.MkdirAll(namespace, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for index := 0; index < 255; index++ {
+			path := filepath.Join(namespace, fmt.Sprintf("%03d.json", index))
+			if err := os.WriteFile(path, []byte(`{"ok":true}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		destination := filepath.Join(namespace, "new.json")
+		if err := enforceOAuthStateQuota(root, "misc/new.json", destination); err != nil {
+			t.Fatalf("255 existing records unexpectedly exceeded quota: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(namespace, "255.json"), []byte(`{"ok":true}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := enforceOAuthStateQuota(root, "misc/new.json", destination); err == nil || !strings.Contains(err.Error(), "quota exceeded") {
+			t.Fatalf("256 existing records quota error=%v", err)
+		}
+		if err := enforceOAuthStateQuota(root, "misc/000.json", filepath.Join(namespace, "000.json")); err != nil {
+			t.Fatalf("updating an existing record at quota failed: %v", err)
+		}
+	})
+
+	t.Run("duplicate JSON state", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "state")
+		if err := os.Mkdir(root, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "duplicate.json"), []byte(`{"key":1,"key":2}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := oauthReadState(root, "duplicate.json"); err == nil {
+			t.Fatal("OAuth state reader accepted duplicate JSON keys")
+		}
+	})
+
+	t.Run("endpoint rate policy", func(t *testing.T) {
+		mcp := &MCPServerConfig{}
+		want := map[string]int{"oauthAdminUser": 10, "oauthRegister": 10, "oauthAuthorize": 30, "oauthToken": 60}
+		for hook, requests := range want {
+			limit := oauthRateLimitForHook(mcp, hook)
+			if limit.Requests != requests || limit.Window != "1m" {
+				t.Errorf("%s rate=%#v, want %d/1m", hook, limit, requests)
+			}
+		}
+		mcp.RateLimit = &MCPRateLimit{Requests: 7, Window: "10s"}
+		for hook := range want {
+			if limit := oauthRateLimitForHook(mcp, hook); limit != mcp.RateLimit {
+				t.Errorf("%s did not honor stricter server rate limit: %#v", hook, limit)
+			}
+		}
+	})
+}
+
+func newOAuthPhase4NegativeFixture(t *testing.T, serverScopes, toolScopes []string) oauthPhase4NegativeFixture {
+	t.Helper()
+	stateDirectory := filepath.Join(t.TempDir(), "oauth-state")
+	loaded := loadOAuthPhase4TestConfig(t, stateDirectory, serverScopes, toolScopes)
+	router := publishMCPPhase12Snapshot(t, loaded)
+	globalConfig.OAuthAdmin = OAuthAdminConfig{Username: "phase4-negative-operator", Password: "Phase4NegativeOperator123"}
+	fixture := oauthPhase4NegativeFixture{
+		router:         router,
+		stateDirectory: stateDirectory,
+		username:       "phase4.negative.user",
+		password:       "Phase4NegativeUser123",
+		redirectURI:    "https://chatgpt.com/connector/oauth/phase4",
+		resource:       "https://nyan8.stamps.necomori.asia/server_mcp_http",
+	}
+	adminBody := fmt.Sprintf(`{"username":%q,"password":%q}`, fixture.username, fixture.password)
+	adminRequest := newOAuthPhase4Request(http.MethodPost, "/oauth_admin_user", adminBody, "application/json")
+	adminRequest.SetBasicAuth(globalConfig.OAuthAdmin.Username, globalConfig.OAuthAdmin.Password)
+	adminResponse := serveMCPPhase12Request(router, adminRequest)
+	if adminResponse.Code != http.StatusCreated {
+		t.Fatalf("negative fixture admin status=%d body=%q", adminResponse.Code, adminResponse.Body.String())
+	}
+	registerBody := fmt.Sprintf(`{"redirect_uris":[%q],"client_name":"Phase 4 negative client","token_endpoint_auth_method":"none","grant_types":["authorization_code"],"response_types":["code"],"scope":"nyan8:read"}`, fixture.redirectURI)
+	registerResponse := serveMCPPhase12Request(router, newOAuthPhase4Request(http.MethodPost, "/oauth_register", registerBody, "application/json"))
+	if registerResponse.Code != http.StatusCreated {
+		t.Fatalf("negative fixture DCR status=%d body=%q", registerResponse.Code, registerResponse.Body.String())
+	}
+	fixture.clientID, _ = oauthPhase4JSONBody(t, registerResponse)["client_id"].(string)
+	if fixture.clientID == "" {
+		t.Fatal("negative fixture DCR returned no client_id")
+	}
+	return fixture
+}
+
+func oauthPhase4NegativeBeginAuthorization(t *testing.T, fixture oauthPhase4NegativeFixture, state, verifier string) oauthPhase4PendingAuthorization {
+	t.Helper()
+	path := "/oauth_authorize?response_type=code" +
+		"&client_id=" + oauthPhase4NegativeEscape(fixture.clientID) +
+		"&redirect_uri=" + oauthPhase4NegativeEscape(fixture.redirectURI) +
+		"&resource=" + oauthPhase4NegativeEscape(fixture.resource) +
+		"&scope=" + oauthPhase4NegativeEscape("nyan8:read") +
+		"&state=" + oauthPhase4NegativeEscape(state) +
+		"&code_challenge=" + oauthPhase4NegativeEscape(sha256Base64URL(verifier)) +
+		"&code_challenge_method=S256"
+	response := serveMCPPhase12Request(fixture.router, newOAuthPhase4Request(http.MethodGet, path, "", ""))
+	if response.Code != http.StatusOK {
+		t.Fatalf("begin authorization status=%d body=%q", response.Code, response.Body.String())
+	}
+	pending := oauthPhase4PendingAuthorization{
+		requestID: oauthPhase4HiddenValue(t, response.Body.String(), "request_id"),
+		csrf:      oauthPhase4HiddenValue(t, response.Body.String(), "csrf"),
+		state:     state,
+		verifier:  verifier,
+	}
+	wantCookieName := "nyan8_oauth_csrf_" + sha256Base64URL(pending.requestID)
+	for _, cookie := range response.Result().Cookies() {
+		if cookie.Name == wantCookieName {
+			pending.cookie = cookie
+			break
+		}
+	}
+	if pending.cookie == nil || pending.cookie.Value != pending.csrf {
+		t.Fatalf("authorization cookie=%#v, want name=%q value=%q", pending.cookie, wantCookieName, pending.csrf)
+	}
+	return pending
+}
+
+func newOAuthPhase4NegativeAuthorizationPost(fixture oauthPhase4NegativeFixture, pending oauthPhase4PendingAuthorization, csrf string, cookie *http.Cookie) *http.Request {
+	form := "request_id=" + oauthPhase4NegativeEscape(pending.requestID) +
+		"&csrf=" + oauthPhase4NegativeEscape(csrf) +
+		"&decision=allow" +
+		"&username=" + oauthPhase4NegativeEscape(fixture.username) +
+		"&password=" + oauthPhase4NegativeEscape(fixture.password)
+	request := newOAuthPhase4Request(http.MethodPost, "/oauth_authorize", form, "application/x-www-form-urlencoded")
+	if cookie != nil {
+		request.AddCookie(cookie)
+	}
+	return request
+}
+
+func oauthPhase4NegativeAuthorizationCode(t *testing.T, response *httptest.ResponseRecorder, redirectURI, state string) string {
+	t.Helper()
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("authorization POST status=%d body=%q", response.Code, response.Body.String())
+	}
+	location, err := response.Result().Location()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if location.Scheme+"://"+location.Host+location.Path != redirectURI || location.Query().Get("state") != state {
+		t.Fatalf("authorization redirect=%q", location.String())
+	}
+	return location.Query().Get("code")
+}
+
+func newOAuthPhase4NegativeTokenRequest(code, clientID, redirectURI, resource, verifier string) *http.Request {
+	form := "grant_type=authorization_code" +
+		"&code=" + oauthPhase4NegativeEscape(code) +
+		"&client_id=" + oauthPhase4NegativeEscape(clientID) +
+		"&redirect_uri=" + oauthPhase4NegativeEscape(redirectURI) +
+		"&resource=" + oauthPhase4NegativeEscape(resource) +
+		"&code_verifier=" + oauthPhase4NegativeEscape(verifier)
+	return newOAuthPhase4Request(http.MethodPost, "/oauth_token", form, "application/x-www-form-urlencoded")
+}
+
+func oauthPhase4NegativeEscape(value string) string {
+	const hexadecimal = "0123456789ABCDEF"
+	var escaped strings.Builder
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || strings.ContainsRune("-._~", rune(character)) {
+			escaped.WriteByte(character)
+			continue
+		}
+		if character == ' ' {
+			escaped.WriteByte('+')
+			continue
+		}
+		escaped.WriteByte('%')
+		escaped.WriteByte(hexadecimal[character>>4])
+		escaped.WriteByte(hexadecimal[character&0x0f])
+	}
+	return escaped.String()
+}
+
+func oauthPhase4NegativeExpireState(t *testing.T, stateDirectory, namespace, secret string) string {
+	t.Helper()
+	key := namespace + "/" + sha256Base64URL(secret) + ".json"
+	text, err := oauthReadState(stateDirectory, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state map[string]interface{}
+	if err := json.Unmarshal([]byte(text), &state); err != nil {
+		t.Fatal(err)
+	}
+	state["expiresAt"] = float64(time.Now().Add(-time.Minute).UnixMilli())
+	updated, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := oauthWriteState(stateDirectory, key, string(updated)); err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+func oauthPhase4NegativeToolCall(fixture oauthPhase4NegativeFixture, token string) *httptest.ResponseRecorder {
+	body := `{"jsonrpc":"2.0","id":"phase4-negative-tool","method":"tools/call","params":{"name":"mcp_sample","arguments":{}}}`
+	request := newOAuthPhase4Request(http.MethodPost, "/server_mcp_http", body, "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+	request.Header.Set("Authorization", "Bearer "+token)
+	return serveMCPPhase12Request(fixture.router, request)
+}
+
+func assertOAuthPhase4NegativeError(t *testing.T, response *httptest.ResponseRecorder, wantStatus int, wantCode string) {
+	t.Helper()
+	if response.Code != wantStatus {
+		t.Fatalf("OAuth error status=%d, want %d; body=%q", response.Code, wantStatus, response.Body.String())
+	}
+	body := oauthPhase4JSONBody(t, response)
+	if body["error"] != wantCode {
+		t.Fatalf("OAuth error=%v, want %q; body=%#v", body["error"], wantCode, body)
+	}
+}
+
+type phase5SMTPResult struct {
+	recipients []string
+	auth       []byte
+	message    []byte
+	err        error
+}
+
+func TestPhase5SendMailEnvelopeMIMEAndSecretHygiene(t *testing.T) {
+	host, port, smtpResult := newPhase5SMTPServer(t)
+	previousConfig := globalConfig
+	previousLogger := logger
+	var logOutput bytes.Buffer
+	logger = log.New(&logOutput, "", 0)
+	globalConfig = Config{SMTP: SMTPConfig{
+		Host:       host,
+		Port:       port,
+		Username:   "phase5-smtp-user",
+		Password:   "phase5-smtp-password-secret",
+		FromEmail:  "sender@example.test",
+		FromName:   "Nyan8 Phase 5",
+		DefaultBCC: []string{"default-hidden@example.test", "HIDDEN@example.test", "cc@example.test"},
+	}}
+	t.Cleanup(func() {
+		globalConfig = previousConfig
+		logger = previousLogger
+	})
+
+	const (
+		bodySecret       = "phase5-body-secret"
+		attachmentSecret = "phase5-attachment-secret"
+	)
+	err := sendMail(
+		[]string{"To@One.test", "duplicate@example.test"},
+		[]string{"cc@example.test", "to@one.test"},
+		[]string{"hidden@example.test", "DUPLICATE@example.test"},
+		"Phase 5 mail",
+		bodySecret,
+		false,
+		[]MailAttachment{{FileName: "phase5.txt", ContentType: "application/octet-stream", Data: []byte(attachmentSecret)}},
+	)
+	if err != nil {
+		t.Fatalf("sendMail: %v", err)
+	}
+
+	var captured phase5SMTPResult
+	select {
+	case captured = <-smtpResult:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for SMTP capture")
+	}
+	if captured.err != nil {
+		t.Fatalf("SMTP mock: %v", captured.err)
+	}
+	wantRecipients := []string{
+		"To@One.test",
+		"duplicate@example.test",
+		"cc@example.test",
+		"hidden@example.test",
+		"default-hidden@example.test",
+	}
+	if !reflect.DeepEqual(captured.recipients, wantRecipients) {
+		t.Fatalf("SMTP recipients=%#v, want %#v", captured.recipients, wantRecipients)
+	}
+	if string(captured.auth) != "\x00phase5-smtp-user\x00phase5-smtp-password-secret" {
+		t.Fatalf("SMTP AUTH payload=%q", captured.auth)
+	}
+
+	message, err := mail.ReadMessage(bytes.NewReader(captured.message))
+	if err != nil {
+		t.Fatalf("parse captured mail: %v\n%s", err, captured.message)
+	}
+	if got := message.Header.Get("To"); got != "To@One.test,duplicate@example.test" {
+		t.Fatalf("To header=%q", got)
+	}
+	if got := message.Header.Get("Cc"); got != "cc@example.test" {
+		t.Fatalf("Cc header=%q", got)
+	}
+	if got := message.Header.Get("Bcc"); got != "" {
+		t.Fatalf("Bcc header was exposed: %q", got)
+	}
+	rawMessage := string(captured.message)
+	for _, hiddenAddress := range []string{"hidden@example.test", "default-hidden@example.test"} {
+		if strings.Contains(strings.ToLower(rawMessage), strings.ToLower(hiddenAddress)) {
+			t.Errorf("Bcc recipient %q was exposed in message data", hiddenAddress)
+		}
+	}
+
+	mediaType, parameters, err := mime.ParseMediaType(message.Header.Get("Content-Type"))
+	if err != nil || mediaType != "multipart/mixed" || parameters["boundary"] == "" {
+		t.Fatalf("message Content-Type=%q parameters=%#v err=%v", mediaType, parameters, err)
+	}
+	multipartReader := multipart.NewReader(message.Body, parameters["boundary"])
+	var decodedBody string
+	var attachmentName string
+	var decodedAttachment string
+	parts := 0
+	for {
+		part, partErr := multipartReader.NextPart()
+		if partErr == io.EOF {
+			break
+		}
+		if partErr != nil {
+			t.Fatalf("read MIME part: %v", partErr)
+		}
+		parts++
+		var reader io.Reader = part
+		if strings.EqualFold(part.Header.Get("Content-Transfer-Encoding"), "base64") {
+			reader = base64.NewDecoder(base64.StdEncoding, part)
+		}
+		data, readErr := io.ReadAll(reader)
+		if readErr != nil {
+			t.Fatalf("decode MIME part: %v", readErr)
+		}
+		disposition, dispositionParameters, dispositionErr := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
+		if dispositionErr == nil && disposition == "attachment" {
+			attachmentName = dispositionParameters["filename"]
+			decodedAttachment = string(data)
+			continue
+		}
+		partType, _, typeErr := mime.ParseMediaType(part.Header.Get("Content-Type"))
+		if typeErr != nil || partType != "text/plain" {
+			t.Fatalf("body part Content-Type=%q err=%v", part.Header.Get("Content-Type"), typeErr)
+		}
+		decodedBody = string(data)
+	}
+	if parts != 2 || decodedBody != bodySecret || attachmentName != "phase5.txt" || decodedAttachment != attachmentSecret {
+		t.Fatalf("MIME parts=%d body=%q attachment=%q data=%q", parts, decodedBody, attachmentName, decodedAttachment)
+	}
+
+	logs := logOutput.String()
+	for _, secret := range []string{
+		"phase5-smtp-user",
+		"phase5-smtp-password-secret",
+		bodySecret,
+		attachmentSecret,
+		"hidden@example.test",
+		"default-hidden@example.test",
+	} {
+		if strings.Contains(logs, secret) {
+			t.Errorf("log exposed secret %q: %q", secret, logs)
+		}
+	}
+	if !strings.Contains(logs, "attachments=1") {
+		t.Fatalf("non-secret mail diagnostic missing: %q", logs)
+	}
+}
+
+func TestPhase5IncomingWebSocketResponseAndPush(t *testing.T) {
+	previousSnapshot := currentAPISnapshot()
+	previousConfig := globalConfig
+	previousPaths := servicePaths
+	previousLogger := logger
+	previousPushConnections := map[interface{}]interface{}{}
+	pushConnections.Range(func(key, value interface{}) bool {
+		previousPushConnections[key] = value
+		pushConnections.Delete(key)
+		return true
+	})
+	var server *httptest.Server
+	var sourceConnection *websocket.Conn
+	var sinkConnection *websocket.Conn
+	t.Cleanup(func() {
+		closePhase5WebSocket(sourceConnection)
+		closePhase5WebSocket(sinkConnection)
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			_, sourceExists := pushConnections.Load("source")
+			_, sinkExists := pushConnections.Load("sink")
+			if !sourceExists && !sinkExists {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if server != nil {
+			server.Close()
+		}
+		pushConnections.Range(func(key, _ interface{}) bool {
+			pushConnections.Delete(key)
+			return true
+		})
+		for key, value := range previousPushConnections {
+			pushConnections.Store(key, value)
+		}
+		publishAPISnapshot(previousSnapshot)
+		globalConfig = previousConfig
+		servicePaths = previousPaths
+		logger = previousLogger
+	})
+
+	dir := t.TempDir()
+	apiPath := filepath.Join(dir, "api.json")
+	writeHotReloadTestFile(t, filepath.Join(dir, "source.js"), `JSON.stringify({kind:"source-response",api:nyanAllParams.api,value:nyanAllParams.value});`)
+	writeHotReloadTestFile(t, filepath.Join(dir, "sink.js"), `JSON.stringify({kind:"sink-push",api:nyanAllParams.api,value:nyanAllParams.value});`)
+	definitions := map[string]interface{}{
+		"source": map[string]interface{}{"script": "./source.js", "push": "sink"},
+		"sink":   map[string]interface{}{"script": "./sink.js"},
+	}
+	data, err := json.Marshal(definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(apiPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readAPIConfigFile(apiPath, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var websocketLogs bytes.Buffer
+	globalConfig = Config{Name: "Phase 5 WebSocket Test"}
+	servicePaths.API.Path = apiPath
+	logger = log.New(&websocketLogs, "", 0)
+	publishAPISnapshot(loaded.Snapshot)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	if err := registerDynamicEndpoints(router, dir); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("local TCP listener is unavailable: %v", err)
+	}
+	server = httptest.NewUnstartedServer(router)
+	server.Listener = listener
+	server.Start()
+
+	websocketURL := "ws" + server.URL[len("http"):]
+	dialer := websocket.Dialer{HandshakeTimeout: 3 * time.Second}
+	sinkConnection, _, err = dialer.Dial(websocketURL+"/sink", nil)
+	if err != nil {
+		t.Fatalf("dial sink WebSocket: %v", err)
+	}
+	waitForHotReloadCondition(t, "sink WebSocket registration", func() bool {
+		connection, exists := pushConnections.Load("sink")
+		_, isServerWebSocket := connection.(*websocket.Conn)
+		return exists && isServerWebSocket
+	})
+	sourceConnection, _, err = dialer.Dial(websocketURL+"/source", nil)
+	if err != nil {
+		t.Fatalf("dial source WebSocket: %v", err)
+	}
+	waitForHotReloadCondition(t, "source WebSocket registration", func() bool {
+		connection, exists := pushConnections.Load("source")
+		_, isServerWebSocket := connection.(*websocket.Conn)
+		return exists && isServerWebSocket
+	})
+
+	operationDeadline := time.Now().Add(3 * time.Second)
+	if err := sourceConnection.SetWriteDeadline(operationDeadline); err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceConnection.SetReadDeadline(operationDeadline); err != nil {
+		t.Fatal(err)
+	}
+	if err := sinkConnection.SetReadDeadline(operationDeadline); err != nil {
+		t.Fatal(err)
+	}
+	requestBody := `{"api":"source","value":"phase5-websocket"}`
+	if err := sourceConnection.WriteMessage(websocket.TextMessage, []byte(requestBody)); err != nil {
+		t.Fatalf("write source WebSocket: %v", err)
+	}
+	sourceType, sourceMessage, err := sourceConnection.ReadMessage()
+	if err != nil {
+		t.Fatalf("read source response: %v; logs=%q", err, websocketLogs.String())
+	}
+	sinkType, sinkMessage, err := sinkConnection.ReadMessage()
+	if err != nil {
+		t.Fatalf("read sink push: %v; logs=%q", err, websocketLogs.String())
+	}
+	if sourceType != websocket.TextMessage || sinkType != websocket.TextMessage {
+		t.Fatalf("message types source/sink=%d/%d, want text/text", sourceType, sinkType)
+	}
+	var sourceBody map[string]interface{}
+	if err := json.Unmarshal(sourceMessage, &sourceBody); err != nil {
+		t.Fatalf("source response=%q: %v", sourceMessage, err)
+	}
+	if sourceBody["kind"] != "source-response" || sourceBody["api"] != "source" || sourceBody["value"] != "phase5-websocket" {
+		t.Fatalf("source response=%#v", sourceBody)
+	}
+	var sinkBody map[string]interface{}
+	if err := json.Unmarshal(sinkMessage, &sinkBody); err != nil {
+		t.Fatalf("sink push=%q: %v", sinkMessage, err)
+	}
+	if sinkBody["kind"] != "sink-push" || sinkBody["api"] != "source" || sinkBody["value"] != "phase5-websocket" {
+		t.Fatalf("sink push=%#v", sinkBody)
+	}
+}
+
+func newPhase5SMTPServer(t *testing.T) (string, int, <-chan phase5SMTPResult) {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("local SMTP listener is unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	if tcpListener, ok := listener.(*net.TCPListener); ok {
+		_ = tcpListener.SetDeadline(time.Now().Add(10 * time.Second))
+	}
+	results := make(chan phase5SMTPResult, 1)
+	go func() {
+		captured := phase5SMTPResult{}
+		defer func() { results <- captured }()
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			captured.err = acceptErr
+			return
+		}
+		defer connection.Close()
+		_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
+		reader := bufio.NewReader(connection)
+		writer := bufio.NewWriter(connection)
+		writeResponse := func(response string) error {
+			if _, writeErr := writer.WriteString(response); writeErr != nil {
+				return writeErr
+			}
+			return writer.Flush()
+		}
+		if captured.err = writeResponse("220 localhost ESMTP phase5\r\n"); captured.err != nil {
+			return
+		}
+		for {
+			line, readErr := reader.ReadString('\n')
+			if readErr != nil {
+				captured.err = readErr
+				return
+			}
+			line = strings.TrimRight(line, "\r\n")
+			upper := strings.ToUpper(line)
+			switch {
+			case strings.HasPrefix(upper, "EHLO ") || strings.HasPrefix(upper, "HELO "):
+				captured.err = writeResponse("250-localhost\r\n250-AUTH PLAIN\r\n250 8BITMIME\r\n")
+			case strings.HasPrefix(upper, "AUTH PLAIN"):
+				fields := strings.Fields(line)
+				encoded := ""
+				if len(fields) >= 3 {
+					encoded = fields[2]
+				} else {
+					if captured.err = writeResponse("334 \r\n"); captured.err != nil {
+						return
+					}
+					encoded, captured.err = reader.ReadString('\n')
+					encoded = strings.TrimSpace(encoded)
+				}
+				if captured.err == nil {
+					captured.auth, captured.err = base64.StdEncoding.DecodeString(encoded)
+				}
+				if captured.err == nil {
+					captured.err = writeResponse("235 2.7.0 authenticated\r\n")
+				}
+			case strings.HasPrefix(upper, "MAIL FROM:"):
+				captured.err = writeResponse("250 2.1.0 sender ok\r\n")
+			case strings.HasPrefix(upper, "RCPT TO:"):
+				recipient := strings.TrimSpace(line[len("RCPT TO:"):])
+				recipient = strings.TrimPrefix(recipient, "<")
+				recipient = strings.TrimSuffix(recipient, ">")
+				captured.recipients = append(captured.recipients, recipient)
+				captured.err = writeResponse("250 2.1.5 recipient ok\r\n")
+			case upper == "DATA":
+				if captured.err = writeResponse("354 end with <CRLF>.<CRLF>\r\n"); captured.err != nil {
+					return
+				}
+				captured.message, captured.err = textproto.NewReader(reader).ReadDotBytes()
+				if captured.err == nil {
+					captured.err = writeResponse("250 2.0.0 queued\r\n")
+				}
+			case upper == "QUIT":
+				captured.err = writeResponse("221 2.0.0 bye\r\n")
+				return
+			default:
+				captured.err = writeResponse("250 2.0.0 ok\r\n")
+			}
+			if captured.err != nil {
+				return
+			}
+		}
+	}()
+	return "localhost", listener.Addr().(*net.TCPAddr).Port, results
+}
+
+func closePhase5WebSocket(connection *websocket.Conn) {
+	if connection == nil {
+		return
+	}
+	deadline := time.Now().Add(250 * time.Millisecond)
+	_ = connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "phase5 test complete"), deadline)
+	_ = connection.Close()
+}
+
+func TestOAuthExpiredPublicStateIsPrunedBeforeQuotaGrowth(t *testing.T) {
+	fixture := newOAuthPhase4NegativeFixture(t, nil, nil)
+
+	clientStateKey := "clients/" + sha256Base64URL(fixture.clientID) + ".json"
+	clientText, err := oauthReadState(fixture.stateDirectory, clientStateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clientState map[string]interface{}
+	if err := json.Unmarshal([]byte(clientText), &clientState); err != nil {
+		t.Fatal(err)
+	}
+	clientState["expiresAt"] = float64(time.Now().Add(-time.Minute).UnixMilli())
+	expiredClient, err := json.Marshal(clientState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := oauthWriteState(fixture.stateDirectory, clientStateKey, string(expiredClient)); err != nil {
+		t.Fatal(err)
+	}
+
+	registerBody := fmt.Sprintf(`{"redirect_uris":[%q],"client_name":"prune replacement","token_endpoint_auth_method":"none","grant_types":["authorization_code"],"response_types":["code"],"scope":"nyan8:read"}`, fixture.redirectURI)
+	registerResponse := serveMCPPhase12Request(fixture.router, newOAuthPhase4Request(http.MethodPost, "/oauth_register", registerBody, "application/json"))
+	if registerResponse.Code != http.StatusCreated {
+		t.Fatalf("replacement DCR status=%d body=%q", registerResponse.Code, registerResponse.Body.String())
+	}
+	if _, err := oauthReadState(fixture.stateDirectory, clientStateKey); !os.IsNotExist(err) {
+		t.Fatalf("expired client read error=%v, want deletion before DCR growth", err)
+	}
+
+	replacementClient, _ := oauthPhase4JSONBody(t, registerResponse)["client_id"].(string)
+	fixture.clientID = replacementClient
+	pending := oauthPhase4NegativeBeginAuthorization(t, fixture, "expired-request-prune", strings.Repeat("q", 64))
+	requestStateKey := oauthPhase4NegativeExpireState(t, fixture.stateDirectory, "requests", pending.requestID)
+	_ = oauthPhase4NegativeBeginAuthorization(t, fixture, "replacement-request", strings.Repeat("w", 64))
+	if _, err := oauthReadState(fixture.stateDirectory, requestStateKey); !os.IsNotExist(err) {
+		t.Fatalf("expired request read error=%v, want deletion before authorization growth", err)
+	}
+}
+
+func TestOAuthStateListIsRootedPrivateAndDeterministic(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "oauth")
+	for _, item := range []struct {
+		key   string
+		value string
+	}{
+		{key: "clients/z.json", value: `{"ok":true}`},
+		{key: "clients/a.json", value: `{"ok":true}`},
+	} {
+		if err := oauthWriteState(root, item.key, item.value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keys, err := oauthListState(root, "clients")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"clients/a.json", "clients/z.json"}; !reflect.DeepEqual(keys, want) {
+		t.Fatalf("OAuth state keys=%#v, want %#v", keys, want)
+	}
+	for _, namespace := range []string{"../clients", "clients/other", ".", ""} {
+		if _, err := oauthListState(root, namespace); err == nil {
+			t.Errorf("unsafe namespace %q was accepted", namespace)
+		}
+	}
+}
+
+func TestProductionWebSocketExposureIsBounded(t *testing.T) {
+	t.Run("configuration contract", func(t *testing.T) {
+		backing := map[string]interface{}{"websocket": false}
+		if apiWebSocketAllowed(backing) {
+			t.Fatal("MCP Tool backing API allows WebSocket upgrades when explicitly disabled")
+		}
+	})
+
+	t.Run("root disabled", func(t *testing.T) {
+		previous := globalConfig
+		allowRoot := false
+		globalConfig.WebSocket = WebSocketConfig{AllowRoot: &allowRoot, MaxConnections: 32}
+		t.Cleanup(func() { globalConfig = previous })
+		router := gin.New()
+		router.Any("/", handleRequest)
+		request := httptest.NewRequest(http.MethodGet, "/", nil)
+		request.Header.Set("Connection", "Upgrade")
+		request.Header.Set("Upgrade", "websocket")
+		request.Header.Set("Sec-WebSocket-Version", "13")
+		request.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("disabled root WebSocket status=%d, want 403", response.Code)
+		}
+	})
+
+	t.Run("global limiter", func(t *testing.T) {
+		firstRelease, firstOK := acquireWebSocketConnection(1)
+		if !firstOK {
+			t.Fatal("first WebSocket slot was rejected")
+		}
+		if _, secondOK := acquireWebSocketConnection(1); secondOK {
+			firstRelease()
+			t.Fatal("connection beyond the global WebSocket limit was accepted")
+		}
+		firstRelease()
+		thirdRelease, thirdOK := acquireWebSocketConnection(1)
+		if !thirdOK {
+			t.Fatal("released WebSocket slot was not reusable")
+		}
+		thirdRelease()
+	})
+}
+
+func TestProxyProtocolV2PreservesClientAddressAndPayload(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	wrappedListener, err := newProxyProtocolListener(listener, ProxyProtocolConfig{
+		Enabled:      true,
+		TrustedCIDRs: []string{"127.0.0.1/32"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type acceptedResult struct {
+		remote  string
+		payload string
+		err     error
+	}
+	resultChannel := make(chan acceptedResult, 1)
+	go func() {
+		conn, acceptErr := wrappedListener.Accept()
+		if acceptErr != nil {
+			resultChannel <- acceptedResult{err: acceptErr}
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		payload := make([]byte, len("tls-client-hello-placeholder"))
+		_, readErr := io.ReadFull(conn, payload)
+		resultChannel <- acceptedResult{remote: conn.RemoteAddr().String(), payload: string(payload), err: readErr}
+	}()
+
+	client, err := net.DialTimeout("tcp", listener.Addr().String(), 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := net.ParseIP("203.0.113.17")
+	destination := net.ParseIP("127.0.0.1")
+	header := testProxyProtocolV2Header(t, source, destination, 45678, 10443)
+	if _, err := client.Write(append(header, []byte("tls-client-hello-placeholder")...)); err != nil {
+		client.Close()
+		t.Fatal(err)
+	}
+	_ = client.Close()
+
+	select {
+	case result := <-resultChannel:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.remote != "203.0.113.17:45678" {
+			t.Fatalf("proxied RemoteAddr=%q, want 203.0.113.17:45678", result.remote)
+		}
+		if result.payload != "tls-client-hello-placeholder" {
+			t.Fatalf("payload=%q", result.payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for PROXY protocol listener")
+	}
+}
+
+func TestProxyProtocolV2IPv6LocalAndTLV(t *testing.T) {
+	t.Run("IPv6 with ignored TLV", func(t *testing.T) {
+		source := net.ParseIP("2001:db8::17").To16()
+		destination := net.ParseIP("2001:db8::44").To16()
+		payload := append(append([]byte(nil), source...), destination...)
+		ports := make([]byte, 4)
+		binary.BigEndian.PutUint16(ports[0:2], 45678)
+		binary.BigEndian.PutUint16(ports[2:4], 10443)
+		payload = append(payload, ports...)
+		payload = append(payload, 0x01, 0x00, 0x03, 't', 'l', 'v')
+		header := append([]byte(nil), proxyProtocolV2Signature...)
+		header = append(header, 0x21, 0x21, byte(len(payload)>>8), byte(len(payload)))
+		reader := bufio.NewReader(bytes.NewReader(append(append(header, payload...), []byte("TLS")...)))
+		remote, err := readProxyProtocolV2Header(reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := remote.String(); got != "[2001:db8::17]:45678" {
+			t.Fatalf("IPv6 RemoteAddr=%q", got)
+		}
+		remainder, err := io.ReadAll(reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(remainder) != "TLS" {
+			t.Fatalf("post-header bytes=%q", remainder)
+		}
+	})
+
+	t.Run("LOCAL keeps transport peer", func(t *testing.T) {
+		header := append([]byte(nil), proxyProtocolV2Signature...)
+		header = append(header, 0x20, 0x00, 0x00, 0x00)
+		reader := bufio.NewReader(bytes.NewReader(append(header, []byte("TLS")...)))
+		remote, err := readProxyProtocolV2Header(reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if remote != nil {
+			t.Fatalf("LOCAL RemoteAddr=%v, want transport peer fallback", remote)
+		}
+		remainder, err := io.ReadAll(reader)
+		if err != nil || string(remainder) != "TLS" {
+			t.Fatalf("LOCAL post-header bytes=%q err=%v", remainder, err)
+		}
+	})
+}
+
+func TestSlowProxyHeaderDoesNotBlockAcceptLoop(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	wrappedListener, err := newProxyProtocolListener(listener, ProxyProtocolConfig{
+		Enabled:      true,
+		TrustedCIDRs: []string{"127.0.0.1/32"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stalledClient, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stalledServer, err := wrappedListener.Accept()
+	if err != nil {
+		stalledClient.Close()
+		t.Fatal(err)
+	}
+	stalledDone := make(chan struct{})
+	go func() {
+		_ = stalledServer.RemoteAddr()
+		close(stalledDone)
+	}()
+
+	secondResult := make(chan error, 1)
+	go func() {
+		conn, acceptErr := wrappedListener.Accept()
+		if acceptErr != nil {
+			secondResult <- acceptErr
+			return
+		}
+		defer conn.Close()
+		buffer := make([]byte, 3)
+		_, readErr := io.ReadFull(conn, buffer)
+		if readErr == nil && string(buffer) != "TLS" {
+			readErr = fmt.Errorf("second payload=%q", buffer)
+		}
+		secondResult <- readErr
+	}()
+	secondClient, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+	if err != nil {
+		stalledClient.Close()
+		stalledServer.Close()
+		t.Fatal(err)
+	}
+	header := testProxyProtocolV2Header(t, net.ParseIP("198.51.100.20"), net.ParseIP("127.0.0.1"), 44000, 10443)
+	if _, err := secondClient.Write(append(header, []byte("TLS")...)); err != nil {
+		secondClient.Close()
+		stalledClient.Close()
+		stalledServer.Close()
+		t.Fatal(err)
+	}
+	_ = secondClient.Close()
+	select {
+	case err := <-secondResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stalled PROXY peer blocked acceptance of a second connection")
+	}
+	_ = stalledClient.Close()
+	_ = stalledServer.Close()
+	select {
+	case <-stalledDone:
+	case <-time.After(time.Second):
+		t.Fatal("stalled connection did not unblock after close")
+	}
+}
+
+func TestRequiredProxyProtocolRejectsDirectTraffic(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	payload := "direct-private-backend-probe"
+	errorChannel := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			errorChannel <- acceptErr
+			return
+		}
+		defer conn.Close()
+		wrapped := &proxyProtocolConn{Conn: conn, headerTimeout: time.Second}
+		_, readErr := wrapped.Read(make([]byte, len(payload)))
+		errorChannel <- readErr
+	}()
+	client, err := net.DialTimeout("tcp", listener.Addr().String(), 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(client, payload); err != nil {
+		client.Close()
+		t.Fatal(err)
+	}
+	_ = client.Close()
+	select {
+	case err := <-errorChannel:
+		if err == nil || !strings.Contains(err.Error(), "invalid PROXY protocol v2 signature") {
+			t.Fatalf("direct connection error=%v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for required PROXY protocol rejection")
+	}
+}
+
+func TestProxyProtocolClientAddressesIsolateRateLimits(t *testing.T) {
+	parseRemote := func(source string, port int) string {
+		header := testProxyProtocolV2Header(t, net.ParseIP(source), net.ParseIP("127.0.0.1"), port, 10443)
+		remote, err := readProxyProtocolV2Header(bufio.NewReader(bytes.NewReader(header)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return remote.String()
+	}
+	first := parseRemote("198.51.100.10", 41000)
+	second := parseRemote("198.51.100.11", 42000)
+	mcpRateBuckets.Lock()
+	previousBuckets := mcpRateBuckets.Buckets
+	previousCleanup := mcpRateBuckets.LastCleanup
+	mcpRateBuckets.Buckets = make(map[string]mcpRateBucket)
+	mcpRateBuckets.LastCleanup = time.Time{}
+	mcpRateBuckets.Unlock()
+	t.Cleanup(func() {
+		mcpRateBuckets.Lock()
+		mcpRateBuckets.Buckets = previousBuckets
+		mcpRateBuckets.LastCleanup = previousCleanup
+		mcpRateBuckets.Unlock()
+	})
+	limit := &MCPRateLimit{Requests: 1, Window: "1m"}
+	now := time.Now()
+	if allowed, _ := mcpRateLimitAllows("proxy-rate-test", limit, first, now); !allowed {
+		t.Fatal("first client was unexpectedly rate limited")
+	}
+	if allowed, _ := mcpRateLimitAllows("proxy-rate-test", limit, second, now); !allowed {
+		t.Fatal("second client shared the first client's rate bucket")
+	}
+	if allowed, _ := mcpRateLimitAllows("proxy-rate-test", limit, first, now); allowed {
+		t.Fatal("first client exceeded its own rate bucket")
+	}
+}
+
+func TestClientIPIgnoresSpoofableForwardingHeaders(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "https://example.test/", nil)
+	request.RemoteAddr = "203.0.113.44:54321"
+	request.Header.Set("X-Forwarded-For", "198.51.100.99")
+	request.Header.Set("X-Real-IP", "198.51.100.98")
+	if got := getClientIP(request); got != "203.0.113.44" {
+		t.Fatalf("client IP=%q, want authenticated RemoteAddr", got)
+	}
+}
+
+func TestProxyProtocolValidation(t *testing.T) {
+	valid := ProxyProtocolConfig{Enabled: true, TrustedCIDRs: []string{"127.0.0.1/32"}}
+	if _, err := validateProxyProtocolConfig(valid); err != nil {
+		t.Fatalf("valid PROXY protocol config: %v", err)
+	}
+	invalid := []ProxyProtocolConfig{
+		{Enabled: true},
+		{Enabled: true, TrustedCIDRs: []string{"not-a-cidr"}},
+		{Enabled: true, TrustedCIDRs: []string{"127.0.0.0/8"}},
+		{Enabled: true, TrustedCIDRs: []string{"127.0.0.1/32", "127.0.0.1/32"}},
+	}
+	for index, config := range invalid {
+		if _, err := validateProxyProtocolConfig(config); err == nil {
+			t.Errorf("invalid PROXY protocol config %d was accepted", index)
+		}
+	}
+}
+
+func testProxyProtocolV2Header(t *testing.T, sourceIP, destinationIP net.IP, sourcePort, destinationPort int) []byte {
+	t.Helper()
+	source := sourceIP.To4()
+	destination := destinationIP.To4()
+	if source == nil || destination == nil || sourcePort < 1 || sourcePort > 65535 || destinationPort < 1 || destinationPort > 65535 {
+		t.Fatal("invalid IPv4 PROXY protocol test address")
+	}
+	header := append([]byte(nil), proxyProtocolV2Signature...)
+	header = append(header, 0x21, 0x11, 0x00, 0x0c)
+	header = append(header, source...)
+	header = append(header, destination...)
+	ports := make([]byte, 4)
+	binary.BigEndian.PutUint16(ports[0:2], uint16(sourcePort))
+	binary.BigEndian.PutUint16(ports[2:4], uint16(destinationPort))
+	return append(header, ports...)
 }
