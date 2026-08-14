@@ -8,6 +8,10 @@
   "javascript_include": [
     "./javascript/base.js"
   ],
+  "APIHotReload": {
+    "Enabled": true,
+    "Interval": "1s"
+  },
   "log": {
     "Filename": "./logs/nyan8.log",
     "MaxSize": 5,
