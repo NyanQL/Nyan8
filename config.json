@@ -18,7 +18,8 @@
     "MaxBackups": 3,
     "MaxAge": 7,
     "Compress": true,
-    "EnableLogging": false
+    "EnableLogging": false,
+    "Level": "info"
   },
   "smtp": {
     "host": "",

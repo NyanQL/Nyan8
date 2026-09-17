@@ -89,7 +89,8 @@ NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./nyan8
     "MaxBackups": 5,                // 世代数
     "MaxAge": 30,                   // 日数
     "Compress": true,               // 圧縮
-    "EnableLogging": true           // false=コンソールのみ
+    "EnableLogging": true,          // false=標準エラー出力
+    "Level": "info"                 // debug / info / warn / error
   },
   "smtp": {
     "host": "smtp.example.com",
@@ -112,9 +113,22 @@ NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./nyan8
 * **MaxBackups** – 保持世代数
 * **MaxAge** – 保持日数
 * **Compress** – 過去ファイルを gzip 圧縮
-* **EnableLogging** – false で標準出力のみ
+* **EnableLogging** – true はファイル、false は標準エラーへ出力（ログ停止ではありません）
+* **Level** – `debug` / `info` / `warn` / `error`。省略時は `info`。指定以上の重大度のログを出力し、不正な値では起動を中止します。
 
 </details>
+
+サービスログはNyanQLと同じ、1行1件のJSON形式です。`time`、`level`、`msg`（処理名）と、API名・ファイル名・件数などを記録します。ファイル出力時のローテーション・圧縮設定は従来どおりです。標準出力にはサービスログを出さず、MCP stdioではJSON-RPC応答専用にします。設定読み込み前の起動エラーは標準エラーへ出力します。
+
+通常の `info` では、起動、設定変更、ジョブ完了、接続状態、警告、エラーを記録します。リクエストのパラメータ、API設定全体、Push・ジョブ結果の本文は自動出力しません。WebSocket接続先はschemeとhostだけを記録します。Ginの標準アクセスログは使用せず、全リクエストのURL・ステータス・処理時間は記録しません。
+
+`debug` では、Pushのバイト数、ジョブの次回実行時刻などに加え、**エラーの詳細文字列とJavaScriptの `console.log(...)` の本文**を出力します。詳細・consoleメッセージは4096バイトまでとし、超過時は省略マーカーを付け、改行はJSON内でエスケープします。これらには入力値や認証情報が含まれ得るため、調査時に使用してください。ジョブ完了の `result_bytes` は結果文字列のバイト数です。
+
+```json
+{"time":"2026-09-18T09:00:00+09:00","level":"INFO","msg":"schedule_completed","job":"daily_update","result_bytes":128}
+```
+
+従来のテキストログ解析はJSON形式への対応が必要です。`log.Level` を含む `config.json` の変更には再起動が必要です。
 
 #### `api.json` のホットリロード
 

@@ -11,11 +11,13 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"log/slog"
 	"math"
 	"mime"
 	"mime/multipart"
@@ -117,6 +119,7 @@ type LogConfig struct {
 	MaxAge        int    `json:"MaxAge"`
 	Compress      bool   `json:"Compress"`
 	EnableLogging bool   `json:"EnableLogging"`
+	Level         string `json:"Level"`
 }
 
 type NyanResponse struct {
@@ -247,8 +250,6 @@ var upgrader = websocket.Upgrader{
 
 var ginContext *gin.Context
 
-var logger *log.Logger
-
 var pushConnections sync.Map
 
 var websocketConnectionCount = struct {
@@ -261,47 +262,38 @@ func main() {
 	// 実行ファイルのディレクトリを取得
 	execPath, err := filepath.Abs(filepath.Dir(os.Args[0]))
 	if err != nil {
-		log.Fatal("Error getting executable path:", err)
+		fatalServiceError("executable_path_failed", err)
 	}
 
 	// 一時ディレクトリを除外してカレントディレクトリを使用
 	if isTemporaryDirectory(execPath) {
 		execPath, err = os.Getwd()
 		if err != nil {
-			log.Fatal("Error getting current working directory:", err)
+			fatalServiceError("working_directory_failed", err)
 		}
 	}
 	execDir := execPath
 
 	options, err := resolveStartupOptions(execDir, os.Args[1:])
 	if err != nil {
-		log.Fatal(err)
+		fatalServiceError("startup_options_invalid", err)
 	}
 	paths := options.Paths
 	servicePaths = paths
 	mcpStdio := options.MCPServer != ""
-	if !mcpStdio {
-		fmt.Println("Executable directory:", execDir)
-		fmt.Printf("Config file path: %s (source: %s)\n", paths.Config.Path, paths.Config.Source)
-		fmt.Printf("API file path: %s (source: %s)\n", paths.API.Path, paths.API.Source)
-	}
 
 	config, err := loadConfig(paths.Config.Path)
 	if err != nil {
-		// logger はまだ初期化前なので標準ログで終了
-		log.Fatalf("Error loading config from %s: %v", paths.Config.Path, err)
+		fatalServiceError("config_load_failed", err, "file", paths.Config.Path)
 	}
 	configBaseDir := filepath.Dir(paths.Config.Path)
 	apiBaseDir := filepath.Dir(paths.API.Path)
 	adjustConfigPaths(configBaseDir, &config)
 	globalConfig = config
 
-	// ロガーをセットアップ
-	loggerFallback := io.Writer(os.Stdout)
-	if mcpStdio {
-		loggerFallback = os.Stderr
+	if err := initLogger(configBaseDir); err != nil {
+		fatalServiceError("invalid_log_level", err, "expected", "debug, info, warn, or error")
 	}
-	initLoggerWithFallback(configBaseDir, loggerFallback)
 	binaryVersion := BinaryVersion
 	if strings.TrimSpace(binaryVersion) == "" {
 		binaryVersion = "unset"
@@ -310,47 +302,47 @@ func main() {
 	if configVersion == "" {
 		configVersion = "unset"
 	}
-	logger.Printf("Binary version: %s", binaryVersion)
-	logger.Printf("Go runtime version: %s", runtime.Version())
-	logger.Printf("Config file: %s (source: %s)", paths.Config.Path, paths.Config.Source)
-	logger.Printf("API file: %s (source: %s)", paths.API.Path, paths.API.Source)
-	logger.Printf("Config version: %s", configVersion)
+	serviceLog(slog.LevelInfo, "starting", "binary_version", binaryVersion, "go_version", runtime.Version(), "config_version", configVersion)
+	serviceLog(slog.LevelInfo, "config_loaded", "file", paths.Config.Path, "source", paths.Config.Source)
 
 	initialAPIConfig, err := readAPIConfigFile(paths.API.Path, apiBaseDir)
 	if err != nil {
-		logger.Fatalf("Failed to load api.json: %v", err)
+		fatalServiceError("api_config_load_failed", err)
 	}
 	publishAPISnapshot(initialAPIConfig.Snapshot)
+	serviceLog(slog.LevelInfo, "api_config_loaded", "file", paths.API.Path, "source", paths.API.Source, "api_count", len(currentAPIFiles()))
 	if mcpStdio {
 		mcp, selectErr := selectMCPStdioServer(initialAPIConfig.Snapshot, options.MCPServer)
 		if selectErr != nil {
-			logger.Fatalf("Failed to start stdio MCP: %v", selectErr)
+			fatalServiceError("mcp_stdio_start_failed", selectErr)
 		}
-		logger.Printf("Starting stdio MCP server: %s", mcp.Name)
+		serviceLog(slog.LevelInfo, "mcp_stdio_starting", "api", mcp.Name)
 		if serveErr := serveMCPStdio(os.Stdin, os.Stdout, initialAPIConfig.Snapshot, mcp); serveErr != nil {
-			logger.Fatalf("stdio MCP failed: %v", serveErr)
+			fatalServiceError("mcp_stdio_failed", serveErr, "api", mcp.Name)
 		}
+		serviceLog(slog.LevelInfo, "mcp_stdio_stopped", "api", mcp.Name)
 		return
 	}
 
 	listenAddress, err := resolveListenAddress(config.BindAddress, config.Port)
 	if err != nil {
-		logger.Fatalf("Invalid listen address: %v", err)
+		fatalServiceError("listen_address_invalid", err)
 	}
 	apiHotReloadInterval, err := parseAPIHotReloadInterval(config.APIHotReload.Interval)
 	if err != nil {
-		logger.Fatalf("Invalid APIHotReload.Interval %q: %v", config.APIHotReload.Interval, err)
+		fatalServiceError("api_hot_reload_interval_invalid", err)
 	}
 	backgroundRuntimes = newBackgroundRuntimeManager()
 	backgroundRuntimes.reconcile(initialAPIConfig.Snapshot.Schedules, initialAPIConfig.Snapshot.WSClients)
 	if config.APIHotReload.Enabled {
-		logger.Printf("API hot reload enabled: interval=%s", apiHotReloadInterval)
+		serviceLog(slog.LevelInfo, "api_hot_reload_enabled", "file", paths.API.Path, "interval", apiHotReloadInterval.String())
 		go watchAPIFile(paths.API.Path, apiBaseDir, apiHotReloadInterval, initialAPIConfig.Hash)
 	} else {
-		logger.Printf("API hot reload disabled")
+		serviceLog(slog.LevelInfo, "api_hot_reload_disabled")
 	}
 
-	r := gin.Default()
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
 	r.SetTrustedProxies(nil) // 信頼するプロキシの設定を解除
 	r.Use(CORSMiddleware())
 	r.Use(RecoveryMiddleware())
@@ -374,18 +366,18 @@ func main() {
 
 	// 動的エンドポイントの登録
 	if err := registerDynamicEndpoints(r, apiBaseDir); err != nil {
-		logger.Fatalf("Failed to register dynamic endpoints: %v", err)
+		fatalServiceError("endpoint_registration_failed", err)
 	}
 
 	// HTTPSサーバーを起動するかどうかを判断
 	// ★★★ 修正：cert/key のパス解決に resolvePath を使用 ★★★
 	certFilePath, err := resolvePath(configBaseDir, config.CertFile)
 	if err != nil {
-		logger.Fatalf("Invalid certPath %q: %v", config.CertFile, err)
+		fatalServiceError("cert_path_invalid", err)
 	}
 	keyFilePath, err := resolvePath(configBaseDir, config.KeyFile)
 	if err != nil {
-		logger.Fatalf("Invalid keyPath %q: %v", config.KeyFile, err)
+		fatalServiceError("key_path_invalid", err)
 	}
 
 	server := &http.Server{
@@ -395,19 +387,20 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
+		ErrorLog:          httpServerErrorLogger(),
 	}
 	if config.ProxyProtocol.Enabled {
-		logger.Printf("Trusted PROXY protocol v2 enabled and required")
+		serviceLog(slog.LevelInfo, "proxy_protocol_enabled")
 	}
 	if config.CertFile != "" && config.KeyFile != "" {
-		logger.Printf("Starting HTTPS server at %s", listenAddress)
+		serviceLog(slog.LevelInfo, "http_server_starting", "transport", "https", "address", listenAddress)
 		err = serveConfiguredHTTPServer(server, certFilePath, keyFilePath, config.ProxyProtocol)
 	} else {
-		logger.Printf("Starting HTTP server at %s", listenAddress)
+		serviceLog(slog.LevelInfo, "http_server_starting", "transport", "http", "address", listenAddress)
 		err = serveConfiguredHTTPServer(server, "", "", config.ProxyProtocol)
 	}
 	if err != nil && err != http.ErrServerClosed {
-		logger.Fatalf("Failed to start server: %v", err)
+		fatalServiceError("http_server_failed", err)
 	}
 }
 
@@ -508,7 +501,7 @@ func (listener *proxyProtocolListener) Accept() (net.Conn, error) {
 		peer := conn.RemoteAddr()
 		_ = conn.Close()
 		if logger != nil {
-			logger.Printf("Rejected connection from untrusted PROXY protocol peer %s", peer)
+			serviceLog(slog.LevelWarn, "proxy_protocol_peer_rejected", "peer", peer)
 		}
 	}
 }
@@ -550,7 +543,7 @@ func (conn *proxyProtocolConn) ensureHeader() error {
 		conn.reader = bufio.NewReaderSize(conn.Conn, 16+maxProxyProtocolV2Payload)
 		conn.remoteAddress, conn.parseErr = readProxyProtocolV2Header(conn.reader)
 		if conn.parseErr != nil && logger != nil {
-			logger.Printf("Rejected invalid PROXY protocol v2 header from %s: %v", conn.Conn.RemoteAddr(), conn.parseErr)
+			logServiceError(slog.LevelWarn, "proxy_protocol_header_rejected", conn.parseErr, "peer", conn.Conn.RemoteAddr().String())
 		}
 	})
 	return conn.parseErr
@@ -952,18 +945,16 @@ func acquireWebSocketConnection(limit int) (func(), bool) {
 // handleAPIRequest はAPIリクエストを処理します。
 func handleAPIRequest(c *gin.Context) {
 	// 実行ファイルのディレクトリを取得
-	fmt.Print("handleAPIRequest: ")
-	fmt.Print(c.Request.URL.Path)
 	execPath, err := filepath.Abs(filepath.Dir(os.Args[0]))
 	if err != nil {
-		logger.Fatalf("Error getting executable path: %v", err)
+		fatalServiceError("executable_path_failed", err)
 	}
 
 	// 一時ディレクトリを除外してカレントディレクトリを使用
 	if isTemporaryDirectory(execPath) {
 		execPath, err = os.Getwd()
 		if err != nil {
-			logger.Fatalf("Error getting current working directory: %v", err)
+			fatalServiceError("working_directory_failed", err)
 		}
 	}
 	execDir := apiBaseDir(execPath)
@@ -977,7 +968,7 @@ func handleAPIRequest(c *gin.Context) {
 	apiJsonPath := apiJSONPath(execDir)
 	scriptListData, err := loadJSONFile(apiJsonPath)
 	if err != nil {
-		logger.Fatalf("Error reading user JSON file: %v", err)
+		fatalServiceError("api_config_load_failed", err)
 	}
 
 	// 全てのパラメータをマージ
@@ -1028,8 +1019,6 @@ func handleAPIRequest(c *gin.Context) {
 		allParams[key] = value
 	}
 
-	logger.Print(postFormParams)
-	logger.Print(allParams)
 	// スクリプトの値を取得
 	scriptValue := allParams["api"]
 	scriptValueKey, ok := scriptValue.(string)
@@ -1041,12 +1030,10 @@ func handleAPIRequest(c *gin.Context) {
 	// スクリプト情報を取得
 	scriptInfo, ok := scriptListData[scriptValueKey].(map[string]interface{})
 	if !ok {
-		logger.Print(scriptValueKey)
-		logger.Printf("Script info not found for script key: %s", scriptValueKey)
+		serviceLog(slog.LevelWarn, "api_config_missing", "api", scriptValueKey)
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Script info not found for script key: %s", scriptValueKey)})
 		return
 	}
-	logger.Print(scriptInfo)
 
 	if getAPIType(scriptInfo) != apiTypeAPI {
 		respondWithError(c, http.StatusBadRequest, fmt.Sprintf("API %s is not an HTTP/WebSocket endpoint", scriptValueKey), nil)
@@ -1056,7 +1043,7 @@ func handleAPIRequest(c *gin.Context) {
 	// スクリプトのパスを取得
 	scriptPath, ok := scriptInfo["script"].(string)
 	if !ok {
-		logger.Printf("Script path not found in script info for key: %s", scriptValueKey)
+		serviceLog(slog.LevelWarn, "script_path_missing", "api", scriptValueKey)
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Script path not found in script info for key: %s", scriptValueKey)})
 		return
 	}
@@ -1102,14 +1089,14 @@ func handleWebSocket(c *gin.Context) {
 	// WebSocket 接続をアップグレード
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		logger.Printf("Failed to upgrade WebSocket: %v", err)
+		logServiceError(slog.LevelWarn, "websocket_upgrade_failed", err)
 		return
 	}
 	// http.Server.ReadTimeout protects ordinary request bodies from slow
 	// clients.  A successful WebSocket upgrade is intentionally long-lived,
 	// so clear the inherited socket deadline before entering its read loop.
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		logger.Printf("Failed to clear WebSocket read deadline: %v", err)
+		logServiceError(slog.LevelWarn, "websocket_deadline_clear_failed", err)
 		conn.Close()
 		return
 	}
@@ -1132,12 +1119,12 @@ func handleWebSocket(c *gin.Context) {
 	// 実行ファイルのディレクトリ取得
 	execPath, err := filepath.Abs(filepath.Dir(os.Args[0]))
 	if err != nil {
-		logger.Fatalf("Error getting executable path: %v", err)
+		fatalServiceError("executable_path_failed", err)
 	}
 	if isTemporaryDirectory(execPath) {
 		execPath, err = os.Getwd()
 		if err != nil {
-			logger.Fatalf("Error getting current working directory: %v", err)
+			fatalServiceError("working_directory_failed", err)
 		}
 	}
 	execDir := apiBaseDir(execPath)
@@ -1146,14 +1133,16 @@ func handleWebSocket(c *gin.Context) {
 		// WebSocket からメッセージを読み取る
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
-			logger.Printf("WebSocket read error: %v", err)
+			logWebSocketDisconnect("websocket_disconnected", apiNameString, err)
 			break
 		}
+
+		serviceLog(slog.LevelDebug, "websocket_message_received", "channel", apiNameString, "bytes", len(message))
 
 		// 受信メッセージをJSONとしてパース
 		var receivedData map[string]interface{}
 		if err := json.Unmarshal(message, &receivedData); err != nil {
-			logger.Printf("Invalid JSON data: %v", err)
+			logServiceError(slog.LevelWarn, "websocket_json_invalid", err)
 			sendErrorMessage(conn, "Invalid JSON data")
 			continue
 		}
@@ -1161,7 +1150,7 @@ func handleWebSocket(c *gin.Context) {
 		// "api" キーからメインAPIの識別子を取得
 		scriptValue, ok := receivedData["api"].(string)
 		if !ok {
-			logger.Printf("Script value is not a string")
+			serviceLog(slog.LevelWarn, "websocket_api_invalid")
 			sendErrorMessage(conn, "Invalid script value")
 			continue
 		}
@@ -1178,7 +1167,7 @@ func handleWebSocket(c *gin.Context) {
 		apiJsonPath := apiJSONPath(execDir)
 		scriptListData, err := loadJSONFile(apiJsonPath)
 		if err != nil {
-			logger.Printf("Error reading api.json file: %v", err)
+			logServiceError(slog.LevelError, "api_config_load_failed", err)
 			sendErrorMessage(conn, "Error reading API configuration")
 			continue
 		}
@@ -1186,25 +1175,25 @@ func handleWebSocket(c *gin.Context) {
 		// メインAPIの設定を取得
 		scriptInfo, ok := scriptListData[scriptValue].(map[string]interface{})
 		if !ok {
-			logger.Printf("Script info not found for key: %s", scriptValue)
+			serviceLog(slog.LevelWarn, "api_config_missing", "api", scriptValue)
 			sendErrorMessage(conn, "Script info not found")
 			continue
 		}
 
 		if getAPIType(scriptInfo) != apiTypeAPI {
-			logger.Printf("Script type for %s is not api", scriptValue)
+			serviceLog(slog.LevelWarn, "api_type_invalid", "api", scriptValue)
 			sendErrorMessage(conn, "Script type not supported")
 			continue
 		}
 		if !apiWebSocketAllowed(scriptInfo) {
-			logger.Printf("WebSocket is disabled for key: %s", scriptValue)
+			serviceLog(slog.LevelWarn, "websocket_api_disabled", "api", scriptValue)
 			sendErrorMessage(conn, "WebSocket is not enabled for this API")
 			continue
 		}
 
 		scriptPath, ok := scriptInfo["script"].(string)
 		if !ok {
-			logger.Printf("Script path not found for key: %s", scriptValue)
+			serviceLog(slog.LevelWarn, "script_path_missing", "api", scriptValue)
 			sendErrorMessage(conn, "Script path not found")
 			continue
 		}
@@ -1215,14 +1204,14 @@ func handleWebSocket(c *gin.Context) {
 		// WebSocket 用なので gin.Context は nil を渡す
 		result, err := runJavaScript(javascriptPath, receivedData, nil)
 		if err != nil {
-			logger.Printf("Failed to run JavaScript: %v", err)
+			logServiceError(slog.LevelError, "websocket_script_failed", err, "api", scriptValue)
 			sendErrorMessage(conn, "Failed to run JavaScript")
 			continue
 		}
 
 		// メインAPIの結果をクライアントへ送信
 		if err := conn.WriteMessage(messageType, []byte(result)); err != nil {
-			logger.Printf("Failed to send message to WebSocket: %v", err)
+			logServiceError(slog.LevelWarn, "websocket_send_failed", err, "api", scriptValue)
 			break
 		}
 
@@ -1238,7 +1227,7 @@ func handleWebSocket(c *gin.Context) {
 							// push API を実行
 							pushResult, err := runJavaScript(pushScriptPath, receivedData, nil)
 							if err != nil {
-								logger.Printf("Push API execution failed for key %s: %v", pushTarget, err)
+								logServiceError(slog.LevelError, "push_script_failed", err, "api", pushTarget)
 							} else {
 								// 先頭の "Push: " を取り除く
 								pushResult = strings.TrimPrefix(pushResult, "Push: ")
@@ -1246,23 +1235,23 @@ func handleWebSocket(c *gin.Context) {
 								if pushConnRaw, ok := pushConnections.Load(pushTarget); ok {
 									if pushConn, ok := pushConnRaw.(*websocket.Conn); ok {
 										if err := pushConn.WriteMessage(messageType, []byte(pushResult)); err != nil {
-											logger.Printf("Failed to push message to %s: %v", pushTarget, err)
+											logServiceError(slog.LevelWarn, "push_send_failed", err, "api", pushTarget)
 										} else {
-											logger.Printf("Push message sent successfully to %s", pushTarget)
+											serviceLog(slog.LevelDebug, "push_sent", "api", pushTarget, "bytes", len(pushResult))
 										}
 									} else {
-										logger.Printf("pushConnections entry for %s is not *websocket.Conn", pushTarget)
+										serviceLog(slog.LevelWarn, "push_connection_invalid", "api", pushTarget)
 									}
 								} else {
-									logger.Printf("No WebSocket connection registered for push target: %s", pushTarget)
+									serviceLog(slog.LevelDebug, "push_no_subscribers", "api", pushTarget)
 								}
 							}
 						} else {
-							logger.Printf("Push script not found for key: %s", pushTarget)
+							serviceLog(slog.LevelWarn, "push_script_missing", "api", pushTarget)
 						}
 					}
 				} else {
-					logger.Printf("API config not found for push target: %s", pushTarget)
+					serviceLog(slog.LevelWarn, "push_api_missing", "api", pushTarget)
 				}
 			}
 		}
@@ -1519,29 +1508,152 @@ func jsonAPI(url string, jsonData []byte, username, password string, headers map
 	return string(body), nil
 }
 
-// loggerの初期化
-func initLogger(execDir string) {
-	initLoggerWithFallback(execDir, os.Stdout)
+// Startup errors use JSON on stderr even before config.json has been loaded.
+var logger = log.New(os.Stderr, "", 0)
+
+var serviceLogLevel slog.LevelVar // INFO unless configured otherwise.
+var serviceLogger = slog.New(slog.NewJSONHandler(serviceLogWriter{}, &slog.HandlerOptions{Level: &serviceLogLevel}))
+
+// Keep the logger's synchronized writer so file rotation and output
+// capture use the same destination. The JSON handler escapes untrusted strings.
+type serviceLogWriter struct{}
+
+func (serviceLogWriter) Write(data []byte) (int, error) {
+	err := logger.Output(3, strings.TrimSuffix(string(data), "\n"))
+	return len(data), err
 }
 
-func initLoggerWithFallback(execDir string, fallback io.Writer) {
-	logFilePath := globalConfig.Log.Filename
-	if strings.TrimSpace(logFilePath) != "" && !filepath.IsAbs(logFilePath) {
-		logFilePath = filepath.Join(execDir, logFilePath)
+func serviceLog(level slog.Level, event string, fields ...interface{}) {
+	serviceLogger.Log(context.Background(), level, event, fields...)
+}
+
+func logServiceError(level slog.Level, event string, err error, fields ...interface{}) {
+	if err != nil {
+		cause := err
+		for errors.Unwrap(cause) != nil {
+			cause = errors.Unwrap(cause)
+		}
+		fields = append(fields, "error_type", fmt.Sprintf("%T", cause))
+		var state interface{ SQLState() string }
+		if errors.As(err, &state) {
+			fields = append(fields, "sqlstate", state.SQLState())
+		}
+		var closeError *websocket.CloseError
+		if errors.As(err, &closeError) {
+			fields = append(fields, "close_code", closeError.Code)
+		}
+		// Driver errors and JavaScript exceptions can contain request values.
+		// Full diagnostic text is an explicit debug-only choice, even on errors.
+		if serviceLogLevel.Level() <= slog.LevelDebug {
+			fields = append(fields, "error_detail", boundedLogText(err.Error()))
+		}
 	}
+	serviceLog(level, event, fields...)
+}
+
+func fatalServiceError(event string, err error, fields ...interface{}) {
+	logServiceError(slog.LevelError, event, err, fields...)
+	os.Exit(1)
+}
+
+func logWebSocketDisconnect(event, name string, err error) {
+	level := slog.LevelWarn
+	var closeError *websocket.CloseError
+	if errors.Is(err, net.ErrClosed) || (errors.As(err, &closeError) && (closeError.Code == websocket.CloseNormalClosure || closeError.Code == websocket.CloseGoingAway)) {
+		level = slog.LevelDebug
+	}
+	logServiceError(level, event, err, "endpoint", name)
+}
+
+func boundedLogText(value string) string {
+	const maxLogTextBytes = 4096
+	if len(value) > maxLogTextBytes {
+		return value[:maxLogTextBytes] + "...[truncated]"
+	}
+	return value
+}
+
+func logURLOrigin(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "ws" && parsed.Scheme != "wss") {
+		return "[invalid URL]"
+	}
+	// Userinfo, paths, queries and fragments can all contain credentials.
+	return parsed.Scheme + "://" + parsed.Host
+}
+
+func initLogger(configBaseDir string) error {
+	level := slog.LevelInfo
+	switch strings.ToLower(strings.TrimSpace(globalConfig.Log.Level)) {
+	case "", "info":
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		return errors.New("log.Level must be debug, info, warn, or error")
+	}
+	var output io.Writer = os.Stderr
 	if globalConfig.Log.EnableLogging {
-		// EnableLogging が true の場合はファイル出力
-		logger = log.New(&lumberjack.Logger{
-			Filename:   logFilePath,
+		output = &lumberjack.Logger{
+			Filename:   resolvePathFromBase(configBaseDir, globalConfig.Log.Filename),
 			MaxSize:    globalConfig.Log.MaxSize,
 			MaxBackups: globalConfig.Log.MaxBackups,
 			MaxAge:     globalConfig.Log.MaxAge,
 			Compress:   globalConfig.Log.Compress,
-		}, "", log.LstdFlags)
-	} else {
-		// EnableLogging が false の場合はコンソール出力
-		logger = log.New(fallback, "", log.LstdFlags)
+		}
 	}
+	logger.SetOutput(output)
+	logger.SetFlags(0)
+	logger.SetPrefix("")
+	serviceLogLevel.Set(level)
+	return nil
+}
+
+// net/http diagnostics must also honor the output, level and error privacy policy.
+type httpErrorLogWriter struct{}
+
+func (httpErrorLogWriter) Write(data []byte) (int, error) {
+	logServiceError(slog.LevelError, "http_server_error", errors.New(strings.TrimSpace(string(data))))
+	return len(data), nil
+}
+func httpServerErrorLogger() *log.Logger {
+	return log.New(httpErrorLogWriter{}, "", 0)
+}
+
+func registerScriptConsole(vm *goja.Runtime) {
+	vm.Set("console", map[string]interface{}{
+		"log": func(call goja.FunctionCall) goja.Value {
+			if serviceLogLevel.Level() > slog.LevelDebug {
+				return goja.Undefined()
+			}
+			var args []string
+			jsonStringifyVal := vm.Get("JSON").ToObject(vm).Get("stringify")
+			jsonStringify, ok := goja.AssertFunction(jsonStringifyVal)
+			if !ok {
+				serviceLog(slog.LevelWarn, "script_console_stringify_unavailable")
+				return goja.Undefined()
+			}
+			for _, arg := range call.Arguments {
+				exported := arg.Export()
+				switch exported.(type) {
+				case map[string]interface{}, []interface{}:
+					s, err := jsonStringify(goja.Undefined(), arg)
+					if err == nil {
+						args = append(args, s.String())
+					} else {
+						args = append(args, arg.String())
+					}
+				default:
+					args = append(args, arg.String())
+				}
+			}
+			serviceLog(slog.LevelDebug, "script_console", "message", boundedLogText(strings.Join(args, " ")))
+			return goja.Undefined()
+		},
+	})
 }
 
 // エラーレスポンス
@@ -1550,12 +1662,12 @@ func respondWithError(c *gin.Context, status int, errMsg string, err error) {
 		"error": errMsg,
 	}
 	if err != nil {
-		// ログには詳細も出す
-		logger.Printf("ERROR: %s - %v", errMsg, err)
+		// エラー詳細のログ出力はdebug時だけ。レスポンス形式は維持する。
+		logServiceError(slog.LevelError, "http_request_failed", err, "status", status, "reason", errMsg)
 		// クライアントにも詳細文字列を返す（原因の可視化）
 		payload["detail"] = err.Error()
 	} else {
-		logger.Printf("ERROR: %s", errMsg)
+		serviceLog(slog.LevelError, "http_request_failed", "status", status, "reason", errMsg)
 	}
 	c.JSON(status, payload)
 }
@@ -1565,7 +1677,7 @@ func RecoveryMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		defer func() {
 			if rec := recover(); rec != nil {
-				logger.Printf("Panic recovered: %v", rec)
+				logServiceError(slog.LevelError, "http_panic_recovered", fmt.Errorf("%v", rec))
 				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Internal Server Error"})
 			}
 		}()
@@ -1809,17 +1921,17 @@ func runOutCheckResponse(apiMap map[string]interface{}, execDir string, allParam
 func registerPublicEndpoint(r *gin.Engine, endpoint string, apiMap map[string]interface{}, execDir string) {
 	routePath := "/" + strings.Trim(strings.TrimSpace(endpoint), "/")
 	if routePath == "/" {
-		logger.Printf("public endpoint %q is invalid: endpoint name must not be empty", endpoint)
+		serviceLog(slog.LevelError, "public_endpoint_invalid", "api", endpoint)
 		return
 	}
 
 	publicPath := getAPIString(apiMap, "path")
 	if publicPath == "" {
-		logger.Printf("public endpoint %s: path is missing", endpoint)
+		serviceLog(slog.LevelError, "public_path_missing", "api", endpoint)
 	}
 	_, pathErr := resolvePath(execDir, publicPath)
 	if pathErr != nil {
-		logger.Printf("public endpoint %s: invalid path %q: %v", endpoint, publicPath, pathErr)
+		logServiceError(slog.LevelError, "public_path_invalid", pathErr, "api", endpoint)
 	}
 
 	handler := func(c *gin.Context) {
@@ -4095,7 +4207,6 @@ func websocketMessageTypeLabel(t int) string {
 // performPush は、API 設定とパラメータを元に push 対象の WebSocket 接続へメッセージを送信します。
 func performPush(scriptInfo map[string]interface{}, scriptListData map[string]interface{}, allParams map[string]interface{}, execDir string) {
 	if pushTargetRaw, exists := scriptInfo["push"]; exists {
-		logger.Printf("Push target specified: %v", pushTargetRaw)
 		if pushTarget, ok := pushTargetRaw.(string); ok && pushTarget != "" {
 			// push 対象の設定を取得
 			if pushConfigRaw, exists := scriptListData[pushTarget]; exists {
@@ -4106,33 +4217,31 @@ func performPush(scriptInfo map[string]interface{}, scriptListData map[string]in
 						// push 対象の API のスクリプトを実行
 						pushResult, err := runJavaScript(pushScriptPath, allParams, nil)
 						if err != nil {
-							logger.Printf("Push API execution failed for key %s: %v", pushTarget, err)
+							logServiceError(slog.LevelError, "push_script_failed", err, "api", pushTarget)
 						} else {
-							logger.Printf("Push API execution succeeded for key %s, result: %s", pushTarget, pushResult)
+							serviceLog(slog.LevelDebug, "push_script_completed", "api", pushTarget, "result_bytes", len(pushResult))
 							// pushConnections から対象の WebSocket 接続を取得し、pushResult を送信
 							if pushConnRaw, ok := pushConnections.Load(pushTarget); ok {
 								if pushConn, ok := pushConnRaw.(*websocket.Conn); ok {
 									pushMessage := []byte(pushResult)
-
-									logger.Printf("Sending push message: %s", string(pushMessage))
 									if err := pushConn.WriteMessage(websocket.TextMessage, pushMessage); err != nil {
-										logger.Printf("Failed to push message to %s: %v", pushTarget, err)
+										logServiceError(slog.LevelWarn, "push_send_failed", err, "api", pushTarget)
 									} else {
-										logger.Printf("Push message sent successfully to %s", pushTarget)
+										serviceLog(slog.LevelDebug, "push_sent", "api", pushTarget, "bytes", len(pushResult))
 									}
 								} else {
-									logger.Printf("pushConnections entry for %s is not *websocket.Conn", pushTarget)
+									serviceLog(slog.LevelWarn, "push_connection_invalid", "api", pushTarget)
 								}
 							} else {
-								logger.Printf("No WebSocket connection registered for push target: %s", pushTarget)
+								serviceLog(slog.LevelDebug, "push_no_subscribers", "api", pushTarget)
 							}
 						}
 					} else {
-						logger.Printf("Push script not found for key: %s", pushTarget)
+						serviceLog(slog.LevelWarn, "push_script_missing", "api", pushTarget)
 					}
 				}
 			} else {
-				logger.Printf("API config not found for push target: %s", pushTarget)
+				serviceLog(slog.LevelWarn, "push_api_missing", "api", pushTarget)
 			}
 		}
 	}
@@ -4684,9 +4793,7 @@ func setupGojaVMWithSnapshot(vm *goja.Runtime, snapshot *APIConfigSnapshot, ginC
 		return ""
 	})
 
-	vm.Set("console", map[string]interface{}{
-		"log": func(args ...interface{}) { logger.Print(args...) },
-	})
+	registerScriptConsole(vm)
 
 	jsonAPIFunc := func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
@@ -5417,7 +5524,7 @@ func sendMail(
 	}
 	mp.Close() // --boundary-- を書く
 
-	logger.Printf("DEBUG: attachments=%d, message=%d bytes", len(attachments), msg.Len())
+	serviceLog(slog.LevelDebug, "mail_message_prepared", "attachments", len(attachments), "bytes", msg.Len())
 
 	/* ───── 4. SMTP 送信 ────────────────────────── */
 	rcpts := append(append(to, cc...), bcc...)
@@ -6921,14 +7028,14 @@ func watchAPIFileUntil(apiFilePath, apiBaseDir string, interval time.Duration, i
 		if err != nil {
 			errorKey := fmt.Sprintf("%x:%s", apiFileStatesFingerprint(observedStates), err.Error())
 			if errorKey != lastReloadError {
-				logger.Printf("API hot reload failed: %v; current API configuration remains active", err)
+				logServiceError(slog.LevelError, "api_hot_reload_failed", err, "file", apiFilePath, "active_config_retained", true)
 			}
 			lastReloadError = errorKey
 			continue
 		}
 		lastReloadError = ""
 		if reloaded {
-			logger.Printf("API hot reload succeeded: api_count=%d", len(currentAPIFiles()))
+			serviceLog(slog.LevelInfo, "api_hot_reload_completed", "api_count", len(currentAPIFiles()))
 		}
 	}
 }
@@ -6971,7 +7078,7 @@ func (manager *backgroundRuntimeManager) reconcile(schedules map[string]schedule
 	for name, runtime := range manager.schedules {
 		if _, exists := schedules[name]; !exists {
 			if _, changed := runtime.update(nil); changed {
-				logger.Printf("Stopping schedule job %s", name)
+				serviceLog(slog.LevelInfo, "schedule_stopping", "job", name)
 			}
 		}
 	}
@@ -6980,21 +7087,21 @@ func (manager *backgroundRuntimeManager) reconcile(schedules map[string]schedule
 			accepted, changed := runtime.update(&cfg)
 			if accepted {
 				if changed {
-					logger.Printf("Updated schedule job %s with cron %q", name, cfg.trigger.Value)
+					serviceLog(slog.LevelInfo, "schedule_updated", "job", name, "cron", cfg.trigger.Value)
 				}
 				continue
 			}
 		}
 		runtime := newScheduleRuntime(cfg)
 		manager.schedules[name] = runtime
-		logger.Printf("Starting schedule job %s with cron %q", name, cfg.trigger.Value)
+		serviceLog(slog.LevelInfo, "schedule_starting", "job", name, "cron", cfg.trigger.Value)
 		go manager.runSchedule(name, runtime)
 	}
 
 	for name, runtime := range manager.wsClients {
 		if _, exists := wsClients[name]; !exists {
 			if _, changed, _ := runtime.update(nil); changed {
-				logger.Printf("Stopping WebSocket client %s", name)
+				serviceLog(slog.LevelInfo, "ws_client_stopping", "client", name)
 			}
 		}
 	}
@@ -7003,14 +7110,14 @@ func (manager *backgroundRuntimeManager) reconcile(schedules map[string]schedule
 			accepted, changed, reconnect := runtime.update(&cfg)
 			if accepted {
 				if changed {
-					logger.Printf("Updated WebSocket client %s reconnect=%t", name, reconnect)
+					serviceLog(slog.LevelInfo, "ws_client_updated", "client", name, "reconnect", reconnect)
 				}
 				continue
 			}
 		}
 		runtime := newWSClientRuntime(cfg)
 		manager.wsClients[name] = runtime
-		logger.Printf("Starting WebSocket client %s -> %s", name, cfg.connectURL)
+		serviceLog(slog.LevelInfo, "ws_client_starting", "client", name, "origin", logURLOrigin(cfg.connectURL))
 		go manager.runWSClient(name, runtime)
 	}
 }
@@ -7167,11 +7274,11 @@ func (runtime *scheduleRuntime) run() {
 		}
 		next := cfg.schedule.next(time.Now())
 		if next.IsZero() {
-			logger.Printf("Schedule job %s has no next run time", cfg.name)
+			serviceLog(slog.LevelWarn, "schedule_no_next_run", "job", cfg.name)
 			<-runtime.wake
 			continue
 		}
-		logger.Printf("Schedule job %s next run at %s", cfg.name, next.Format(time.RFC3339))
+		serviceLog(slog.LevelDebug, "schedule_next_run", "job", cfg.name, "next_run", next.Format(time.RFC3339))
 		timer := time.NewTimer(time.Until(next))
 		select {
 		case <-runtime.wake:
@@ -7197,10 +7304,10 @@ func (runtime *scheduleRuntime) run() {
 		}
 		result, err := runJavaScript(latest.scriptPath, allParams, nil)
 		if err != nil {
-			logger.Printf("Schedule job %s failed: %v", latest.name, err)
+			logServiceError(slog.LevelError, "schedule_failed", err, "job", latest.name)
 			continue
 		}
-		logger.Printf("Schedule job %s completed: %s", latest.name, result)
+		serviceLog(slog.LevelInfo, "schedule_completed", "job", latest.name, "result_bytes", len(result))
 	}
 }
 
@@ -7330,7 +7437,7 @@ func (runtime *wsClientRuntime) run() {
 			continue
 		}
 		if err != nil {
-			logger.Printf("WebSocket client %s disconnected: %v", cfg.name, err)
+			logWebSocketDisconnect("ws_client_disconnected", cfg.name, err)
 		}
 		timer := time.NewTimer(backoff)
 		select {
@@ -7369,12 +7476,13 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
 	}
 	defer runtime.clearConnection(conn)
 	defer conn.Close()
-	logger.Printf("WebSocket client %s connected", cfg.name)
+	serviceLog(slog.LevelInfo, "ws_client_connected", "client", cfg.name)
 	for {
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
 			return fmt.Errorf("read error: %w", err)
 		}
+		serviceLog(slog.LevelDebug, "ws_client_message_received", "client", cfg.name, "message_type", websocketMessageTypeLabel(msgType), "bytes", len(data))
 		if msgType == websocket.CloseMessage {
 			return fmt.Errorf("close message received: %s", string(data))
 		}
@@ -7399,7 +7507,7 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
 		}
 		result, err := runJavaScript(latest.scriptPath, allParams, nil)
 		if err != nil {
-			logger.Printf("ws_client %s script error: %v", latest.name, err)
+			logServiceError(slog.LevelError, "ws_client_script_failed", err, "client", latest.name)
 			continue
 		}
 		if trimmed := strings.TrimSpace(result); trimmed != "" {

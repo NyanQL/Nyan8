@@ -3,13 +3,16 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"mime"
 	"mime/multipart"
 	"net"
@@ -28,8 +31,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dop251/goja"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/natefinch/lumberjack"
 )
 
 func initTestLogger() {
@@ -2221,7 +2226,7 @@ func TestWatchAPIFileReloadsGrandchildWithoutRootChange(t *testing.T) {
 		return exists
 	})
 	waitForHotReloadCondition(t, "grandchild reload log", func() bool {
-		return strings.Contains(logs.String(), "API hot reload succeeded: api_count=1")
+		return strings.Contains(logs.String(), `"msg":"api_hot_reload_completed","api_count":1`)
 	})
 }
 
@@ -2730,10 +2735,10 @@ func TestWatchAPIFileSuppressesDuplicateErrorsAndRecovers(t *testing.T) {
 
 	writeHotReloadTestFile(t, apiPath, `{"broken":`)
 	waitForHotReloadCondition(t, "first reload error", func() bool {
-		return strings.Count(logs.String(), "API hot reload failed:") == 1
+		return strings.Count(logs.String(), `"msg":"api_hot_reload_failed"`) == 1
 	})
 	time.Sleep(25 * time.Millisecond)
-	if count := strings.Count(logs.String(), "API hot reload failed:"); count != 1 {
+	if count := strings.Count(logs.String(), `"msg":"api_hot_reload_failed"`); count != 1 {
 		t.Fatalf("reload error count=%d, want 1; logs=%q", count, logs.String())
 	}
 
@@ -2743,7 +2748,7 @@ func TestWatchAPIFileSuppressesDuplicateErrorsAndRecovers(t *testing.T) {
 		return exists
 	})
 	waitForHotReloadCondition(t, "success log", func() bool {
-		return strings.Contains(logs.String(), "API hot reload succeeded: api_count=1")
+		return strings.Contains(logs.String(), `"msg":"api_hot_reload_completed","api_count":1`)
 	})
 }
 
@@ -4084,7 +4089,7 @@ func TestMCPStdioCommandProcessEndToEnd(t *testing.T) {
   "version":"test",
   "Port":-1,
   "bindAddress":"invalid bind address",
-  "log":{"EnableLogging":false},
+  "log":{"EnableLogging":false,"Level":"debug"},
   "APIHotReload":{"Enabled":true,"Interval":"not-a-duration"},
   "websocket":{"maxConnections":128}
 }`
@@ -4155,10 +4160,11 @@ func TestMCPStdioCommandProcessEndToEnd(t *testing.T) {
 	if strings.Contains(stdout.String(), "Executable directory") || strings.Contains(stdout.String(), "stdio-process-log") {
 		t.Fatalf("stdout was polluted: %q", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "Starting stdio MCP server: local_mcp") || !strings.Contains(stderr.String(), "stdio-process-log") {
+	decodeLogRecords(t, stderr.String())
+	if !strings.Contains(stderr.String(), `"msg":"mcp_stdio_starting","api":"local_mcp"`) || !strings.Contains(stderr.String(), "stdio-process-log") {
 		t.Fatalf("stderr did not receive startup/JavaScript logs: %q", stderr.String())
 	}
-	if strings.Contains(stderr.String(), "Starting schedule job") || strings.Contains(stderr.String(), "Starting WebSocket client") || strings.Contains(stderr.String(), "API hot reload enabled") {
+	if strings.Contains(stderr.String(), `"msg":"schedule_starting"`) || strings.Contains(stderr.String(), `"msg":"ws_client_starting"`) || strings.Contains(stderr.String(), `"msg":"api_hot_reload_enabled"`) {
 		t.Fatalf("stdio mode started background services: %q", stderr.String())
 	}
 	if !strings.Contains(stdout.String(), `"transport":"stdio"`) {
@@ -6089,6 +6095,9 @@ type phase5SMTPResult struct {
 }
 
 func TestPhase5SendMailEnvelopeMIMEAndSecretHygiene(t *testing.T) {
+	previousLevel := serviceLogLevel.Level()
+	serviceLogLevel.Set(slog.LevelDebug)
+	t.Cleanup(func() { serviceLogLevel.Set(previousLevel) })
 	host, port, smtpResult := newPhase5SMTPServer(t)
 	previousConfig := globalConfig
 	previousLogger := logger
@@ -6223,7 +6232,7 @@ func TestPhase5SendMailEnvelopeMIMEAndSecretHygiene(t *testing.T) {
 			t.Errorf("log exposed secret %q: %q", secret, logs)
 		}
 	}
-	if !strings.Contains(logs, "attachments=1") {
+	if !strings.Contains(logs, `"attachments":1`) {
 		t.Fatalf("non-secret mail diagnostic missing: %q", logs)
 	}
 }
@@ -6883,4 +6892,326 @@ func testProxyProtocolV2Header(t *testing.T, sourceIP, destinationIP net.IP, sou
 	binary.BigEndian.PutUint16(ports[0:2], uint16(sourcePort))
 	binary.BigEndian.PutUint16(ports[2:4], uint16(destinationPort))
 	return append(header, ports...)
+}
+
+func captureServiceLogs(t *testing.T, level slog.Level) *bytes.Buffer {
+	t.Helper()
+	previous, previousLevel := logger, serviceLogLevel.Level()
+	output := new(bytes.Buffer)
+	logger = log.New(output, "", 0)
+	serviceLogLevel.Set(level)
+	t.Cleanup(func() { logger = previous; serviceLogLevel.Set(previousLevel) })
+	return output
+}
+
+func decodeLogRecords(t *testing.T, data string) []map[string]interface{} {
+	t.Helper()
+	var records []map[string]interface{}
+	for _, line := range strings.Split(strings.TrimSpace(data), "\n") {
+		if line == "" {
+			continue
+		}
+		var record map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("invalid JSON log: %q: %v", line, err)
+		}
+		if record["time"] == nil || record["level"] == nil || record["msg"] == nil {
+			t.Fatalf("missing log fields: %v", record)
+		}
+		records = append(records, record)
+	}
+	return records
+}
+
+func TestServiceLoggingLevelsAndErrorPrivacy(t *testing.T) {
+	output := captureServiceLogs(t, slog.LevelInfo)
+	err := fmt.Errorf("wrapped: %w", errors.New("password=private-error\nforged log line"))
+	serviceLog(slog.LevelDebug, "hidden_debug")
+	logServiceError(slog.LevelError, "execution_failed", err, "api", "example\napi")
+	records := decodeLogRecords(t, output.String())
+	if len(records) != 1 || records[0]["level"] != "ERROR" || records[0]["error_type"] != "*errors.errorString" || records[0]["api"] != "example\napi" || records[0]["error_detail"] != nil {
+		t.Fatalf("unexpected records: %v", records)
+	}
+	if strings.Contains(output.String(), "private-error") {
+		t.Fatal("info log exposed error detail")
+	}
+	output.Reset()
+	serviceLogLevel.Set(slog.LevelDebug)
+	logServiceError(slog.LevelError, "execution_failed", err)
+	if got := decodeLogRecords(t, output.String())[0]["error_detail"]; got != err.Error() {
+		t.Fatalf("debug detail=%v", got)
+	}
+	output.Reset()
+	serviceLogLevel.Set(slog.LevelError)
+	serviceLog(slog.LevelInfo, "hidden_info")
+	serviceLog(slog.LevelWarn, "hidden_warn")
+	if output.Len() != 0 {
+		t.Fatalf("lower levels emitted: %s", output)
+	}
+}
+
+func TestInitLoggerDestinationsLevelsAndRotation(t *testing.T) {
+	output := captureServiceLogs(t, slog.LevelInfo)
+	previous := globalConfig
+	t.Cleanup(func() { globalConfig = previous })
+	for _, tc := range []struct {
+		value string
+		want  slog.Level
+	}{
+		{"", slog.LevelInfo}, {"info", slog.LevelInfo}, {" DEBUG ", slog.LevelDebug}, {"warn", slog.LevelWarn}, {"error", slog.LevelError},
+	} {
+		globalConfig.Log = LogConfig{Level: tc.value}
+		if err := initLogger(t.TempDir()); err != nil {
+			t.Fatal(err)
+		}
+		if logger.Writer() != os.Stderr || serviceLogLevel.Level() != tc.want {
+			t.Fatalf("wrong destination/level for %q", tc.value)
+		}
+	}
+	logger.SetOutput(output)
+	globalConfig.Log = LogConfig{EnableLogging: true, Filename: "should-not-exist.log", Level: "verbose"}
+	if err := initLogger(t.TempDir()); err == nil {
+		t.Fatal("invalid level accepted")
+	}
+	if logger.Writer() != output || serviceLogLevel.Level() != slog.LevelError {
+		t.Fatal("invalid config changed logging")
+	}
+	dir := t.TempDir()
+	globalConfig.Log = LogConfig{EnableLogging: true, Filename: "logs/service.log", Level: "info", MaxSize: 5, MaxBackups: 3, MaxAge: 7, Compress: true}
+	if err := initLogger(dir); err != nil {
+		t.Fatal(err)
+	}
+	writer, ok := logger.Writer().(*lumberjack.Logger)
+	if !ok {
+		t.Fatalf("unexpected file writer %T", logger.Writer())
+	}
+	defer writer.Close()
+	if writer.Filename != filepath.Join(dir, "logs/service.log") || writer.MaxSize != 5 || writer.MaxBackups != 3 || writer.MaxAge != 7 || !writer.Compress {
+		t.Fatalf("rotation config changed: %+v", writer)
+	}
+	serviceLog(slog.LevelInfo, "file_event")
+	data, err := os.ReadFile(writer.Filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeLogRecords(t, string(data)); len(got) != 1 || got[0]["msg"] != "file_event" {
+		t.Fatalf("file records: %v", got)
+	}
+}
+
+func TestScriptConsoleLoggingRequiresDebug(t *testing.T) {
+	output := captureServiceLogs(t, slog.LevelInfo)
+	vm := goja.New()
+	setupGojaVM(vm, nil)
+	script := `console.log("private-console\nsecond line", {count:2});`
+	if _, err := vm.RunString(script); err != nil {
+		t.Fatal(err)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("info console leaked: %s", output)
+	}
+	serviceLogLevel.Set(slog.LevelDebug)
+	if _, err := vm.RunString(script); err != nil {
+		t.Fatal(err)
+	}
+	records := decodeLogRecords(t, output.String())
+	if len(records) != 1 || records[0]["message"] != "private-console\nsecond line {\"count\":2}" {
+		t.Fatalf("console record: %v", records)
+	}
+	output.Reset()
+	if _, err := vm.RunString(`console.log("x".repeat(10000));`); err != nil {
+		t.Fatal(err)
+	}
+	message := decodeLogRecords(t, output.String())[0]["message"].(string)
+	if message != strings.Repeat("x", 4096)+"...[truncated]" {
+		t.Fatalf("unexpected truncation length: %d", len(message))
+	}
+}
+
+func TestWebSocketLoggingPrivacyAndNormalClose(t *testing.T) {
+	output := captureServiceLogs(t, slog.LevelInfo)
+	logWebSocketDisconnect("ws_client_disconnected", "sample", &websocket.CloseError{Code: websocket.CloseNormalClosure, Text: "private-close"})
+	if output.Len() != 0 {
+		t.Fatal("normal close emitted at info")
+	}
+	logWebSocketDisconnect("ws_client_disconnected", "sample", &websocket.CloseError{Code: websocket.CloseAbnormalClosure, Text: "private-close"})
+	record := decodeLogRecords(t, output.String())[0]
+	if record["level"] != "WARN" || record["close_code"] != float64(websocket.CloseAbnormalClosure) || strings.Contains(output.String(), "private-close") {
+		t.Fatalf("close record: %v", record)
+	}
+	if got := logURLOrigin("wss://user:password@example.test:443/private-path?token=secret#secret"); got != "wss://example.test:443" {
+		t.Fatalf("origin=%s", got)
+	}
+}
+
+func TestHTTPRecoveryAndServerDiagnosticsArePrivateJSON(t *testing.T) {
+	output := captureServiceLogs(t, slog.LevelInfo)
+	previousMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(previousMode) })
+	router := gin.New()
+	router.Use(RecoveryMiddleware())
+	router.GET("/panic", func(c *gin.Context) { panic("private-panic") })
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/panic", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("panic status=%d", rec.Code)
+	}
+	httpServerErrorLogger().Print("private-server-diagnostic\nforged line")
+	records := decodeLogRecords(t, output.String())
+	if len(records) != 2 || strings.Contains(output.String(), "private-") || strings.Contains(output.String(), "forged") {
+		t.Fatalf("diagnostics leaked: %s", output)
+	}
+}
+
+// Run the actual main entry point in an isolated process without rebuilding it.
+func TestLoggingCommandHelper(t *testing.T) {
+	if os.Getenv("NYAN8_LOGGING_TEST_HELPER") != "1" {
+		return
+	}
+	for i, arg := range os.Args {
+		if arg == "--" {
+			os.Args = append([]string{os.Args[0]}, os.Args[i+1:]...)
+			main()
+			os.Exit(0)
+		}
+	}
+	os.Exit(2)
+}
+
+func loggingTestCommand(t *testing.T, configPath, apiPath string) *exec.Cmd {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestLoggingCommandHelper$", "--", "--config", configPath, "--api", apiPath)
+	command.Env = append(os.Environ(), "NYAN8_LOGGING_TEST_HELPER=1")
+	return command
+}
+
+func TestStartupLoggingErrorsAreJSONOnStderr(t *testing.T) {
+	for _, tc := range []struct{ name, config, event string }{
+		{"missing", "", "startup_options_invalid"},
+		{"malformed", `{`, "config_load_failed"},
+		{"invalid_level", `{"log":{"Level":"verbose"}}`, "invalid_log_level"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.json")
+			apiPath := filepath.Join(dir, "api.json")
+			writeHotReloadTestFile(t, apiPath, `{}`)
+			if tc.config != "" {
+				writeHotReloadTestFile(t, configPath, tc.config)
+			}
+			command := loggingTestCommand(t, configPath, apiPath)
+			var stdout, stderr bytes.Buffer
+			command.Stdout = &stdout
+			command.Stderr = &stderr
+			if err := command.Run(); err == nil {
+				t.Fatal("startup unexpectedly succeeded")
+			}
+			records := decodeLogRecords(t, stderr.String())
+			if stdout.Len() != 0 || len(records) != 1 || records[0]["msg"] != tc.event || records[0]["level"] != "ERROR" {
+				t.Fatalf("stdout=%s stderr=%s", &stdout, &stderr)
+			}
+		})
+	}
+}
+
+func TestHTTPProcessLoggingDoesNotDumpPayloadsOrAccessLogs(t *testing.T) {
+	for _, level := range []string{"info", "debug"} {
+		t.Run(level, func(t *testing.T) { checkHTTPProcessLogging(t, level) })
+	}
+}
+
+func checkHTTPProcessLogging(t *testing.T, level string) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("local listener unavailable: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	apiPath := filepath.Join(dir, "api.json")
+	writeHotReloadTestFile(t, configPath, fmt.Sprintf(`{"Port":%d,"bindAddress":"127.0.0.1","APIHotReload":{"Enabled":false},"log":{"EnableLogging":false,"Level":%q}}`, port, level))
+	writeHotReloadTestFile(t, apiPath, `{"echo":{"script":"./echo.js","private_config":"private-config"},"push":{"script":"./push.js"},"with_push":{"script":"./echo.js","push":"push"}}`)
+	writeHotReloadTestFile(t, filepath.Join(dir, "echo.js"), `console.log("private-console"); JSON.stringify({status:200,value:nyanAllParams.value});`)
+	writeHotReloadTestFile(t, filepath.Join(dir, "push.js"), `JSON.stringify({value:"private-push"});`)
+	command := loggingTestCommand(t, configPath, apiPath)
+	var stdout, stderr synchronizedBuffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if command.ProcessState == nil {
+			command.Process.Kill()
+			command.Wait()
+		}
+	}()
+	client := &http.Client{Timeout: time.Second}
+	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		response, err := client.Get(base + "/favicon.ico")
+		if err == nil {
+			response.Body.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server did not start: %s", stderr.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for _, path := range []string{"/", "/echo", "/with_push", "/nyan-rpc"} {
+		body := `{"api":"echo","value":"private-request"}`
+		if path == "/nyan-rpc" {
+			body = `{"jsonrpc":"2.0","id":1,"method":"with_push","params":{"value":"private-request"}}`
+		}
+		response, err := client.Post(base+path, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, readErr := io.ReadAll(response.Body)
+		response.Body.Close()
+		if readErr != nil || !bytes.Contains(data, []byte("private-request")) {
+			t.Fatalf("%s response=%s err=%v", path, data, readErr)
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("%s status=%d logs=%s", path, response.StatusCode, stderr.String())
+		}
+	}
+	command.Process.Kill()
+	command.Wait()
+	if stdout.String() != "" {
+		t.Fatalf("stdout polluted: %s", stdout.String())
+	}
+	records := decodeLogRecords(t, stderr.String())
+	if len(records) == 0 {
+		t.Fatal("missing startup logs")
+	}
+	for _, record := range records {
+		switch record["msg"] {
+		case "starting", "config_loaded", "api_config_loaded", "api_hot_reload_disabled", "http_server_starting":
+		case "push_script_completed", "push_no_subscribers":
+			if level != "debug" {
+				t.Fatalf("debug event emitted at info: %v", record)
+			}
+		case "script_console":
+			if level != "debug" {
+				t.Fatalf("console emitted at info: %v", record)
+			}
+		default:
+			t.Fatalf("unexpected request/access log: %v", record)
+		}
+	}
+	for _, secret := range []string{"private-request", "private-config", "private-push"} {
+		if strings.Contains(stderr.String(), secret) {
+			t.Fatalf("log exposed payload: %s", stderr.String())
+		}
+	}
+	if strings.Contains(stderr.String(), "private-console") != (level == "debug") {
+		t.Fatalf("console level mismatch: %s", stderr.String())
+	}
 }
