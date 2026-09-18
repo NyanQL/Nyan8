@@ -807,6 +807,85 @@ func TestReloadAPIFileRejectsInvalidBackgroundConfiguration(t *testing.T) {
 	}
 }
 
+func TestAPIEndpointAliasCollision(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		root string
+	}{
+		{"direct", `{"x":{},"api/x":{}}`},
+		{"included", `{"x":{},"api":{"type":"include","path":"./child.json"}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			rootPath := filepath.Join(dir, "api.json")
+			writeHotReloadTestFile(t, rootPath, test.root)
+			writeHotReloadTestFile(t, filepath.Join(dir, "child.json"), `{"x":{}}`)
+			_, err := readAPIConfigFile(rootPath, dir)
+			if err == nil {
+				t.Fatal("conflicting endpoint paths were accepted")
+			}
+			for _, detail := range []string{`endpoint path "/api/x"`, `"x"`, `"api/x"`} {
+				if !strings.Contains(err.Error(), detail) {
+					t.Fatalf("error=%v, want %s", err, detail)
+				}
+			}
+		})
+	}
+}
+
+func TestAPIEndpointAliasesRemainAvailable(t *testing.T) {
+	dir := t.TempDir()
+	writeHotReloadTestFile(t, filepath.Join(dir, "script.js"), `JSON.stringify({status:200,api:nyanAllParams.api});`)
+	loaded, err := loadMCPPhase12Config(dir, map[string]interface{}{
+		"x":     map[string]interface{}{"script": "./script.js"},
+		"api/y": map[string]interface{}{"script": "./script.js"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+	if err := registerDynamicEndpoints(router, dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct{ path, api string }{
+		{"/x", "x"}, {"/api/x", "x"}, {"/api/y", "api/y"},
+	} {
+		response := serveMCPPhase12Request(router, httptest.NewRequest(http.MethodGet, test.path, nil))
+		var body map[string]interface{}
+		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || response.Code != http.StatusOK || body["api"] != test.api {
+			t.Fatalf("%s: status=%d body=%s error=%v", test.path, response.Code, response.Body.String(), err)
+		}
+	}
+}
+
+func TestReloadRejectsAPIEndpointAliasCollision(t *testing.T) {
+	initTestLogger()
+	dir := t.TempDir()
+	rootPath := filepath.Join(dir, "api.json")
+	childPath := filepath.Join(dir, "child.json")
+	writeHotReloadTestFile(t, rootPath, `{"x":{},"api":{"type":"include","path":"./child.json"}}`)
+	writeHotReloadTestFile(t, childPath, `{"y":{}}`)
+	loaded, err := readAPIConfigFile(rootPath, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousSnapshot, previousManager := currentAPISnapshot(), backgroundRuntimes
+	publishAPISnapshot(loaded.Snapshot)
+	backgroundRuntimes = nil
+	t.Cleanup(func() {
+		publishAPISnapshot(previousSnapshot)
+		backgroundRuntimes = previousManager
+	})
+	writeHotReloadTestFile(t, childPath, `{"x":{}}`)
+	_, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, dir, loaded.Snapshot.FileStates)
+	if err == nil || reloaded || !strings.Contains(err.Error(), `endpoint path "/api/x"`) {
+		t.Fatalf("reload=%t error=%v, want rejected collision", reloaded, err)
+	}
+	if currentAPISnapshot() != loaded.Snapshot {
+		t.Fatal("last good snapshot was replaced after rejected collision")
+	}
+}
+
 func TestDecodeAPIFileRejectsInvalidTopLevelAndEntries(t *testing.T) {
 	tests := []struct {
 		name string
@@ -3943,6 +4022,112 @@ func TestMCPStdioTransportConfiguration(t *testing.T) {
 				t.Fatalf("error=%v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestMCPOAuthReferenceWhitespace(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	oauth := mcpPhase12Entry(t, definitions)["oauth"].(map[string]interface{})
+	for key, value := range oauth {
+		oauth[key] = " \t" + value.(string) + "\n "
+	}
+	writeHotReloadTestFile(t, filepath.Join(dir, "oauth-hook.js"), mcpPhase2GapAuthenticatedHook())
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := loaded.Snapshot.MCPServers["custom-mcp"]
+	encoded, err := json.Marshal(server.OAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var normalized map[string]interface{}
+	if err := json.Unmarshal(encoded, &normalized); err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range oauth {
+		if normalized[key] != strings.TrimSpace(value.(string)) {
+			t.Errorf("oauth.%s=%q, want normalized reference", key, normalized[key])
+		}
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+	response := mcpPhase2GapToolCall(router, `{}`, "Bearer test")
+	body := oauthPhase4JSONBody(t, response)
+	result, _ := body["result"].(map[string]interface{})
+	if response.Code != http.StatusOK || result["isError"] != false {
+		t.Fatalf("normalized OAuth hook failed: status=%d body=%s", response.Code, response.Body.String())
+	}
+	writeHotReloadTestFile(t, filepath.Join(dir, "oauth-hook.js"), `({authenticated:false,forbidden:false});`)
+	response = mcpPhase2GapToolCall(router, `{}`, "")
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("OAuth rejection was bypassed: status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestMCPOAuthInvalidReferences(t *testing.T) {
+	for _, test := range []struct {
+		name, reference, want string
+		allBlank              bool
+	}{
+		{name: "missing", reference: "missing", want: "references invalid API"},
+		{name: "wrong type", reference: "assets", want: "references invalid API"},
+		{name: "blank", reference: " \t", want: "oauth.verifyAccess API name is required"},
+		{name: "all blank", allBlank: true, want: "API name is required"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir, definitions := newMCPPhase12Definitions(t)
+			oauth := mcpPhase12Entry(t, definitions)["oauth"].(map[string]interface{})
+			oauth["verifyAccess"] = test.reference
+			if test.allBlank {
+				for key := range oauth {
+					oauth[key] = " \t"
+				}
+			}
+			if _, err := loadMCPPhase12Config(dir, definitions); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestMCPWithoutOAuthRemainsAnonymous(t *testing.T) {
+	for _, transport := range []string{"streamable_http", "stdio"} {
+		for _, form := range []string{"omitted", "empty object", "empty references"} {
+			t.Run(transport+"/"+form, func(t *testing.T) {
+				dir, definitions := newMCPPhase12Definitions(t)
+				mcp := mcpPhase12Entry(t, definitions)
+				mcp["transport"] = transport
+				delete(mcp, "redirectURIAllowedPrefixes")
+				switch form {
+				case "omitted":
+					delete(mcp, "oauth")
+				case "empty object":
+					mcp["oauth"] = map[string]interface{}{}
+				case "empty references":
+					for key := range mcp["oauth"].(map[string]interface{}) {
+						mcp["oauth"].(map[string]interface{})[key] = ""
+					}
+				}
+				loaded, err := loadMCPPhase12Config(dir, definitions)
+				if err != nil {
+					t.Fatal(err)
+				}
+				server := loaded.Snapshot.MCPServers["custom-mcp"]
+				principal, authenticated, forbidden := validateMCPAccessToken(loaded.Snapshot, server, mcpRuntimeURLs{}, "", "sample", nil)
+				if mcpOAuthConfigured(server.OAuth) || !authenticated || forbidden || !reflect.DeepEqual(principal, map[string]interface{}{"anonymous": true}) {
+					t.Fatalf("anonymous access changed: principal=%#v authenticated=%t forbidden=%t", principal, authenticated, forbidden)
+				}
+				if transport == "streamable_http" {
+					router := publishMCPPhase12Snapshot(t, loaded)
+					response := mcpPhase2GapToolCall(router, `{}`, "")
+					body := oauthPhase4JSONBody(t, response)
+					result, _ := body["result"].(map[string]interface{})
+					if response.Code != http.StatusOK || result["isError"] != false {
+						t.Fatalf("anonymous Tool call failed: status=%d body=%s", response.Code, response.Body.String())
+					}
+				}
+			})
+		}
 	}
 }
 

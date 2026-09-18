@@ -2036,6 +2036,9 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 		return fmt.Errorf("failed to load api.json: %v", err)
 	}
 
+	if err := validateAPIEndpointPaths(apiConf); err != nil {
+		return err
+	}
 	for apiName, apiRaw := range apiConf {
 		apiMap, ok := apiRaw.(map[string]interface{})
 		if !ok {
@@ -5959,17 +5962,23 @@ func mcpOAuthConfigured(config MCPOAuthConfig) bool {
 }
 
 func resolveAndValidateMCPOAuthAPIs(mcp *MCPServerConfig, definitions map[string]interface{}) error {
-	required := map[string]string{
-		"authorizationServerMetadata": mcp.OAuth.AuthorizationServerMetadata,
-		"protectedResourceMetadata":   mcp.OAuth.ProtectedResourceMetadata,
-		"authorize":                   mcp.OAuth.Authorize,
-		"token":                       mcp.OAuth.Token,
-		"register":                    mcp.OAuth.Register,
-		"verifyAccess":                mcp.OAuth.VerifyAccess,
+	// Normalize only after OAuth has been detected, so blank references cannot
+	// turn a malformed OAuth configuration into an anonymous server.
+	required := []struct {
+		label string
+		name  *string
+	}{
+		{"authorizationServerMetadata", &mcp.OAuth.AuthorizationServerMetadata},
+		{"protectedResourceMetadata", &mcp.OAuth.ProtectedResourceMetadata},
+		{"authorize", &mcp.OAuth.Authorize},
+		{"token", &mcp.OAuth.Token},
+		{"register", &mcp.OAuth.Register},
+		{"verifyAccess", &mcp.OAuth.VerifyAccess},
 	}
 	seen := make(map[string]string)
-	for label, apiName := range required {
-		apiName = strings.TrimSpace(apiName)
+	for _, reference := range required {
+		*reference.name = strings.TrimSpace(*reference.name)
+		label, apiName := reference.label, *reference.name
 		if apiName == "" {
 			return fmt.Errorf("oauth.%s API name is required", label)
 		}
@@ -5991,7 +6000,8 @@ func resolveAndValidateMCPOAuthAPIs(mcp *MCPServerConfig, definitions map[string
 		}
 	}
 	if mcp.OAuth.AdminUser != "" {
-		apiName := strings.TrimSpace(mcp.OAuth.AdminUser)
+		mcp.OAuth.AdminUser = strings.TrimSpace(mcp.OAuth.AdminUser)
+		apiName := mcp.OAuth.AdminUser
 		if _, err := canonicalAPIEndpointPath(apiName); err != nil {
 			return fmt.Errorf("oauth.adminUser: %w", err)
 		}
@@ -6006,7 +6016,10 @@ func resolveAndValidateMCPOAuthAPIs(mcp *MCPServerConfig, definitions map[string
 			return fmt.Errorf("oauth.adminUser and oauth.%s reference the same API %q", previous, apiName)
 		}
 	}
-	verifyDefinition := definitions[mcp.OAuth.VerifyAccess].(map[string]interface{})
+	verifyDefinition, ok := definitions[mcp.OAuth.VerifyAccess].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("oauth.verifyAccess references invalid API %q", mcp.OAuth.VerifyAccess)
+	}
 	scopes, ok := stringSliceFromJSON(verifyDefinition["scopes"])
 	if !ok || len(scopes) == 0 {
 		return fmt.Errorf("oauth.verifyAccess API %q must define scopes", mcp.OAuth.VerifyAccess)
@@ -6261,6 +6274,9 @@ func loadAPIConfigDataAttempt(apiFilePath, apiBaseDir string, data []byte) (*api
 			return nil, fileStates, fmt.Errorf("API name %q uses the reserved nyan namespace", name)
 		}
 	}
+	if err := validateAPIEndpointPaths(definitions); err != nil {
+		return nil, fileStates, err
+	}
 	mcpServers, err := buildMCPServerConfigs(apiFilePath, definitions, sources)
 	if err != nil {
 		return nil, fileStates, err
@@ -6279,6 +6295,27 @@ func loadAPIConfigDataAttempt(apiFilePath, apiBaseDir string, data []byte) (*api
 		Snapshot: snapshot,
 		Hash:     sha256.Sum256(data),
 	}, fileStates, nil
+}
+
+func validateAPIEndpointPaths(definitions map[string]interface{}) error {
+	owners := make(map[string]string)
+	for _, name := range sortedDefinitionNames(definitions) {
+		entry, ok := definitions[name].(map[string]interface{})
+		if !ok || getAPIType(entry) != apiTypeAPI || isReservedNyanAPIName(name) {
+			continue
+		}
+		paths := []string{"/" + name}
+		if !strings.HasPrefix(name, "api/") {
+			paths = append(paths, "/api/"+name)
+		}
+		for _, path := range paths {
+			if owner, exists := owners[path]; exists {
+				return fmt.Errorf("endpoint path %q conflicts between APIs %q and %q", path, owner, name)
+			}
+			owners[path] = name
+		}
+	}
+	return nil
 }
 
 func decodeAPIFile(data []byte) (map[string]interface{}, error) {
