@@ -8,13 +8,18 @@
   "javascript_include": [
     "./javascript/base.js"
   ],
+  "APIHotReload": {
+    "Enabled": true,
+    "Interval": "1s"
+  },
   "log": {
     "Filename": "./logs/nyan8.log",
     "MaxSize": 5,
     "MaxBackups": 3,
     "MaxAge": 7,
     "Compress": true,
-    "EnableLogging": false
+    "EnableLogging": false,
+    "Level": "info"
   },
   "smtp": {
     "host": "",
