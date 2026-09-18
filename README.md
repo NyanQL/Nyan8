@@ -132,7 +132,9 @@ NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./nyan8
 
 #### `api.json` のホットリロード
 
-HTTPサーバーモードでは、ルートの `api.json` と、そこから `include` されたすべての `api.json` は既定で1秒ごとに確認され、変更を検知するとルートから再解析されます。通常API、public API、JSON-RPC、MCP、schedule、ws_clientの追加・変更・削除が再起動なしで反映されます。stdioモードではホットリロードを行いません。
+HTTPサーバーモードでは、ルートの `api.json` と、そこから `include` されたすべての `api.json` は既定で1秒ごとに確認され、変更を検知するとルートから再解析されます。通常API、public API、JSON-RPC、MCP、schedule、ws_clientの追加・変更・削除を反映します。ただし、HTTPエンドポイントには以下の制約があります。stdioモードではホットリロードを行いません。
+
+起動時に登録したHTTPルートは再構築されません。そのURLを別のAPI名で再利用する変更などでは、設定のリロードが成功しても新しいAPIへ到達できない場合があり、再起動が必要です。たとえば、起動時の `x` を削除して `api/x` を追加すると、`/api/x` は旧API名 `x` を参照したままとなり、再起動するまで404を返します。
 
 不正なJSON、存在しないinclude先、不正なschedule／ws_client設定などは採用されず、直前の正常な定義で稼働を継続します。失敗した候補内で新しく見つかったinclude先も監視されるため、ファイルの作成や修正だけで自動的に再試行されます。同じファイル状態とエラーは繰り返しログ出力されません。
 
@@ -276,7 +278,7 @@ includeには次の制約があります。
 ```jsonc
 "websocket_clients_local": {
   "type": "ws_client",
-  "script": "./javascript/ws_client_handler.js",
+  "script": "./javascript/ws/receiver_main.js",
   "connectURL": "ws://localhost:8889/hello",
   "description": "ローカル動作確認用（自身の /hello に接続）"
 }
@@ -284,8 +286,16 @@ includeには次の制約があります。
 
 受信したメッセージは `nyanAllParams.ws_message_text` に入り、`script` で指定した JavaScript へ渡されます。戻り値は文字列化され、前後の空白を除去してから上流の WebSocket へテキストメッセージとして送信されます。空文字または空白だけの結果では返信しません。
 
-動かし方の例:
-- まずはローカルで挙動を見る場合: 上記 `websocket_clients_local` を有効のままにして `./nyan8`（ソースから試す場合は `sh testrun.sh`）を起動します。別ターミナルで手持ちの WebSocket クライアントから `ws://localhost:8889/hello` に送ると、指定した `script` の応答が見えます。
+動作確認には、`api.json` の `add` に `push: "hello"` を指定したサンプル構成を使います。
+
+1. `config.json` の `Port` を `8889`、`log.Level` を `debug` にし、上記の `websocket_clients_local` を含む構成で `./nyan8` を起動します。
+2. `client: "websocket_clients_local"` の `ws_client_connected` ログで接続完了を確認した後、別ターミナルから次を実行します。
+
+   ```bash
+   curl "http://localhost:8889/add?addNumber=3"
+   ```
+
+3. `add` の実行で `hello` へのpushが発生し、Nyan8内の `ws_client` が受信します。`receiver_main.js` の `console.log` による受信内容を、ログの `script_console` で確認します。`EnableLogging: true` ならログファイル、`false` なら標準エラーへ出力されます。このサンプルは空文字を返すため、WebSocketへの返信は行いません。
 
 #### 定期実行ジョブ
 
@@ -463,7 +473,7 @@ GET/POST/JSON 受信パラメータをまとめたオブジェクトです。
 このオブジェクトから受信した情報をすべて取得することができます。
 
 ```javascript
-console.log("nyanAllParams");
+console.log(nyanAllParams);
 ```
 
 ### 4‑2 console.log
