@@ -1163,14 +1163,19 @@ func handleWebSocket(c *gin.Context) {
 		}
 		receivedData["_headers"] = headersMap
 
-		// api.json を読み込む
+		// Pin one configuration generation for this message, including nested calls.
 		apiJsonPath := apiJSONPath(execDir)
-		scriptListData, err := loadJSONFile(apiJsonPath)
-		if err != nil {
-			logServiceError(slog.LevelError, "api_config_load_failed", err)
-			sendErrorMessage(conn, "Error reading API configuration")
-			continue
+		snapshot, cached := cachedAPISnapshotFor(apiJsonPath)
+		if !cached {
+			loaded, err := readAPIConfigFile(apiJsonPath, execDir)
+			if err != nil {
+				logServiceError(slog.LevelError, "api_config_load_failed", err)
+				sendErrorMessage(conn, "Error reading API configuration")
+				continue
+			}
+			snapshot = loaded.Snapshot
 		}
+		scriptListData := snapshot.Definitions
 
 		// メインAPIの設定を取得
 		scriptInfo, ok := scriptListData[scriptValue].(map[string]interface{})
@@ -1191,6 +1196,18 @@ func handleWebSocket(c *gin.Context) {
 			continue
 		}
 
+		if handled, checkResponse, err := runParamCheckResponseWithSnapshot(snapshot, scriptInfo, execDir, receivedData, nil); handled {
+			if err != nil {
+				logServiceError(slog.LevelError, "websocket_param_check_failed", err, "api", scriptValue)
+				checkResponse = newParamCheckError(http.StatusInternalServerError, "Failed to run paramCheck")
+			}
+			if err := writeWebSocketCheckResponse(conn, messageType, checkResponse); err != nil {
+				logServiceError(slog.LevelWarn, "websocket_send_failed", err, "api", scriptValue)
+				break
+			}
+			continue
+		}
+
 		scriptPath, ok := scriptInfo["script"].(string)
 		if !ok {
 			serviceLog(slog.LevelWarn, "script_path_missing", "api", scriptValue)
@@ -1202,10 +1219,22 @@ func handleWebSocket(c *gin.Context) {
 		javascriptPath := resolvePathFromBase(execDir, scriptPath)
 
 		// WebSocket 用なので gin.Context は nil を渡す
-		result, err := runJavaScript(javascriptPath, receivedData, nil)
+		result, err := runJavaScriptWithSnapshot(snapshot, javascriptPath, receivedData, nil)
 		if err != nil {
 			logServiceError(slog.LevelError, "websocket_script_failed", err, "api", scriptValue)
 			sendErrorMessage(conn, "Failed to run JavaScript")
+			continue
+		}
+
+		if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, scriptInfo, execDir, receivedData, scriptResultResponse(result), nil); handled {
+			if err != nil {
+				logServiceError(slog.LevelError, "websocket_out_check_failed", err, "api", scriptValue)
+				checkResponse = newParamCheckError(http.StatusInternalServerError, "Failed to run outCheck")
+			}
+			if err := writeWebSocketCheckResponse(conn, messageType, checkResponse); err != nil {
+				logServiceError(slog.LevelWarn, "websocket_send_failed", err, "api", scriptValue)
+				break
+			}
 			continue
 		}
 
@@ -1225,7 +1254,7 @@ func handleWebSocket(c *gin.Context) {
 						if ok && pushScript != "" {
 							pushScriptPath := resolvePathFromBase(execDir, pushScript)
 							// push API を実行
-							pushResult, err := runJavaScript(pushScriptPath, receivedData, nil)
+							pushResult, err := runJavaScriptWithSnapshot(snapshot, pushScriptPath, receivedData, nil)
 							if err != nil {
 								logServiceError(slog.LevelError, "push_script_failed", err, "api", pushTarget)
 							} else {
@@ -1265,6 +1294,15 @@ func sendErrorMessage(conn *websocket.Conn, message string) {
 	}
 	jsonMessage, _ := json.Marshal(errMessage)
 	conn.WriteMessage(websocket.TextMessage, jsonMessage)
+}
+
+func writeWebSocketCheckResponse(conn *websocket.Conn, messageType int, response ParamCheckResponse) error {
+	body, err := json.Marshal(response)
+	if err != nil {
+		logServiceError(slog.LevelError, "websocket_check_response_invalid", err)
+		body, _ = json.Marshal(newParamCheckError(http.StatusInternalServerError, "Failed to encode check response"))
+	}
+	return conn.WriteMessage(messageType, body)
 }
 
 // runJavaScript はJavaScriptを実行します。
@@ -1402,8 +1440,18 @@ func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, 
 		return result, nil
 	}
 
-	// Internal calls can return plain text or JSON without an HTTP status.
-	// Inspect the original result without changing the value returned on success.
+	if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, apiMap, execDir, params, scriptResultResponse(result), ginCtx); err != nil {
+		return "", fmt.Errorf("failed to run outCheck for API %s: %w", apiName, err)
+	} else if handled {
+		body, err := json.Marshal(checkResponse)
+		return string(body), err
+	}
+	return result, nil
+}
+
+// WebSocket and internal calls accept plain text or JSON without an HTTP status.
+// Inspect the original result without changing the value returned on success.
+func scriptResultResponse(result string) APIResponse {
 	response := APIResponse{Status: http.StatusOK, ContentType: "text/plain", Headers: map[string]string{}, Body: []byte(result)}
 	if json.Valid(response.Body) {
 		response.ContentType = "application/json"
@@ -1414,13 +1462,7 @@ func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, 
 			}
 		}
 	}
-	if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, apiMap, execDir, params, response, ginCtx); err != nil {
-		return "", fmt.Errorf("failed to run outCheck for API %s: %w", apiName, err)
-	} else if handled {
-		body, err := json.Marshal(checkResponse)
-		return string(body), err
-	}
-	return result, nil
+	return response
 }
 
 // loadJSONFile はJSONファイルを読み込みます。
@@ -6927,6 +6969,14 @@ func setAPIFiles(path string, files map[string]interface{}) {
 }
 
 func cachedAPIFilesFor(path string) (map[string]interface{}, bool) {
+	snapshot, ok := cachedAPISnapshotFor(path)
+	if !ok {
+		return nil, false
+	}
+	return snapshot.Definitions, true
+}
+
+func cachedAPISnapshotFor(path string) (*APIConfigSnapshot, bool) {
 	snapshot := currentAPISnapshot()
 	if snapshot == nil || snapshot.Definitions == nil || snapshot.RootPath == "" {
 		return nil, false
@@ -6935,7 +6985,7 @@ func cachedAPIFilesFor(path string) (map[string]interface{}, bool) {
 	if err != nil || normalizedPath != snapshot.RootPath {
 		return nil, false
 	}
-	return snapshot.Definitions, true
+	return snapshot, true
 }
 
 func sameAPIConfigSnapshot(current, candidate *APIConfigSnapshot) bool {

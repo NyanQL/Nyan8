@@ -359,7 +359,7 @@ schedule 定義自体には `paramCheck` / `outCheck` / `push` は適用され�
 | `type: "public"` のHTTPファイル配信 | 適用する |
 | JSON-RPC `/nyan-rpc` | 適用する（レスポンスはJSON-RPC形式） |
 | ルート経由の通常API `/?api=API名` | 適用しない |
-| WebSocket経由の通常API | 適用しない |
+| WebSocket経由の通常API | 受信メッセージごとに適用する（チェック結果をJSONフレームで返信） |
 | `nyanCallMe()` | 適用する（チェック結果を呼び出し元に返す） |
 | schedule、ws_client | 適用しない |
 | MCP `tools/call` | 適用しない。JSON Schemaによる検証を行う |
@@ -405,7 +405,7 @@ JSON-RPCの通常実行では `paramCheck` による拒否を `error.code: -3260
 
 #### checkOnly
 
-上表の対応経路で `nyan_mode=checkOnly` を指定すると、`paramCheck` だけを実行し、本体 `script` やファイル配信へ進みません。JSON-RPCでは `params.nyan_mode`、内部呼び出しでは `nyanCallMe({ api: "secure_add", nyan_mode: "checkOnly" })` のように指定します。
+上表の対応経路で `nyan_mode=checkOnly` を指定すると、`paramCheck` だけを実行し、本体 `script` やファイル配信へ進みません。JSON-RPCでは `params.nyan_mode`、WebSocketでは送信するJSONの `nyan_mode`、内部呼び出しでは `nyanCallMe({ api: "secure_add", nyan_mode: "checkOnly" })` のように指定します。
 
 ```bash
 curl "http://localhost:8080/secure_add?token=secret&nyan_mode=checkOnly"
@@ -448,7 +448,25 @@ if (nyanAllParams.nyan_output.status === 200 &&
 
 互換用に `nyan_output_status`, `nyan_output_content_type`, `nyan_output_body`, `nyan_output_body_base64` も利用できます。
 
-通常APIのHTTPエンドポイント、`type: "public"`、JSON-RPCでは上表の範囲で同じチェック指定を利用できます。MCP `tools/call` ではチェック用JavaScriptを実行せず、解決済みの `inputSchema` と、定義されている場合の `outputSchema` で検証します。`public`、`schedule`、`ws_client` はJSON-RPC / MCP Toolとしては呼び出せません。
+通常APIのHTTPエンドポイント、`type: "public"`、JSON-RPC、WebSocket、`nyanCallMe()` では上表の範囲で同じチェック指定を利用できます。MCP `tools/call` ではチェック用JavaScriptを実行せず、解決済みの `inputSchema` と、定義されている場合の `outputSchema` で検証します。`public`、`schedule`、`ws_client` はJSON-RPC / MCP Toolとしては呼び出せません。
+
+#### WebSocketでのチェック
+
+受信したJSONメッセージの `api` に対応するAPIで、`paramCheck` → 本体 `script` → `outCheck` → 応答送信 → `push` の順に処理します。接続URLとメッセージの `api` が異なる場合も、チェック対象はメッセージの `api` です。ルート接続、`/API名`、`/api/API名` のいずれでも同じ処理を行います。
+
+`paramCheck` で拒否された場合は本体・`outCheck`・`push` を実行せず、チェック結果を返します。`outCheck` で拒否された場合は本体の出力を送信せず、チェック結果を返して `push` も止めます。チェック結果は `{ success, status, result }` のJSONで、返信フレームは受信したtext/binaryの種別を維持します。`status` はフレーム内の値であり、接続済みのHTTPステータスを変更しません。チェックの実行・解析や結果のJSON化に失敗すると `success: false`、`status: 500` の結果を返します。これらの応答後も接続を維持し、次のメッセージを処理します。
+
+`checkOnly` では本体・`outCheck`・`push` を実行しません。`paramCheck` が未設定なら `{ success: true, status: 200, result: null }` を返信します。
+
+```json
+{"api":"secure_add","token":"secret","nyan_mode":"checkOnly"}
+```
+
+`outCheck` の `nyan_output` は `nyanCallMe()` と同じ形式です。`body` は本体の返却内容そのもので、JSONオブジェクトの数値 `status` を使用し、省略時は `200` とします。有効なJSONなら `contentType` は `application/json`、それ以外は `text/plain`、`headers` は空のオブジェクトです。本体が `success: false` を返す場合も検査します。
+
+接続情報は `nyanAllParams._headers`、`_remote_ip`、`_user_agent` で参照できます。これらはサーバーが接続時の情報で上書きします。WebSocketでは `nyanGetCookie()`、`nyanGetRemoteIP()`、`nyanGetUserAgent()`、`nyanGetRequestHeaders()` は空の値を返すため、チェックでも `nyanAllParams` の接続情報を使用してください。
+
+チェックはAPIを実行するメッセージに適用します。WebSocket接続の確立やPushの購読登録時には実行しません。また、Push先API自体の `paramCheck` / `outCheck` と `type: "ws_client"` の受信スクリプトには適用されません。
 
 ---
 
