@@ -345,7 +345,7 @@ schedule の `script` では通常の API と同じように `nyanAllParams`、`
 
 schedule は HTTP リクエストから実行されないため、`nyanGetRemoteIP()`、`nyanGetUserAgent()`、`nyanGetRequestHeaders()` などリクエスト情報に依存する関数は空の値を返します。`javascript_include` に設定した共通 JavaScript は、schedule の `script` 実行時にも毎回読み込まれます。
 
-schedule 定義自体には `paramCheck` / `outCheck` / `push` は適用されません。必要な前処理や通知は、schedule の `script` 内、または `nyanCallMe()` で呼び出す通常APIの本体に実装してください。`nyanCallMe()` も呼び出し先の `paramCheck` / `outCheck` / `push` を実行しません。
+schedule 定義自体には `paramCheck` / `outCheck` / `push` は適用されません。`nyanCallMe()` で通常APIを呼び出す場合は、呼び出し先の `paramCheck` / `outCheck` が実行されます。通知は schedule の `script` 内、または呼び出し先APIの本体に実装してください。
 
 動作確認例の [api.json](./api.json) にある `schedule_debug_every_minute` と [javascript/schedule_debug.js](./javascript/schedule_debug.js) は、HTTPサーバーモードで1分ごとに実行されます。`info` ではジョブ名と結果のバイト数を含む完了ログを記録します。スクリプトが `console.log` へ渡す実行時刻などの本文を確認する場合は、`log.Level` を `debug` に設定してください。
 
@@ -360,7 +360,8 @@ schedule 定義自体には `paramCheck` / `outCheck` / `push` は適用され�
 | JSON-RPC `/nyan-rpc` | 適用する（レスポンスはJSON-RPC形式） |
 | ルート経由の通常API `/?api=API名` | 適用しない |
 | WebSocket経由の通常API | 適用しない |
-| `nyanCallMe()`、schedule、ws_client | 適用しない |
+| `nyanCallMe()` | 適用する（チェック結果を呼び出し元に返す） |
+| schedule、ws_client | 適用しない |
 | MCP `tools/call` | 適用しない。JSON Schemaによる検証を行う |
 
 `paramCheck` に認可処理を実装しても、適用しない経路からの実行は保護されません。認可を設計する際は、使用する呼び出し経路を確認してください。
@@ -400,9 +401,11 @@ if (nyanAllParams.token === "secret") {
 
 JSON-RPCの通常実行では `paramCheck` による拒否を `error.code: -32602`、`error.data` にチェック結果を入れたレスポンスとしてHTTP 200で返します。`checkOnly` または `outCheck` による応答では、チェック結果を `result` に入れ、HTTPステータスをチェック結果の `status` にします。
 
+`nyanCallMe()` では、拒否された場合や `checkOnly` の場合にチェック結果のオブジェクトを呼び出し元へ返します。呼び出し元は `success` と `status` を確認してください。呼び出し元のHTTPレスポンスへ直接書き込むことはありません。
+
 #### checkOnly
 
-上表の対応経路で `nyan_mode=checkOnly` を指定すると、`paramCheck` だけを実行し、本体 `script` やファイル配信へ進みません。JSON-RPCでは `params.nyan_mode` に指定します。
+上表の対応経路で `nyan_mode=checkOnly` を指定すると、`paramCheck` だけを実行し、本体 `script` やファイル配信へ進みません。JSON-RPCでは `params.nyan_mode`、内部呼び出しでは `nyanCallMe({ api: "secure_add", nyan_mode: "checkOnly" })` のように指定します。
 
 ```bash
 curl "http://localhost:8080/secure_add?token=secret&nyan_mode=checkOnly"
@@ -702,8 +705,12 @@ console.log(result); // { success: true, status: 200, data: ...}
 
 - `api` でAPI名を指定します。指定が無い場合は `hello2` が呼ばれます。
 - 引数オブジェクトは、そのまま呼び出し先 API の `nyanAllParams` に渡されます。
-- 呼び出し先の本体 `script` を直接実行します。`paramCheck` / `outCheck` / `push` は適用されず、`nyan_mode=checkOnly` による実行抑止もありません。
-- 実行に失敗すると JavaScript 側で例外が投げられます。
+- 呼び出し先の `paramCheck` → 本体 `script` → `outCheck` の順に実行します。チェックは `success: true` かつ `status: 200` の場合だけ通過します。
+- `paramCheck` で拒否されると本体・`outCheck` は実行せず、チェック結果を返します。`outCheck` で拒否されると本体の結果の代わりにチェック結果を返します。
+- `nyan_mode: "checkOnly"` では本体・`outCheck` を実行せず、`paramCheck` の結果を返します。`paramCheck` が未設定の場合は `{ success: true, status: 200, result: null }` を返します。
+- `outCheck` には本体の返却内容を `nyan_output.body` などで渡します。JSONオブジェクトに数値の `status` があれば使用し、それ以外は `200` とします。`contentType` は有効なJSONなら `application/json`、それ以外は `text/plain`、`headers` は空のオブジェクトです。本体が `success: false` を返す場合も検査します。チェック通過時の戻り値は従来どおりです。
+- `push` は実行しません。
+- 本体やチェックの実行、チェックの戻り値の解析に失敗すると JavaScript 側で例外が投げられます。
 
 #### よくある使い方
 自分自身の API から別 API を呼び出して結果をマージする用途です。

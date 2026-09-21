@@ -1375,21 +1375,50 @@ func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, 
 		return "", fmt.Errorf("API %s is not an HTTP endpoint", apiName)
 	}
 
-	scriptPath, ok := apiMap["script"].(string)
-	if !ok || strings.TrimSpace(scriptPath) == "" {
-		return "", fmt.Errorf("script not found for API %s", apiName)
-	}
-
 	params := map[string]interface{}{}
 	for k, v := range allParams {
 		params[k] = v
 	}
 	params["api"] = apiName
 
+	if handled, checkResponse, err := runParamCheckResponseWithSnapshot(snapshot, apiMap, execDir, params, ginCtx); err != nil {
+		return "", fmt.Errorf("failed to run paramCheck for API %s: %w", apiName, err)
+	} else if handled {
+		body, err := json.Marshal(checkResponse)
+		return string(body), err
+	}
+
+	scriptPath, ok := apiMap["script"].(string)
+	if !ok || strings.TrimSpace(scriptPath) == "" {
+		return "", fmt.Errorf("script not found for API %s", apiName)
+	}
+
 	fullScriptPath := resolvePathFromBase(execDir, scriptPath)
 	result, err := runJavaScriptWithSnapshot(snapshot, fullScriptPath, params, ginCtx)
 	if err != nil {
 		return "", fmt.Errorf("failed to run API %s: %v", apiName, err)
+	}
+	if getAPIString(apiMap, "outCheck", "outcheck") == "" {
+		return result, nil
+	}
+
+	// Internal calls can return plain text or JSON without an HTTP status.
+	// Inspect the original result without changing the value returned on success.
+	response := APIResponse{Status: http.StatusOK, ContentType: "text/plain", Headers: map[string]string{}, Body: []byte(result)}
+	if json.Valid(response.Body) {
+		response.ContentType = "application/json"
+		var jsonData map[string]interface{}
+		if err := json.Unmarshal(response.Body, &jsonData); err == nil {
+			if status, ok := parseStatusCode(jsonData["status"]); ok {
+				response.Status = status
+			}
+		}
+	}
+	if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, apiMap, execDir, params, response, ginCtx); err != nil {
+		return "", fmt.Errorf("failed to run outCheck for API %s: %w", apiName, err)
+	} else if handled {
+		body, err := json.Marshal(checkResponse)
+		return string(body), err
 	}
 	return result, nil
 }
@@ -1823,45 +1852,45 @@ func writeParamCheckResponse(c *gin.Context, resp ParamCheckResponse) {
 }
 
 func runParamCheck(c *gin.Context, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}) (bool, bool) {
+	if getAPIString(apiMap, "paramCheck", "paramcheck", "check") != "" {
+		c.Writer.Header().Set("Cache-Control", "no-store")
+		c.Writer.Header().Set("Pragma", "no-cache")
+	}
+	handled, checkResponse, err := runParamCheckResponseWithSnapshot(currentAPISnapshot(), apiMap, execDir, allParams, c)
+	if err != nil {
+		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
+		return false, true
+	}
+	if handled {
+		writeParamCheckResponse(c, checkResponse)
+		return checkResponse.Success && checkResponse.Status == http.StatusOK, true
+	}
+	return true, false
+}
+
+// runParamCheckResponseWithSnapshot evaluates checks without writing an HTTP response.
+func runParamCheckResponseWithSnapshot(snapshot *APIConfigSnapshot, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, ginCtx *gin.Context) (bool, ParamCheckResponse, error) {
 	checkOnly := isCheckOnlyMode(allParams)
 	paramCheckPath := getAPIString(apiMap, "paramCheck", "paramcheck", "check")
 	if paramCheckPath == "" {
-		if checkOnly {
-			writeParamCheckResponse(c, ParamCheckResponse{
-				Success: true,
-				Status:  http.StatusOK,
-				Result:  nil,
-			})
-			return false, true
-		}
-		return true, false
+		return checkOnly, ParamCheckResponse{Success: true, Status: http.StatusOK, Result: nil}, nil
 	}
-
-	c.Writer.Header().Set("Cache-Control", "no-store")
-	c.Writer.Header().Set("Pragma", "no-cache")
 
 	fullPath, err := resolvePath(execDir, paramCheckPath)
 	if err != nil {
-		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
-		return false, true
+		return true, ParamCheckResponse{}, err
 	}
-	resultValue, err := runJavaScriptValue(fullPath, allParams, c)
+	resultValue, err := runJavaScriptValueWithSnapshot(snapshot, fullPath, allParams, ginCtx)
 	if err != nil {
-		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
-		return false, true
+		return true, ParamCheckResponse{}, err
 	}
 	checkResponse, err := parseCheckResponse(resultValue, "paramCheck")
 	if err != nil {
-		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
-		return false, true
+		return true, ParamCheckResponse{}, err
 	}
 
 	allowed := checkResponse.Success && checkResponse.Status == http.StatusOK
-	if checkOnly || !allowed {
-		writeParamCheckResponse(c, checkResponse)
-		return allowed, true
-	}
-	return true, false
+	return checkOnly || !allowed, checkResponse, nil
 }
 
 func runOutCheck(c *gin.Context, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response APIResponse) bool {
@@ -1878,6 +1907,10 @@ func runOutCheck(c *gin.Context, apiMap map[string]interface{}, execDir string, 
 }
 
 func runOutCheckResponse(apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response APIResponse, ginCtx *gin.Context) (bool, ParamCheckResponse, error) {
+	return runOutCheckResponseWithSnapshot(currentAPISnapshot(), apiMap, execDir, allParams, response, ginCtx)
+}
+
+func runOutCheckResponseWithSnapshot(snapshot *APIConfigSnapshot, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response APIResponse, ginCtx *gin.Context) (bool, ParamCheckResponse, error) {
 	outCheckPath := getAPIString(apiMap, "outCheck", "outcheck")
 	if outCheckPath == "" {
 		return false, ParamCheckResponse{}, nil
@@ -1904,7 +1937,7 @@ func runOutCheckResponse(apiMap map[string]interface{}, execDir string, allParam
 	if err != nil {
 		return true, ParamCheckResponse{}, err
 	}
-	resultValue, err := runJavaScriptValue(fullPath, checkParams, ginCtx)
+	resultValue, err := runJavaScriptValueWithSnapshot(snapshot, fullPath, checkParams, ginCtx)
 	if err != nil {
 		return true, ParamCheckResponse{}, err
 	}
