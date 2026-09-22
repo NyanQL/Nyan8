@@ -28,11 +28,11 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 ## 2  インストール
 
 1. [Releases](https://github.com/NyanQL/Nyan8/releases) から OS 向け zip を取得
-2. 展開して実行ファイル（`nyan8` / `nyan8.exe`）を配置
+2. 展開して実行ファイル（`Nyan8` / `Nyan8.exe`）を配置
 3. `config.json` と `api.json` をプロジェクトルートに用意
 4. 実行：
    ```bash
-   ./nyan8   # Windows は nyan8.exe
+   ./Nyan8   # Windows は Nyan8.exe
    ```
 
 ### 2-1  設定ファイルのパス指定
@@ -41,9 +41,9 @@ Nyan8 は起動時に `api.json` と `config.json` の読み込みパスを指�
 指定がない場合は、従来どおり実行ファイルと同じディレクトリにある `api.json` / `config.json` を読み込みます。
 
 ```bash
-./nyan8
-./nyan8 --api /path/to/api.json --config /path/to/config.json
-NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./nyan8
+./Nyan8
+./Nyan8 --api /path/to/api.json --config /path/to/config.json
+NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./Nyan8
 ```
 
 各 `api.json` 内の `script` / `path` / `paramCheck` / `outCheck` の相対パスは、その定義を書いた `api.json` が置かれているディレクトリから解決されます。
@@ -289,7 +289,7 @@ includeには次の制約があります。
 
 動作確認には、`api.json` の `add` に `push: "hello"` を指定したサンプル構成を使います。
 
-1. `config.json` の `Port` を `8889`、`log.Level` を `debug` にし、上記の `websocket_clients_local` を含む構成で `./nyan8` を起動します。
+1. `config.json` の `Port` を `8889`、`log.Level` を `debug` にし、上記の `websocket_clients_local` を含む構成で `./Nyan8` を起動します。
 2. `client: "websocket_clients_local"` の `ws_client_connected` ログで接続完了を確認した後、別ターミナルから次を実行します。
 
    ```bash
