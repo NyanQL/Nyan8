@@ -424,28 +424,39 @@ curl "http://localhost:8080/secure_add?token=secret&nyan_mode=checkOnly"
 
 #### outCheck の入力
 
-`outCheck` では、本体の出力内容を `nyanAllParams.nyan_output` で参照できます。
+`outCheck` は、本体の実行結果を出力する前に検査するためのチェックです。主に `result` など、本体が返すデータの値や構造が期待どおりかを確認します。
+
+`nyanAllParams.nyan_output.body` には、本体の返却内容全体が文字列で入ります。本体がJSONを返す場合は、`JSON.parse()` で解析して `result` などを参照します。次は、本体が `{ success: true, status: 200, result: { message: "expected" } }` の形式のJSON文字列を返すAPIを想定した例です。
 
 ```javascript
-if (nyanAllParams.nyan_output.status === 200 &&
-    nyanAllParams.nyan_output.body.indexOf("expected") >= 0) {
+const output = JSON.parse(nyanAllParams.nyan_output.body);
+if (output && output.result && output.result.message === "expected") {
   ({ success: true, status: 200, result: null });
 } else {
   ({ success: false, status: 409, result: { message: "output mismatch" } });
 }
 ```
 
-`nyan_output` には次の値が入ります。
+この例の `output.result` は本体の返却データです。チェック自身が返す `{ success, status, result }` は、チェックの合否や拒否理由を表します。チェック通過時には、本体の返却データが出力に使われます。
+
+`nyan_output` には次の検査用データが入ります。
 
 | キー | 説明 |
 |------|------|
-| `status` | 本体レスポンスの HTTP ステータス |
-| `contentType` | 本体レスポンスの Content-Type |
-| `headers` | 本体レスポンスのヘッダー |
-| `body` | 本体レスポンス本文 |
-| `bodyBase64` | 本体レスポンス本文の Base64 |
-| `bodyLength` | 本体レスポンス本文のバイト長 |
+| `status` | 呼び出し経路に応じて設定する検査用ステータス |
+| `contentType` | 検査対象の内容に対して設定する形式情報 |
+| `headers` | 現在は空のオブジェクト `{}`。実際の応答ヘッダーは含まれない |
+| `body` | 本体の返却内容全体、または公開ファイル全体の内容を文字列にしたもの |
+| `bodyBase64` | 検査対象の内容をBase64にしたもの |
+| `bodyLength` | 検査対象の内容のバイト長 |
 | `bodyLengthBytes` | `bodyLength` と同じ互換用フィールド |
+
+`status`、`contentType`、`headers` は付随情報で、通常API、JSON-RPCなどの呼び出し経路によって意味が異なります。`nyan_output` は出力前の検査用データであり、本文やバイト長を含め、最終的なHTTPレスポンスとの一致を保証するものではありません。
+
+- 通常APIのHTTPエンドポイントでは、本体が返したJSON文字列を検査します。`status` は本体の数値 `status`、`contentType` は `application/json` です。検査通過後にJSONを再生成して送信するため、空白やキーの順序、バイト長が変わる場合があります。
+- JSON-RPCでは、JSON-RPC形式に整形する前の本体のJSON文字列を検査します。`status` は本体の数値 `status`（数値がなければ `200`）、`contentType` は `application/json` です。たとえば本体の `status` が `201` なら検査時も `201` ですが、検査通過後の成功応答はHTTP `200` で、本体の `status` を除いたデータがJSON-RPCの `result` に入ります。
+- `type: "public"` では、ファイル全体を検査します。`status` は `200`、`contentType` はファイル内容から推定した値です。検査通過後にHEAD、範囲指定、条件付きリクエストなどの処理を行うため、実際には本文なし、部分配信（`206`）、未更新（`304`）になる場合があります。配信時のContent-Typeも、拡張子などによって異なる場合があります。
+- WebSocketと `nyanCallMe()` では、本体の返却内容を検査します。`status` は本体のJSONオブジェクトに数値で指定された値（それ以外は `200`）、`contentType` は有効なJSONなら `application/json`、それ以外は `text/plain` です。これらはHTTPレスポンスのステータスやヘッダーを表しません。
 
 互換用に `nyan_output_status`, `nyan_output_content_type`, `nyan_output_body`, `nyan_output_body_base64` も利用できます。
 
