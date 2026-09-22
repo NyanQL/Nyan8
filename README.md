@@ -363,6 +363,7 @@ schedule 定義自体には `paramCheck` / `outCheck` / `push` は適用され�
 | WebSocket経由の通常API | 受信メッセージごとに適用する（チェック結果をJSONフレームで返信） |
 | `nyanCallMe()` | 適用する（チェック結果を呼び出し元に返す） |
 | schedule、ws_client | 適用しない |
+| OAuth用として呼び出されるAPI | 適用しない。OAuth用JavaScript内で検証する |
 | MCP `tools/call` | 適用しない。JSON Schemaによる検証を行う |
 
 `paramCheck` に認可処理を実装しても、適用しない経路からの実行は保護されません。認可を設計する際は、使用する呼び出し経路を確認してください。
@@ -1138,6 +1139,129 @@ Go側はAuthorization Server MetadataとProtected Resource Metadata、OAuth endp
 たとえばDCRで `authorization_code` と `refresh_token` を受け付けた場合のrefresh token発行や、`authorization_code` だけの場合の発行抑止は、OAuth JavaScript側で制御します。利用するpolicyは、Go側が公開するmetadataと整合させてください。
 
 未認証またはscope不足の`tools/call`には、HTTPの`WWW-Authenticate`とMCP resultの`_meta["mcp/www_authenticate"]`の両方を返します。
+
+#### OAuth用JavaScriptの実行環境と処理の種類
+
+以下は、MCPのOAuth設定から専用経路で呼び出されるJavaScriptの仕様です。参照先は通常APIと同じ `script` で指定しますが、OAuth用の入力・戻り値・実行環境を使用します。
+
+呼び出しごとに新しいJavaScript実行環境で対象のファイルを実行し、最後に評価したJavaScriptオブジェクトを戻り値として受け取ります。戻り値全体を `JSON.stringify()` で文字列にしないでください。JavaScript実行には15秒のタイムアウトを設定しています。
+
+`javascript_include` は読み込まれず、`paramCheck` / `outCheck` / `checkOnly` も適用されません。必要な入力・認証・出力の検証はOAuth用JavaScript内で実装してください。通常APIの `nyanGetFile`、`nyanCallMe`、`nyanHostExec`、`nyanSendMail` などや `console.log` は登録されません。利用できるのはJavaScriptの標準機能と、後述するOAuth用ヘルパーです。
+
+同じスクリプトを複数のOAuth APIで使う場合は、`nyanAllParams.oauth_hook` で処理を分けます。
+
+| `oauth` の設定キー | `oauth_hook` の値 | 呼び出し方法 |
+|---|---|---|
+| `authorize` | `oauthAuthorize` | GET、またはフォームのPOST |
+| `token` | `oauthToken` | フォームのPOST |
+| `register` | `oauthRegister` | JSONのPOST |
+| `adminUser` | `oauthAdminUser` | JSONのPOST |
+| `verifyAccess` | `oauthValidateAccessToken` | MCP `tools/call` の実行前に内部呼び出し |
+
+フォームのPOSTには `Content-Type: application/x-www-form-urlencoded`、JSONのPOSTには `Content-Type: application/json` を指定します。OPTIONSにはGo側が応答し、JavaScriptを実行しません。`authorizationServerMetadata` と `protectedResourceMetadata` もGo側が生成し、参照先のJavaScriptは実行しません。`verifyAccess` のURLへ直接HTTPリクエストすると `404` を返します。
+
+#### OAuth用JavaScriptへの入力
+
+すべてのhookで、次の共通情報が `nyanAllParams` に入ります。
+
+| キー | 内容 |
+|---|---|
+| `oauth_hook` | 上表の処理名 |
+| `endpoint` | MCPのAPI名 |
+| `oauth_api` | 呼び出し対象のOAuth API名 |
+| `resource` | requestから導出したMCPの絶対URL |
+| `issuer` | requestから導出したAuthorization Serverのissuer URL |
+| `path` | OAuth API名から生成したパス（例：`/oauth/token`） |
+| `scopes` | MCPのOAuth設定で公開するscopeの配列。参照先 `verifyAccess` APIの `scopes` から取得する |
+| `redirect_uri_allowed_prefixes` | MCP定義の `redirectURIAllowedPrefixes` |
+| `state_directory` | 解決済みのOAuth state保存先 |
+
+`authorize`、`token`、`register`、`adminUser` には、次のHTTPリクエスト情報も入ります。
+
+| キー | 内容 |
+|---|---|
+| `method` | HTTPメソッド |
+| `request_path` | 実際のリクエストパス。`/?api=oauth/token` なら `/`。共通情報の `path` はこの場合も `/oauth/token` |
+| `query` | URLクエリ。各値は文字列の配列 |
+| `form` | フォームPOSTの本文。各値は文字列の配列。フォームPOSTの場合だけ設定される |
+| `body` | JSON POSTの解析済み本文。JSON POSTの場合だけ設定される |
+| `headers` | `Authorization`、`Content-Type`、`Accept`、`Origin` の4項目。各値は文字列 |
+| `authorization` | Authorizationヘッダー全体。未指定なら空文字 |
+| `cookies` | Cookie名をキー、値を文字列とするオブジェクト |
+
+`query` と `form` は、値が1つでも配列です。たとえば `grant_type=authorization_code` は `nyanAllParams.form.grant_type` に `["authorization_code"]` として入ります。同名の値が複数送られた場合も保持します。単一値が必要な項目は、配列の要素数が1つであることを確認してから `[0]` を使ってください。JSON本文は `nyanAllParams.body` から参照し、通常APIのように本文の各項目が `nyanAllParams` 直下へ展開されることはありません。
+
+`verifyAccess` には、共通情報に加えて `authorization`（Authorizationヘッダー全体）、`tool`（実行対象のTool名）、`required_scopes`（その呼び出しに必要なscopeの配列）が入ります。OAuthを使うToolには、参照先の通常APIの `securitySchemes` にscope指定が必要です。HTTP hook用の `query`、`form`、`body` などは渡されません。
+
+#### HTTP hookの戻り値
+
+`authorize`、`token`、`register`、`adminUser` は、次の形式のJavaScriptオブジェクトを返します。次はHTTPエラー応答の形式例です。
+
+```javascript
+({
+  status: 400,
+  contentType: "application/json",
+  headers: {},
+  body: {
+    error: "invalid_request",
+    error_description: "Required parameter is missing"
+  }
+});
+```
+
+| キー | 内容 |
+|---|---|
+| `status` | 必須。100〜599の整数のHTTPステータス |
+| `contentType` | 省略時は `application/json; charset=utf-8`。`application/json`、`text/html`、`text/plain` を使用でき、charsetなどのパラメーターも指定可能 |
+| `headers` | 省略可能。許可された応答ヘッダー名をキー、文字列を値とするオブジェクト |
+| `body` | HTTP応答本文。文字列はそのまま送信し、オブジェクトなどはJSONに変換する。省略または `null` なら本文なし |
+
+通常APIの `{ success, status, result }` 形式の `result` は、OAuth hookの応答本文として使われません。送信する内容は `body` に入れます。HTTP hookの実行失敗や不正な戻り値はHTTP `500` になります。
+
+`headers` で指定できるのは `Cache-Control`、`Content-Security-Policy`、`Location`、`Pragma`、`Referrer-Policy`、`Set-Cookie` です。`Cache-Control` は最終的に `no-store` に設定されます。`Location` はHTTPSの絶対URLで、ユーザー情報とフラグメントを含められません。`Set-Cookie` には `Secure`、`HttpOnly`、`SameSite=Lax` または `SameSite=Strict` が必要です。各ヘッダー値は8192バイト以下で改行を含められず、本文は1 MiB以下です。
+
+#### verifyAccessの戻り値
+
+`verifyAccess` は、アクセストークン、`resource`、期限、`required_scopes` などを検証し、認証・認可の判定をJavaScriptオブジェクトで返します。次は、必要な検証に成功した場合の戻り値の例です。
+
+```javascript
+({
+  authenticated: true,
+  principal: {
+    user_id: "example-user"
+  }
+});
+```
+
+| 戻り値 | 扱い |
+|---|---|
+| `{ authenticated: true, principal: ... }` | `principal` が存在し `null` でなければToolの実行へ進む |
+| `{ authenticated: false }` | 認証失敗。HTTP `401` / `invalid_token` |
+| `{ authenticated: false, forbidden: true }` | scope不足。HTTP `403` / `insufficient_scope` |
+
+`principal` の内容はOAuth用JavaScriptが決めます。Tool本体へは `nyanAllParams.mcp_principal` として渡されます。`forbidden` は `authenticated: false` の場合に参照する値です。例外、JSON文字列などオブジェクト以外の戻り値、`authenticated: true` での `principal` 欠落や `null` は認証失敗として扱います。通常APIの `success` / `status` / `result` や、HTTP hookの `body` は、この判定には使いません。
+
+#### OAuth用ヘルパー
+
+| 関数 | 引数・戻り値 |
+|---|---|
+| `nyanOAuthRead(key)` | stateのJSON文字列を読む。存在しない場合は空文字 |
+| `nyanOAuthWrite(key, jsonText)` | JSON文字列をstateへ保存し、成功時に `true` を返す。オブジェクトは `JSON.stringify()` して渡す |
+| `nyanOAuthDelete(key)` | stateを削除し、`true` を返す。存在しない場合も `true` |
+| `nyanOAuthConsume(key)` | stateのJSON文字列を取得して削除する。同一プロセス内では1回だけ取得でき、存在しない場合は空文字 |
+| `nyanOAuthList(namespace)` | 指定namespaceのstateキーの一覧を返す |
+| `nyanRandomBase64URL(size)` | 16〜128バイトの暗号乱数を生成し、パディングなしのBase64URL文字列を返す。`size` はエンコード前のバイト数 |
+| `nyanSHA256Base64URL(value)` | 文字列のSHA-256を、パディングなしのBase64URL文字列で返す |
+| `nyanArgon2idHash(password)` | 1〜4096バイトのpasswordからArgon2idハッシュ文字列を生成する |
+| `nyanArgon2idVerify(password, encoded)` | passwordと `nyanArgon2idHash()` で生成したハッシュ文字列が一致するかを真偽値で返す。不一致や非対応の形式・パラメーターでは `false` |
+| `nyanOAuthAdminAuthorized(authorization)` | Authorizationヘッダー全体を受け取り、`config.json` の `oauth_admin` に対するBasic認証の結果を真偽値で返す |
+| `nyanBase64Decode(value)` | 標準Base64文字列をデコードする。不正な値なら空文字 |
+
+stateの `key` は保存先からの相対パスで、末尾を `.json` にします（例：`users/example.json`）。保存先の外へ出るパスやシンボリックリンクは利用できません。保存するJSON文字列は重複キーを含まない有効なJSONで、1 MiB以下にします。state操作の失敗は、上表で示した未存在の場合を除きJavaScript例外になります。
+
+`nyanOAuthList()` の `namespace` は英数字・`_`・`-` で構成する1〜64文字の名前です。直下のJSONファイルを `users/example.json` のようなキーの昇順の配列で返し、存在しないnamespaceは空配列になります。子ディレクトリや `.json` 以外のファイルが含まれる場合は例外になります。
+
+#### OAuth stateの保存先と管理
 
 OAuth state用ヘルパーの保存先は、`config.json` の `oauth_state_directory` をrootとした、その下の `MCPのAPI名` です。未指定時はMCP定義元のディレクトリにある `oauth-state/MCPのAPI名` を使用します。保存する内容やキーはOAuth JavaScriptが決め、書き込む値は有効なJSONである必要があります。これはruntimeの永続保存先であり、`api.json` のMCP定義には記載しません。
 
