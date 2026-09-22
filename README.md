@@ -47,6 +47,7 @@ NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./nyan8
 ```
 
 各 `api.json` 内の `script` / `path` / `paramCheck` / `outCheck` の相対パスは、その定義を書いた `api.json` が置かれているディレクトリから解決されます。
+JavaScriptの `nyanGetFile` / `nyanReadFileB64` / `nyanSendMailAttachment` と `nyanSendMail` の添付 `path` も、そのAPIを定義したJSONのディレクトリを基準にします。include先のAPIはinclude先JSON、`nyanCallMe` は呼び出し先API、PushはPush先APIの定義場所が基準です。絶対パスはそのまま使用できます。
 `config.json` 内の `certPath` / `keyPath` / `javascript_include` / `log.Filename` の相対パスは、`config.json` が置かれているディレクトリから解決されます。
 
 ---
@@ -616,7 +617,7 @@ console.log(result);
 ### 4‑8 nyanGetFile
 サーバー上のファイルを読み込み、内容を文字列として取得します。
 
-実行中の Nyan8 バイナリのディレクトリからの相対パスでファイルを指定します。
+実行対象のAPIを定義した `api.json` のディレクトリからの相対パス、または絶対パスでファイルを指定します。たとえば `/srv/service/api.json` に定義したAPIの `nyanGetFile("./data.txt")` は `/srv/service/data.txt` を読み込みます。include先のAPIでは、そのAPIを定義したJSONのディレクトリが基準です。本体・`paramCheck`・`outCheck` で同じ基準を使用します。
 ファイルが存在しない場合やディレクトリを指定した場合は `null` が返却されます。権限エラーなどその他の失敗時は JavaScript 側で例外が投げられます。
 
 ```javascript
@@ -671,7 +672,7 @@ console.log(result);
 | to           | Array       | 宛先メールアドレスの配列                         |
 | subject      | String      | メール件名                                   |
 | body         | String      | メール本文                                   |
-| attachments  | Array       | 添付ファイルの配列。各要素は `path` または `dataBase64` を持つ。|
+| attachments  | Array       | 添付ファイルの配列。各要素は `path` または `dataBase64` を持つ。相対 `path` は実行対象APIの定義JSONがあるディレクトリ基準。|
 | cc           | Array       | CC 宛先メールアドレスの配列（省略可）               |
 | bcc          | Array       | BCC 宛先メールアドレスの配列（省略可）              |
 | html         | Boolean     | true で HTML メールとして送信（省略可、デフォルト false） |
@@ -685,6 +686,7 @@ console.log(result);
 
 ### 4‑13 添付ヘルパー nyanSendMailAttachment
 ファイルパスを渡すと、`nyanSendMail` 用の添付オブジェクトを返します。
+相対パスは実行対象APIの定義JSONがあるディレクトリ基準です。絶対パスも指定できます。
 
 ```javascript
 let attachment = nyanSendMailAttachment("./mail-body.txt");
@@ -699,6 +701,7 @@ console.log(result);
 
 ### 4‑14 ファイル→Base64 変換 nyanReadFileB64
 指定したファイルを Base64 文字列に変換します。
+相対パスは実行対象APIの定義JSONがあるディレクトリ基準です。絶対パスも指定できます。
 
 ```javascript
 try {

@@ -966,10 +966,11 @@ func handleAPIRequest(c *gin.Context) {
 
 	// スクリプトリストの取り込み
 	apiJsonPath := apiJSONPath(execDir)
-	scriptListData, err := loadJSONFile(apiJsonPath)
+	snapshot, err := loadAPIConfigSnapshot(apiJsonPath, execDir)
 	if err != nil {
 		fatalServiceError("api_config_load_failed", err)
 	}
+	scriptListData := snapshot.Definitions
 
 	// 全てのパラメータをマージ
 	allParams := make(map[string]interface{})
@@ -1053,7 +1054,7 @@ func handleAPIRequest(c *gin.Context) {
 	scriptPath = resolvePathFromBase(execDir, scriptPath)
 
 	// JavaScriptを実行し、結果を取得
-	result, err := runJavaScript(scriptPath, allParams, c)
+	result, err := runJavaScriptWithSnapshot(snapshot, scriptPath, allParams, c)
 	if err != nil {
 		respondWithError(c, http.StatusInternalServerError, "Failed to run JavaScript", err)
 		return
@@ -1072,7 +1073,7 @@ func handleAPIRequest(c *gin.Context) {
 	}
 
 	// HTTP リクエストから push を発生させる処理
-	performPush(scriptInfo, scriptListData, allParams, execDir)
+	performPushWithSnapshot(snapshot, scriptInfo, scriptListData, allParams, execDir)
 
 	c.JSON(int(status), jsonData)
 }
@@ -1165,15 +1166,11 @@ func handleWebSocket(c *gin.Context) {
 
 		// Pin one configuration generation for this message, including nested calls.
 		apiJsonPath := apiJSONPath(execDir)
-		snapshot, cached := cachedAPISnapshotFor(apiJsonPath)
-		if !cached {
-			loaded, err := readAPIConfigFile(apiJsonPath, execDir)
-			if err != nil {
-				logServiceError(slog.LevelError, "api_config_load_failed", err)
-				sendErrorMessage(conn, "Error reading API configuration")
-				continue
-			}
-			snapshot = loaded.Snapshot
+		snapshot, err := loadAPIConfigSnapshot(apiJsonPath, execDir)
+		if err != nil {
+			logServiceError(slog.LevelError, "api_config_load_failed", err)
+			sendErrorMessage(conn, "Error reading API configuration")
+			continue
 		}
 		scriptListData := snapshot.Definitions
 
@@ -1254,7 +1251,7 @@ func handleWebSocket(c *gin.Context) {
 						if ok && pushScript != "" {
 							pushScriptPath := resolvePathFromBase(execDir, pushScript)
 							// push API を実行
-							pushResult, err := runJavaScriptWithSnapshot(snapshot, pushScriptPath, receivedData, nil)
+							pushResult, err := runJavaScriptForAPI(snapshot, pushTarget, pushScriptPath, receivedData, nil)
 							if err != nil {
 								logServiceError(slog.LevelError, "push_script_failed", err, "api", pushTarget)
 							} else {
@@ -1312,7 +1309,12 @@ func runJavaScript(scriptPath string, allParams map[string]interface{}, ginCtx *
 }
 
 func runJavaScriptWithSnapshot(snapshot *APIConfigSnapshot, scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (string, error) {
-	value, err := runJavaScriptValueWithSnapshot(snapshot, scriptPath, allParams, ginCtx)
+	apiName, _ := allParams["api"].(string)
+	return runJavaScriptForAPI(snapshot, apiName, scriptPath, allParams, ginCtx)
+}
+
+func runJavaScriptForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (string, error) {
+	value, err := runJavaScriptValueForAPI(snapshot, apiName, scriptPath, allParams, ginCtx)
 	if err != nil {
 		return "", err
 	}
@@ -1324,10 +1326,15 @@ func runJavaScriptValue(scriptPath string, allParams map[string]interface{}, gin
 }
 
 func runJavaScriptValueWithSnapshot(snapshot *APIConfigSnapshot, scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (goja.Value, error) {
+	apiName, _ := allParams["api"].(string)
+	return runJavaScriptValueForAPI(snapshot, apiName, scriptPath, allParams, ginCtx)
+}
+
+func runJavaScriptValueForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (goja.Value, error) {
 	// 新たな goja の VM を生成
 	vm := goja.New()
 	// 必要なグローバル関数等を登録する
-	setupGojaVMWithSnapshot(vm, snapshot, ginCtx)
+	setupGojaVMForAPI(vm, snapshot, apiName, ginCtx)
 
 	// ★★★ 追加：include の基準ディレクトリを取得（mainと同じロジック） ★★★
 	basePath, err := filepath.Abs(filepath.Dir(os.Args[0]))
@@ -1893,12 +1900,12 @@ func writeParamCheckResponse(c *gin.Context, resp ParamCheckResponse) {
 	c.JSON(status, resp)
 }
 
-func runParamCheck(c *gin.Context, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}) (bool, bool) {
+func runParamCheckWithSnapshot(snapshot *APIConfigSnapshot, c *gin.Context, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}) (bool, bool) {
 	if getAPIString(apiMap, "paramCheck", "paramcheck", "check") != "" {
 		c.Writer.Header().Set("Cache-Control", "no-store")
 		c.Writer.Header().Set("Pragma", "no-cache")
 	}
-	handled, checkResponse, err := runParamCheckResponseWithSnapshot(currentAPISnapshot(), apiMap, execDir, allParams, c)
+	handled, checkResponse, err := runParamCheckResponseWithSnapshot(snapshot, apiMap, execDir, allParams, c)
 	if err != nil {
 		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
 		return false, true
@@ -1935,8 +1942,8 @@ func runParamCheckResponseWithSnapshot(snapshot *APIConfigSnapshot, apiMap map[s
 	return checkOnly || !allowed, checkResponse, nil
 }
 
-func runOutCheck(c *gin.Context, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response APIResponse) bool {
-	handled, checkResponse, err := runOutCheckResponse(apiMap, execDir, allParams, response, c)
+func runOutCheckWithSnapshot(snapshot *APIConfigSnapshot, c *gin.Context, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response APIResponse) bool {
+	handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, apiMap, execDir, allParams, response, c)
 	if !handled {
 		return false
 	}
@@ -1946,10 +1953,6 @@ func runOutCheck(c *gin.Context, apiMap map[string]interface{}, execDir string, 
 	}
 	writeParamCheckResponse(c, checkResponse)
 	return true
-}
-
-func runOutCheckResponse(apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response APIResponse, ginCtx *gin.Context) (bool, ParamCheckResponse, error) {
-	return runOutCheckResponseWithSnapshot(currentAPISnapshot(), apiMap, execDir, allParams, response, ginCtx)
 }
 
 func runOutCheckResponseWithSnapshot(snapshot *APIConfigSnapshot, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response APIResponse, ginCtx *gin.Context) (bool, ParamCheckResponse, error) {
@@ -2033,14 +2036,15 @@ func registerPublicEndpoint(r *gin.Engine, endpoint string, apiMap map[string]in
 }
 
 func servePublicEndpoint(c *gin.Context, endpoint, requestedPath, execDir string, fallback map[string]interface{}) {
-	files, err := loadJSONFile(apiJSONPath(execDir))
+	snapshot, err := loadAPIConfigSnapshot(apiJSONPath(execDir), execDir)
 	if err != nil {
 		if fallback == nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load API configuration", "detail": err.Error()})
 			return
 		}
-		files = map[string]interface{}{endpoint: fallback}
+		snapshot = newAPIConfigSnapshot(apiJSONPath(execDir), map[string]interface{}{endpoint: fallback}, nil, nil, nil, nil)
 	}
+	files := snapshot.Definitions
 	latestRaw, exists := files[endpoint]
 	latest, ok := latestRaw.(map[string]interface{})
 	if !exists || !ok || getAPIType(latest) != apiTypePublic {
@@ -2067,7 +2071,7 @@ func servePublicEndpoint(c *gin.Context, endpoint, requestedPath, execDir string
 	allParams["nyan_public_path"] = requestedPath
 	ginContext = c
 	defer func() { ginContext = nil }()
-	if allowed, handled := runParamCheck(c, latest, execDir, allParams); handled || !allowed {
+	if allowed, handled := runParamCheckWithSnapshot(snapshot, c, latest, execDir, allParams); handled || !allowed {
 		return
 	}
 	if requestedPath == "" || !filepath.IsLocal(requestedPath) {
@@ -2095,7 +2099,7 @@ func servePublicEndpoint(c *gin.Context, endpoint, requestedPath, execDir string
 			return
 		}
 		response := APIResponse{Status: http.StatusOK, ContentType: http.DetectContentType(fileContent), Headers: map[string]string{}, Body: fileContent}
-		if handled := runOutCheck(c, latest, execDir, allParams, response); handled {
+		if handled := runOutCheckWithSnapshot(snapshot, c, latest, execDir, allParams, response); handled {
 			return
 		}
 		http.ServeContent(c.Writer, c.Request, fileInfo.Name(), fileInfo.ModTime(), bytes.NewReader(fileContent))
@@ -2154,11 +2158,12 @@ func registerDynamicEndpoints(r *gin.Engine, execDir string) error {
 }
 
 func executeAPIEndpoint(c *gin.Context, apiName, execDir string) {
-	scriptListData, err := loadJSONFile(apiJSONPath(execDir))
+	snapshot, err := loadAPIConfigSnapshot(apiJSONPath(execDir), execDir)
 	if err != nil {
 		respondWithError(c, http.StatusInternalServerError, "Failed to load API configuration", err)
 		return
 	}
+	scriptListData := snapshot.Definitions
 	scriptInfo, ok := scriptListData[apiName].(map[string]interface{})
 	if !ok || getAPIType(scriptInfo) != apiTypeAPI {
 		respondWithError(c, http.StatusNotFound, fmt.Sprintf("API config not found for key: %s", apiName), nil)
@@ -2179,7 +2184,7 @@ func executeAPIEndpoint(c *gin.Context, apiName, execDir string) {
 		return
 	}
 	allParams["api"] = apiName
-	if allowed, handled := runParamCheck(c, scriptInfo, execDir, allParams); handled || !allowed {
+	if allowed, handled := runParamCheckWithSnapshot(snapshot, c, scriptInfo, execDir, allParams); handled || !allowed {
 		return
 	}
 	scriptPath := getAPIString(scriptInfo, "script")
@@ -2192,7 +2197,7 @@ func executeAPIEndpoint(c *gin.Context, apiName, execDir string) {
 		respondWithError(c, http.StatusBadRequest, fmt.Sprintf("Invalid script path for key: %s", apiName), err)
 		return
 	}
-	result, err := runJavaScript(fullScriptPath, allParams, c)
+	result, err := runJavaScriptWithSnapshot(snapshot, fullScriptPath, allParams, c)
 	if err != nil {
 		respondWithError(c, http.StatusInternalServerError, "Failed to run JavaScript", err)
 		return
@@ -2210,10 +2215,10 @@ func executeAPIEndpoint(c *gin.Context, apiName, execDir string) {
 		return
 	}
 	response.Status = int(status)
-	if handled := runOutCheck(c, scriptInfo, execDir, allParams, response); handled {
+	if handled := runOutCheckWithSnapshot(snapshot, c, scriptInfo, execDir, allParams, response); handled {
 		return
 	}
-	performPush(scriptInfo, scriptListData, allParams, execDir)
+	performPushWithSnapshot(snapshot, scriptInfo, scriptListData, allParams, execDir)
 	c.JSON(response.Status, jsonData)
 }
 
@@ -4284,6 +4289,10 @@ func websocketMessageTypeLabel(t int) string {
 
 // performPush は、API 設定とパラメータを元に push 対象の WebSocket 接続へメッセージを送信します。
 func performPush(scriptInfo map[string]interface{}, scriptListData map[string]interface{}, allParams map[string]interface{}, execDir string) {
+	performPushWithSnapshot(currentAPISnapshot(), scriptInfo, scriptListData, allParams, execDir)
+}
+
+func performPushWithSnapshot(snapshot *APIConfigSnapshot, scriptInfo map[string]interface{}, scriptListData map[string]interface{}, allParams map[string]interface{}, execDir string) {
 	if pushTargetRaw, exists := scriptInfo["push"]; exists {
 		if pushTarget, ok := pushTargetRaw.(string); ok && pushTarget != "" {
 			// push 対象の設定を取得
@@ -4293,7 +4302,7 @@ func performPush(scriptInfo map[string]interface{}, scriptListData map[string]in
 					if ok && pushScript != "" {
 						pushScriptPath := resolvePathFromBase(execDir, pushScript)
 						// push 対象の API のスクリプトを実行
-						pushResult, err := runJavaScript(pushScriptPath, allParams, nil)
+						pushResult, err := runJavaScriptForAPI(snapshot, pushTarget, pushScriptPath, allParams, nil)
 						if err != nil {
 							logServiceError(slog.LevelError, "push_script_failed", err, "api", pushTarget)
 						} else {
@@ -4836,6 +4845,21 @@ func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 }
 
 func setupGojaVMWithSnapshot(vm *goja.Runtime, snapshot *APIConfigSnapshot, ginCtx *gin.Context) {
+	setupGojaVMForAPI(vm, snapshot, "", ginCtx)
+}
+
+func setupGojaVMForAPI(vm *goja.Runtime, snapshot *APIConfigSnapshot, apiName string, ginCtx *gin.Context) {
+	// Capture the API definition's directory once, independently of JS parameters.
+	fileBaseDir, fileBaseErr := javaScriptFileBaseDir(snapshot, apiName)
+	filePath := func(path string) string {
+		if filepath.IsAbs(path) {
+			return path
+		}
+		if fileBaseErr != nil {
+			panic(vm.ToValue(fileBaseErr.Error()))
+		}
+		return filepath.Join(fileBaseDir, path)
+	}
 
 	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
@@ -4907,7 +4931,7 @@ func setupGojaVMWithSnapshot(vm *goja.Runtime, snapshot *APIConfigSnapshot, ginC
 		return vm.ToValue(m)
 	})
 
-	vm.Set("nyanGetFile", newNyanGetFile(vm))
+	vm.Set("nyanGetFile", newNyanGetFile(vm, filePath))
 
 	vm.Set("nyanCallMe", func(call goja.FunctionCall) goja.Value {
 		apiName := "hello2"
@@ -5007,11 +5031,7 @@ func setupGojaVMWithSnapshot(vm *goja.Runtime, snapshot *APIConfigSnapshot, ginC
 					if pv, ok := m["path"]; ok {
 						p := fmt.Sprint(pv)
 						if p != "" {
-							abs := p
-							if !filepath.IsAbs(p) {
-								wd, _ := os.Getwd()
-								abs = filepath.Join(wd, p)
-							}
+							abs := filePath(p)
 							data, err := os.ReadFile(abs)
 							if err != nil {
 								panic(vm.ToValue("read attach: " + err.Error()))
@@ -5072,14 +5092,7 @@ func setupGojaVMWithSnapshot(vm *goja.Runtime, snapshot *APIConfigSnapshot, ginC
 
 	// --- base64--------------------------------------
 	vm.Set("nyanReadFileB64", func(path string) string {
-		// 相対パスならカレントディレクトリ基準で解決
-		abs := path
-		if !filepath.IsAbs(path) {
-			wd, _ := os.Getwd()
-			abs = filepath.Join(wd, path)
-		}
-
-		data, err := os.ReadFile(abs)
+		data, err := os.ReadFile(filePath(path))
 		if err != nil {
 			// JS 側に例外として伝える
 			panic(vm.ToValue(err.Error()))
@@ -5088,11 +5101,7 @@ func setupGojaVMWithSnapshot(vm *goja.Runtime, snapshot *APIConfigSnapshot, ginC
 	})
 	// --------------------------------------------------------------
 	vm.Set("nyanSendMailAttachment", func(path string) map[string]interface{} {
-		abs := path
-		if !filepath.IsAbs(path) {
-			wd, _ := os.Getwd()
-			abs = filepath.Join(wd, path)
-		}
+		abs := filePath(path)
 		data, err := os.ReadFile(abs)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
@@ -5215,21 +5224,38 @@ func execCommand(commandLine string) (*ExecResult, error) {
 	return result, nil
 }
 
-func newNyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
+// javaScriptFileBaseDir follows the owning API JSON, including mounted definitions.
+// Snapshots without source metadata still retain the root configuration path.
+func javaScriptFileBaseDir(snapshot *APIConfigSnapshot, apiName string) (string, error) {
+	apiPath := servicePaths.API.Path
+	if snapshot != nil {
+		if source := snapshot.Sources[apiName]; source != "" {
+			apiPath = source
+		} else if snapshot.RootPath != "" {
+			apiPath = snapshot.RootPath
+		}
+	}
+	if apiPath != "" {
+		return filepath.Abs(filepath.Dir(apiPath))
+	}
+	// Match the default api.json location used at startup when no config is loaded.
+	execDir, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	if err != nil {
+		return "", err
+	}
+	if isTemporaryDirectory(execDir) {
+		return os.Getwd()
+	}
+	return execDir, nil
+}
+
+func newNyanGetFile(vm *goja.Runtime, filePath func(string) string) func(call goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		// 引数のチェック
 		if len(call.Arguments) < 1 {
 			panic(vm.NewTypeError("nyanGetFileには1つの引数（ファイルパス）が必要です"))
 		}
-		relativePath := call.Arguments[0].String()
-
-		// 実行中のバイナリのディレクトリからの相対パスに解決
-		exePath, err := os.Executable()
-		if err != nil {
-			panic(vm.ToValue(err.Error()))
-		}
-		exeDir := filepath.Dir(exePath)
-		fullPath := filepath.Join(exeDir, relativePath)
+		fullPath := filePath(call.Arguments[0].String())
 
 		// ディレクトリ指定なら null
 		if fi, err := os.Stat(fullPath); err == nil && fi.IsDir() {
@@ -5313,11 +5339,12 @@ func handleJSONRPC(c *gin.Context) {
 
 	// api.jsonの読み込み
 	apiJsonPath := apiJSONPath(execDir)
-	scriptListData, err := loadJSONFile(apiJsonPath)
+	snapshot, err := loadAPIConfigSnapshot(apiJsonPath, execDir)
 	if err != nil {
 		respondJSONRPCError(c, rpcReq.ID, -32603, "Failed to read api.json", err)
 		return
 	}
+	scriptListData := snapshot.Definitions
 
 	// method名（rpcReq.Method）からスクリプト情報を取得
 	scriptInfoRaw, ok := scriptListData[rpcReq.Method]
@@ -5363,7 +5390,7 @@ func handleJSONRPC(c *gin.Context) {
 			respondJSONRPCError(c, rpcReq.ID, -32603, "Check script error", err.Error())
 			return
 		}
-		resultValue, err := runJavaScriptValue(fullCheckPath, allParams, c)
+		resultValue, err := runJavaScriptValueWithSnapshot(snapshot, fullCheckPath, allParams, c)
 		if err != nil {
 			respondJSONRPCError(c, rpcReq.ID, -32603, "Check script error", err.Error())
 			return
@@ -5401,7 +5428,7 @@ func handleJSONRPC(c *gin.Context) {
 	}
 
 	// JavaScriptの実行
-	resultStr, err := runJavaScript(fullPath, allParams, c)
+	resultStr, err := runJavaScriptWithSnapshot(snapshot, fullPath, allParams, c)
 	if err != nil {
 		respondJSONRPCError(c, rpcReq.ID, -32603, "Script execution failed", err)
 		return
@@ -5452,7 +5479,7 @@ func handleJSONRPC(c *gin.Context) {
 			statusCode = parsed
 		}
 	}
-	if handled, checkResponse, err := runOutCheckResponse(scriptInfo, execDir, allParams, APIResponse{
+	if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, scriptInfo, execDir, allParams, APIResponse{
 		Status:      statusCode,
 		ContentType: "application/json",
 		Headers:     map[string]string{},
@@ -5479,7 +5506,7 @@ func handleJSONRPC(c *gin.Context) {
 	}
 
 	// 必要に応じてpush処理の実行
-	performPush(scriptInfo, scriptListData, allParams, execDir)
+	performPushWithSnapshot(snapshot, scriptInfo, scriptListData, allParams, execDir)
 
 	// JSON-RPC成功レスポンスの生成
 	rpcResp := JSONRPCResponse{
@@ -6976,6 +7003,17 @@ func cachedAPIFilesFor(path string) (map[string]interface{}, bool) {
 	return snapshot.Definitions, true
 }
 
+func loadAPIConfigSnapshot(path, baseDir string) (*APIConfigSnapshot, error) {
+	if snapshot, ok := cachedAPISnapshotFor(path); ok {
+		return snapshot, nil
+	}
+	loaded, err := readAPIConfigFile(path, baseDir)
+	if err != nil {
+		return nil, err
+	}
+	return loaded.Snapshot, nil
+}
+
 func cachedAPISnapshotFor(path string) (*APIConfigSnapshot, bool) {
 	snapshot := currentAPISnapshot()
 	if snapshot == nil || snapshot.Definitions == nil || snapshot.RootPath == "" {
@@ -7415,6 +7453,14 @@ func (runtime *scheduleRuntime) run() {
 		if !active || !sameScheduleTiming(cfg, latest) {
 			continue
 		}
+		snapshot := currentAPISnapshot()
+		if snapshot != nil && snapshot.Schedules != nil {
+			// Keep the script and its owning JSON directory in one generation.
+			latest, active = snapshot.Schedules[cfg.name]
+			if !active || !sameScheduleTiming(cfg, latest) {
+				continue
+			}
+		}
 		allParams := map[string]interface{}{
 			"api": latest.name, "nyan_job_name": latest.name,
 			"nyan_schedule_trigger_type": latest.trigger.Type,
@@ -7422,7 +7468,7 @@ func (runtime *scheduleRuntime) run() {
 			"nyan_schedule_time":         next.Format(time.RFC3339),
 			"nyan_schedule_description":  latest.description,
 		}
-		result, err := runJavaScript(latest.scriptPath, allParams, nil)
+		result, err := runJavaScriptWithSnapshot(snapshot, latest.scriptPath, allParams, nil)
 		if err != nil {
 			logServiceError(slog.LevelError, "schedule_failed", err, "job", latest.name)
 			continue
@@ -7610,6 +7656,14 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
 		if !active || latest.connectURL != cfg.connectURL {
 			return nil
 		}
+		snapshot := currentAPISnapshot()
+		if snapshot != nil && snapshot.WSClients != nil {
+			// A reload may publish before this runtime receives its update.
+			latest, active = snapshot.WSClients[cfg.name]
+			if !active || latest.connectURL != cfg.connectURL {
+				return nil
+			}
+		}
 		allParams := map[string]interface{}{
 			"api": latest.name, "ws_client": latest.name,
 			"ws_message_type": websocketMessageTypeLabel(msgType),
@@ -7625,7 +7679,7 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
 				allParams["ws_message_json"] = decoded
 			}
 		}
-		result, err := runJavaScript(latest.scriptPath, allParams, nil)
+		result, err := runJavaScriptWithSnapshot(snapshot, latest.scriptPath, allParams, nil)
 		if err != nil {
 			logServiceError(slog.LevelError, "ws_client_script_failed", err, "client", latest.name)
 			continue
