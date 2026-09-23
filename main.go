@@ -250,7 +250,48 @@ var upgrader = websocket.Upgrader{
 
 var ginContext *gin.Context
 
-var pushConnections sync.Map
+var pushConnections = pushConnectionRegistry{connections: make(map[string][]*serverWebSocket)}
+
+type pushConnectionRegistry struct {
+	sync.RWMutex
+	connections map[string][]*serverWebSocket
+}
+
+func (registry *pushConnectionRegistry) add(api string, conn *serverWebSocket) {
+	registry.Lock()
+	defer registry.Unlock()
+	if registry.connections == nil {
+		registry.connections = make(map[string][]*serverWebSocket)
+	}
+	registry.connections[api] = append(registry.connections[api], conn)
+}
+
+func (registry *pushConnectionRegistry) remove(api string, conn *serverWebSocket) {
+	registry.Lock()
+	defer registry.Unlock()
+	connections := registry.connections[api]
+	for index, candidate := range connections {
+		if candidate != conn {
+			continue
+		}
+		copy(connections[index:], connections[index+1:])
+		connections[len(connections)-1] = nil
+		connections = connections[:len(connections)-1]
+		if len(connections) == 0 {
+			delete(registry.connections, api)
+		} else {
+			registry.connections[api] = connections
+		}
+		return
+	}
+}
+
+// Copy the recipients so network writes never hold the registry lock.
+func (registry *pushConnectionRegistry) snapshot(api string) []*serverWebSocket {
+	registry.RLock()
+	defer registry.RUnlock()
+	return append([]*serverWebSocket(nil), registry.connections[api]...)
+}
 
 // Push and request replies can write to the same connection concurrently.
 type serverWebSocket struct {
@@ -1091,8 +1132,9 @@ func handleAPIRequest(c *gin.Context) {
 	if handled := runOutCheckWithSnapshot(snapshot, c, scriptInfo, execDir, allParams, response); handled {
 		return
 	}
-	// 出力チェックを通過したHTTPリクエストからPushを実行する。
-	performPushWithSnapshot(snapshot, scriptInfo, scriptListData, allParams, execDir)
+	if responseAllowsPush(response) {
+		performPushWithContext(snapshot, scriptInfo, scriptListData, allParams, execDir, c)
+	}
 
 	c.JSON(response.Status, jsonData)
 }
@@ -1174,8 +1216,9 @@ func handleWebSocket(c *gin.Context) {
 		return
 	}
 	defer conn.Close()
-	pushConnections.Store(apiNameString, conn)
-	defer pushConnections.Delete(apiNameString)
+	pushConnections.add(apiNameString, conn)
+	defer pushConnections.remove(apiNameString, conn)
+	requestContext := readOnlyScriptRequestContext(c)
 
 	for {
 		// WebSocket からメッセージを読み取る
@@ -1203,7 +1246,7 @@ func handleWebSocket(c *gin.Context) {
 			continue
 		}
 
-		addWebSocketRequestMetadata(receivedData, c.Request)
+		addWebSocketRequestMetadata(receivedData, requestContext.Request)
 
 		// Pin one configuration generation for this message, including nested calls.
 		apiJsonPath := apiJSONPath(execDir)
@@ -1234,7 +1277,7 @@ func handleWebSocket(c *gin.Context) {
 			continue
 		}
 
-		if handled, checkResponse, err := runParamCheckResponseWithSnapshot(snapshot, scriptInfo, execDir, receivedData, nil); handled {
+		if handled, checkResponse, err := runParamCheckResponseWithSnapshot(snapshot, scriptInfo, execDir, receivedData, requestContext); handled {
 			if err != nil {
 				logServiceError(slog.LevelError, "websocket_param_check_failed", err, "api", scriptValue)
 				checkResponse = newParamCheckError(http.StatusInternalServerError, "Failed to run paramCheck")
@@ -1256,15 +1299,16 @@ func handleWebSocket(c *gin.Context) {
 		// メインAPIのスクリプトの絶対パス作成
 		javascriptPath := resolvePathFromBase(execDir, scriptPath)
 
-		// WebSocket 用なので gin.Context は nil を渡す
-		result, err := runJavaScriptWithSnapshot(snapshot, javascriptPath, receivedData, nil)
+		// Read connection-time request information without writing HTTP headers after upgrade.
+		result, err := runJavaScriptWithSnapshot(snapshot, javascriptPath, receivedData, requestContext)
 		if err != nil {
 			logServiceError(slog.LevelError, "websocket_script_failed", err, "api", scriptValue)
 			sendErrorMessage(conn, "Failed to run JavaScript")
 			continue
 		}
 
-		if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, scriptInfo, execDir, receivedData, scriptResultResponse(result), nil); handled {
+		response := scriptResultResponse(result)
+		if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, scriptInfo, execDir, receivedData, response, requestContext); handled {
 			if err != nil {
 				logServiceError(slog.LevelError, "websocket_out_check_failed", err, "api", scriptValue)
 				checkResponse = newParamCheckError(http.StatusInternalServerError, "Failed to run outCheck")
@@ -1282,7 +1326,9 @@ func handleWebSocket(c *gin.Context) {
 			break
 		}
 
-		performPushForTransport(snapshot, scriptInfo, scriptListData, receivedData, execDir, messageType, true)
+		if responseAllowsPush(response) {
+			performPushForTransport(snapshot, scriptInfo, scriptListData, receivedData, execDir, messageType, true, requestContext)
+		}
 	}
 }
 
@@ -1483,6 +1529,21 @@ func scriptResultResponse(result string) APIResponse {
 		}
 	}
 	return response
+}
+
+// Gate Push on the source result, without changing its response or skipping outCheck.
+// WebSocket text and results without an explicit status retain their default 200.
+func responseAllowsPush(response APIResponse) bool {
+	if response.Status < http.StatusOK || response.Status >= http.StatusBadRequest {
+		return false
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(response.Body, &result); err == nil {
+		if success, ok := result["success"].(bool); ok && !success {
+			return false
+		}
+	}
+	return true
 }
 
 // loadJSONFile はJSONファイルを読み込みます。
@@ -1862,7 +1923,10 @@ func parseCheckResponse(value goja.Value, checkName string) (ParamCheckResponse,
 		return ParamCheckResponse{}, fmt.Errorf("%s must return an object", checkName)
 	}
 
-	exported := value.Export()
+	return parseExportedCheckResponse(value.Export(), checkName)
+}
+
+func parseExportedCheckResponse(exported interface{}, checkName string) (ParamCheckResponse, error) {
 	respMap, ok := exported.(map[string]interface{})
 	if !ok {
 		text, isString := exported.(string)
@@ -1984,23 +2048,7 @@ func runOutCheckResponseForAPI(snapshot *APIConfigSnapshot, apiName string, apiM
 		return false, ParamCheckResponse{}, nil
 	}
 
-	checkParams := cloneParams(allParams)
-	bodyString := string(response.Body)
-	bodyBase64 := base64.StdEncoding.EncodeToString(response.Body)
-	checkParams["nyan_output"] = map[string]interface{}{
-		"status":          response.Status,
-		"contentType":     response.ContentType,
-		"headers":         response.Headers,
-		"body":            bodyString,
-		"bodyBase64":      bodyBase64,
-		"bodyLength":      len(response.Body),
-		"bodyLengthBytes": len(response.Body),
-	}
-	checkParams["nyan_output_status"] = response.Status
-	checkParams["nyan_output_content_type"] = response.ContentType
-	checkParams["nyan_output_body"] = bodyString
-	checkParams["nyan_output_body_base64"] = bodyBase64
-
+	checkParams := outCheckParams(allParams, response)
 	fullPath, err := resolvePath(execDir, outCheckPath)
 	if err != nil {
 		return true, ParamCheckResponse{}, err
@@ -2017,6 +2065,31 @@ func runOutCheckResponseForAPI(snapshot *APIConfigSnapshot, apiName string, apiM
 		return false, ParamCheckResponse{}, nil
 	}
 	return true, checkResponse, nil
+}
+
+func outCheckParams(allParams map[string]interface{}, response APIResponse) map[string]interface{} {
+	checkParams := cloneParams(allParams)
+	headers := make(map[string]string, len(response.Headers))
+	for name, value := range response.Headers {
+		headers[name] = value
+	}
+	bodyString := string(response.Body)
+	bodyBase64 := base64.StdEncoding.EncodeToString(response.Body)
+	checkParams["nyan_output"] = map[string]interface{}{
+		"status":          response.Status,
+		"contentType":     response.ContentType,
+		"headers":         headers,
+		"body":            bodyString,
+		"bodyBase64":      bodyBase64,
+		"bodyLength":      len(response.Body),
+		"bodyLengthBytes": len(response.Body),
+	}
+	checkParams["nyan_output_status"] = response.Status
+	checkParams["nyan_output_content_type"] = response.ContentType
+	checkParams["nyan_output_body"] = bodyString
+	checkParams["nyan_output_body_base64"] = bodyBase64
+
+	return checkParams
 }
 
 func registerPublicEndpoint(r *gin.Engine, endpoint string, apiMap map[string]interface{}, execDir string) {
@@ -2241,7 +2314,9 @@ func executeAPIEndpoint(c *gin.Context, apiName, execDir string) {
 	if handled := runOutCheckWithSnapshot(snapshot, c, scriptInfo, execDir, allParams, response); handled {
 		return
 	}
-	performPushWithSnapshot(snapshot, scriptInfo, scriptListData, allParams, execDir)
+	if responseAllowsPush(response) {
+		performPushWithContext(snapshot, scriptInfo, scriptListData, allParams, execDir, c)
+	}
 	c.JSON(response.Status, jsonData)
 }
 
@@ -2753,7 +2828,7 @@ func handleMCPToolCall(c *gin.Context, snapshot *APIConfigSnapshot, mcp *MCPServ
 		})
 		return
 	}
-	payload, toolError := executeMCPTool(snapshot, tool, params.Arguments, principal)
+	payload, toolError := executeMCPToolWithContext(snapshot, tool, params.Arguments, principal, c)
 	if toolError != "" {
 		mcpWriteToolError(c, request.ID, toolError)
 		return
@@ -2788,6 +2863,11 @@ func findMCPTool(mcp *MCPServerConfig, name string) *MCPToolConfig {
 }
 
 func executeMCPTool(snapshot *APIConfigSnapshot, tool *MCPToolConfig, rawArguments map[string]interface{}, principal interface{}) (map[string]interface{}, string) {
+	return executeMCPToolWithContext(snapshot, tool, rawArguments, principal, nil)
+}
+
+func executeMCPToolWithContext(snapshot *APIConfigSnapshot, tool *MCPToolConfig, rawArguments map[string]interface{}, principal interface{}, ginCtx *gin.Context) (map[string]interface{}, string) {
+	requestContext := readOnlyScriptRequestContext(ginCtx)
 	argumentsValue := rawArguments
 	if argumentsValue == nil {
 		argumentsValue = map[string]interface{}{}
@@ -2812,7 +2892,7 @@ func executeMCPTool(snapshot *APIConfigSnapshot, tool *MCPToolConfig, rawArgumen
 	if err != nil {
 		return nil, "Tool execution failed."
 	}
-	if handled, check, err := runParamCheckResponseForAPI(snapshot, tool.API, backing, execDir, arguments, nil); err != nil {
+	if handled, check, err := runParamCheckResponseForAPI(snapshot, tool.API, backing, execDir, arguments, requestContext); err != nil {
 		return nil, "Tool paramCheck failed."
 	} else if handled {
 		return mcpCheckResult(check)
@@ -2821,7 +2901,7 @@ func executeMCPTool(snapshot *APIConfigSnapshot, tool *MCPToolConfig, rawArgumen
 	if scriptPath == "" {
 		return nil, "Tool backing API is unavailable."
 	}
-	value, err := runJavaScriptValueWithSnapshot(snapshot, scriptPath, arguments, nil)
+	value, err := runJavaScriptValueWithSnapshot(snapshot, scriptPath, arguments, requestContext)
 	if err != nil {
 		return nil, "Tool execution failed."
 	}
@@ -2832,7 +2912,7 @@ func executeMCPTool(snapshot *APIConfigSnapshot, tool *MCPToolConfig, rawArgumen
 	if len(body) > maxMCPToolResultBytes {
 		return nil, "Tool result is too large."
 	}
-	if handled, check, err := runOutCheckResponseForAPI(snapshot, tool.API, backing, execDir, arguments, scriptResultResponse(string(body)), nil); err != nil {
+	if handled, check, err := runOutCheckResponseForAPI(snapshot, tool.API, backing, execDir, arguments, scriptResultResponse(string(body)), requestContext); err != nil {
 		return nil, "Tool outCheck failed."
 	} else if handled {
 		return mcpCheckResult(check)
@@ -3291,39 +3371,6 @@ func handleOAuthHTTP(c *gin.Context, snapshot *APIConfigSnapshot, mcp *MCPServer
 		c.Status(http.StatusNoContent)
 		return
 	}
-	if role == "authorizationServerMetadata" {
-		if c.Request.Method != http.MethodGet {
-			c.Header("Allow", "GET, OPTIONS")
-			c.Status(http.StatusMethodNotAllowed)
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{
-			"issuer":                                runtimeURLs.Issuer,
-			"authorization_endpoint":                runtimeURLs.AuthorizationEndpoint,
-			"token_endpoint":                        runtimeURLs.TokenEndpoint,
-			"registration_endpoint":                 runtimeURLs.RegistrationEndpoint,
-			"response_types_supported":              []string{"code"},
-			"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
-			"token_endpoint_auth_methods_supported": []string{"none"},
-			"code_challenge_methods_supported":      []string{"S256"},
-			"scopes_supported":                      mcp.OAuth.Scopes,
-		})
-		return
-	}
-	if role == "protectedResourceMetadata" {
-		if c.Request.Method != http.MethodGet {
-			c.Header("Allow", "GET, OPTIONS")
-			c.Status(http.StatusMethodNotAllowed)
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{
-			"resource":                 runtimeURLs.Resource,
-			"authorization_servers":    []string{runtimeURLs.Issuer},
-			"scopes_supported":         mcp.OAuth.Scopes,
-			"bearer_methods_supported": []string{"header"},
-		})
-		return
-	}
 	if role == "oauthValidateAccessToken" || apiName == mcp.OAuth.VerifyAccess {
 		c.Status(http.StatusNotFound)
 		return
@@ -3365,6 +3412,15 @@ func handleOAuthHTTP(c *gin.Context, snapshot *APIConfigSnapshot, mcp *MCPServer
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "OAuth hook failed"})
 		return
 	}
+	if check, ok := value.(*ParamCheckResponse); ok {
+		body, err := json.Marshal(check)
+		if err != nil || len(body) > maxMCPRequestBytes {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "OAuth check result is invalid or too large"})
+			return
+		}
+		c.Data(check.Status, "application/json; charset=utf-8", body)
+		return
+	}
 	if err := writeOAuthHookResponse(c, value); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "OAuth hook returned an invalid response"})
 	}
@@ -3383,6 +3439,8 @@ func writeOAuthCORSHeaders(c *gin.Context, mcp *MCPServerConfig, requestOrigin s
 
 func oauthMethodAllowed(hook, method string) bool {
 	switch hook {
+	case "authorizationServerMetadata", "protectedResourceMetadata":
+		return method == http.MethodGet
 	case "oauthAuthorize":
 		return method == http.MethodGet || method == http.MethodPost
 	case "oauthAdminUser", "oauthRegister", "oauthToken":
@@ -3393,6 +3451,9 @@ func oauthMethodAllowed(hook, method string) bool {
 }
 
 func oauthAllowedMethods(hook string) string {
+	if hook == "authorizationServerMetadata" || hook == "protectedResourceMetadata" {
+		return "GET, OPTIONS"
+	}
 	if hook == "oauthAuthorize" {
 		return "GET, POST, OPTIONS"
 	}
@@ -3459,6 +3520,10 @@ func oauthRequestParams(request *http.Request) (map[string]interface{}, error) {
 		},
 		"authorization": request.Header.Get("Authorization"),
 	}
+	// The control parameter follows Nyan8's body-over-query precedence.
+	if values, ok := request.URL.Query()["nyan_mode"]; ok && len(values) > 0 {
+		params["nyan_mode"] = values[0]
+	}
 	cookies := map[string]string{}
 	for _, cookie := range request.Cookies() {
 		cookies[cookie.Name] = cookie.Value
@@ -3483,6 +3548,11 @@ func oauthRequestParams(request *http.Request) (map[string]interface{}, error) {
 			return nil, fmt.Errorf("invalid JSON")
 		}
 		params["body"] = value
+		if object, ok := value.(map[string]interface{}); ok {
+			if mode, exists := object["nyan_mode"]; exists {
+				params["nyan_mode"] = mode
+			}
+		}
 		return params, nil
 	}
 	values, err := url.ParseQuery(string(body))
@@ -3490,6 +3560,9 @@ func oauthRequestParams(request *http.Request) (map[string]interface{}, error) {
 		return nil, err
 	}
 	params["form"] = oauthValuesForJavaScript(values)
+	if modes, ok := values["nyan_mode"]; ok && len(modes) > 0 {
+		params["nyan_mode"] = modes[0]
+	}
 	return params, nil
 }
 
@@ -3520,10 +3593,6 @@ func invokeOAuthHook(snapshot *APIConfigSnapshot, mcp *MCPServerConfig, runtimeU
 	if !ok || getAPIType(apiDefinition) != apiTypeAPI {
 		return nil, fmt.Errorf("OAuth API is not configured")
 	}
-	hookPath := getAPIString(apiDefinition, "script")
-	if hookPath == "" {
-		return nil, fmt.Errorf("OAuth API script is not configured")
-	}
 	params := map[string]interface{}{
 		"oauth_hook":                    hookName,
 		"endpoint":                      mcp.Name,
@@ -3541,7 +3610,86 @@ func invokeOAuthHook(snapshot *APIConfigSnapshot, mcp *MCPServerConfig, runtimeU
 	// /API名と/?api=API名は同じAPIであるため、policyへ渡すpathは
 	// request表記ではなく参照先API名から導出したcanonical pathに固定する。
 	params["path"] = apiPath
-	return runOAuthHookJavaScript(snapshot, mcp, hookPath, params)
+	checkOnly := isCheckOnlyMode(params)
+	check := ParamCheckResponse{Success: true, Status: http.StatusOK, Result: nil}
+	if checkPath := getAPIString(apiDefinition, "paramCheck", "paramcheck", "check"); checkPath != "" {
+		check, err = runOAuthCheck(snapshot, mcp, checkPath, params, "paramCheck")
+		if err != nil {
+			return nil, err
+		}
+	}
+	if checkOnly || !check.Success || check.Status != http.StatusOK {
+		// A distinct Go type prevents a check result from becoming an authentication decision.
+		return &check, nil
+	}
+
+	var value interface{}
+	switch hookName {
+	case "authorizationServerMetadata":
+		value = map[string]interface{}{"status": http.StatusOK, "body": map[string]interface{}{
+			"issuer":                                runtimeURLs.Issuer,
+			"authorization_endpoint":                runtimeURLs.AuthorizationEndpoint,
+			"token_endpoint":                        runtimeURLs.TokenEndpoint,
+			"registration_endpoint":                 runtimeURLs.RegistrationEndpoint,
+			"response_types_supported":              []string{"code"},
+			"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
+			"token_endpoint_auth_methods_supported": []string{"none"},
+			"code_challenge_methods_supported":      []string{"S256"},
+			"scopes_supported":                      mcp.OAuth.Scopes,
+		}}
+	case "protectedResourceMetadata":
+		value = map[string]interface{}{"status": http.StatusOK, "body": map[string]interface{}{
+			"resource":                 runtimeURLs.Resource,
+			"authorization_servers":    []string{runtimeURLs.Issuer},
+			"scopes_supported":         mcp.OAuth.Scopes,
+			"bearer_methods_supported": []string{"header"},
+		}}
+	default:
+		hookPath := getAPIString(apiDefinition, "script")
+		if hookPath == "" {
+			return nil, fmt.Errorf("OAuth API script is not configured")
+		}
+		value, err = runOAuthHookJavaScript(snapshot, mcp, hookPath, params)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if checkPath := getAPIString(apiDefinition, "outCheck", "outcheck"); checkPath != "" {
+		var response APIResponse
+		if hookName == "oauthValidateAccessToken" {
+			// Inspect the complete decision, before authenticated/principal are consumed.
+			response = APIResponse{Status: http.StatusOK, ContentType: "application/json; charset=utf-8", Headers: map[string]string{}}
+			response.Body, err = json.Marshal(value)
+			if err == nil && len(response.Body) > maxMCPRequestBytes {
+				err = fmt.Errorf("OAuth decision is too large")
+			}
+		} else {
+			response, err = prepareOAuthHookResponse(value)
+		}
+		if err != nil {
+			return nil, err
+		}
+		check, err := runOAuthCheck(snapshot, mcp, checkPath, outCheckParams(params, response), "outCheck")
+		if err != nil {
+			return nil, err
+		}
+		if !check.Success || check.Status != http.StatusOK {
+			return &check, nil
+		}
+		if hookName != "oauthValidateAccessToken" {
+			// Send exactly the validated bytes inspected by outCheck.
+			return response, nil
+		}
+	}
+	return value, nil
+}
+
+func runOAuthCheck(snapshot *APIConfigSnapshot, mcp *MCPServerConfig, scriptPath string, params map[string]interface{}, name string) (ParamCheckResponse, error) {
+	value, err := runOAuthHookJavaScript(snapshot, mcp, scriptPath, params)
+	if err != nil {
+		return ParamCheckResponse{}, err
+	}
+	return parseExportedCheckResponse(value, name)
 }
 
 func mcpOAuthAPIForRole(mcp *MCPServerConfig, role string) string {
@@ -3549,6 +3697,10 @@ func mcpOAuthAPIForRole(mcp *MCPServerConfig, role string) string {
 		return ""
 	}
 	switch role {
+	case "authorizationServerMetadata":
+		return mcp.OAuth.AuthorizationServerMetadata
+	case "protectedResourceMetadata":
+		return mcp.OAuth.ProtectedResourceMetadata
 	case "oauthAuthorize":
 		return mcp.OAuth.Authorize
 	case "oauthToken":
@@ -3591,13 +3743,29 @@ func runOAuthHookJavaScript(snapshot *APIConfigSnapshot, mcp *MCPServerConfig, s
 }
 
 func writeOAuthHookResponse(c *gin.Context, value interface{}) error {
+	response, ok := value.(APIResponse)
+	if !ok {
+		var err error
+		response, err = prepareOAuthHookResponse(value)
+		if err != nil {
+			return err
+		}
+	}
+	for key, value := range response.Headers {
+		c.Header(key, value)
+	}
+	c.Data(response.Status, response.ContentType, response.Body)
+	return nil
+}
+
+func prepareOAuthHookResponse(value interface{}) (APIResponse, error) {
 	response, ok := value.(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("response is not an object")
+		return APIResponse{}, fmt.Errorf("response is not an object")
 	}
 	status, ok := oauthStatusCode(response["status"])
 	if !ok {
-		return fmt.Errorf("invalid response status")
+		return APIResponse{}, fmt.Errorf("invalid response status")
 	}
 	contentType, _ := response["contentType"].(string)
 	if contentType == "" {
@@ -3605,31 +3773,27 @@ func writeOAuthHookResponse(c *gin.Context, value interface{}) error {
 	}
 	mediaType, _, err := mime.ParseMediaType(contentType)
 	if err != nil || (mediaType != "application/json" && mediaType != "text/html" && mediaType != "text/plain") {
-		return fmt.Errorf("invalid response content type")
+		return APIResponse{}, fmt.Errorf("invalid response content type")
 	}
 	body, err := oauthResponseBody(response["body"])
 	if err != nil || len(body) > maxMCPRequestBytes {
-		return fmt.Errorf("invalid response body")
+		return APIResponse{}, fmt.Errorf("invalid response body")
 	}
 	validatedHeaders := map[string]string{}
 	if headers, ok := response["headers"].(map[string]interface{}); ok {
 		for key, rawValue := range headers {
 			if !oauthResponseHeaderAllowed(key) {
-				return fmt.Errorf("response header is not allowed")
+				return APIResponse{}, fmt.Errorf("response header is not allowed")
 			}
 			value := fmt.Sprint(rawValue)
 			if len(value) > 8192 || strings.ContainsAny(value, "\r\n") || !oauthResponseHeaderValueAllowed(key, value) {
-				return fmt.Errorf("invalid response header")
+				return APIResponse{}, fmt.Errorf("invalid response header")
 			}
 			validatedHeaders[http.CanonicalHeaderKey(key)] = value
 		}
 	}
-	for key, value := range validatedHeaders {
-		c.Header(key, value)
-	}
-	c.Header("Cache-Control", "no-store")
-	c.Data(status, contentType, body)
-	return nil
+	validatedHeaders["Cache-Control"] = "no-store"
+	return APIResponse{Status: status, ContentType: contentType, Headers: validatedHeaders, Body: body}, nil
 }
 
 func oauthStatusCode(raw interface{}) (int, bool) {
@@ -4350,12 +4514,16 @@ func performPush(scriptInfo map[string]interface{}, scriptListData map[string]in
 }
 
 func performPushWithSnapshot(snapshot *APIConfigSnapshot, scriptInfo map[string]interface{}, scriptListData map[string]interface{}, allParams map[string]interface{}, execDir string) {
-	performPushForTransport(snapshot, scriptInfo, scriptListData, allParams, execDir, websocket.TextMessage, false)
+	performPushWithContext(snapshot, scriptInfo, scriptListData, allParams, execDir, nil)
+}
+
+func performPushWithContext(snapshot *APIConfigSnapshot, scriptInfo map[string]interface{}, scriptListData map[string]interface{}, allParams map[string]interface{}, execDir string, ginCtx *gin.Context) {
+	performPushForTransport(snapshot, scriptInfo, scriptListData, allParams, execDir, websocket.TextMessage, false, ginCtx)
 }
 
 // Keep HTTP and WebSocket Push checks identical while preserving their frame
 // types and the legacy WebSocket-only removal of the "Push: " prefix.
-func performPushForTransport(snapshot *APIConfigSnapshot, scriptInfo map[string]interface{}, scriptListData map[string]interface{}, allParams map[string]interface{}, execDir string, messageType int, stripPrefix bool) {
+func performPushForTransport(snapshot *APIConfigSnapshot, scriptInfo map[string]interface{}, scriptListData map[string]interface{}, allParams map[string]interface{}, execDir string, messageType int, stripPrefix bool, ginCtx *gin.Context) {
 	pushTarget, _ := scriptInfo["push"].(string)
 	if pushTarget == "" {
 		return
@@ -4368,8 +4536,9 @@ func performPushForTransport(snapshot *APIConfigSnapshot, scriptInfo map[string]
 
 	// Preserve the triggering API in nyanAllParams.api, but execute all three
 	// scripts with the Push target's definition and the same captured snapshot.
+	requestContext := readOnlyScriptRequestContext(ginCtx)
 	params := cloneParams(allParams)
-	if handled, check, err := runParamCheckResponseForAPI(snapshot, pushTarget, pushConfig, execDir, params, nil); err != nil {
+	if handled, check, err := runParamCheckResponseForAPI(snapshot, pushTarget, pushConfig, execDir, params, requestContext); err != nil {
 		logServiceError(slog.LevelError, "push_param_check_failed", err, "api", pushTarget)
 		return
 	} else if handled {
@@ -4383,7 +4552,7 @@ func performPushForTransport(snapshot *APIConfigSnapshot, scriptInfo map[string]
 		return
 	}
 	pushScriptPath := resolvePathFromBase(execDir, pushScript)
-	pushResult, err := runJavaScriptForAPI(snapshot, pushTarget, pushScriptPath, params, nil)
+	pushResult, err := runJavaScriptForAPI(snapshot, pushTarget, pushScriptPath, params, requestContext)
 	if err != nil {
 		logServiceError(slog.LevelError, "push_script_failed", err, "api", pushTarget)
 		return
@@ -4391,7 +4560,7 @@ func performPushForTransport(snapshot *APIConfigSnapshot, scriptInfo map[string]
 	if stripPrefix {
 		pushResult = strings.TrimPrefix(pushResult, "Push: ")
 	}
-	if handled, check, err := runOutCheckResponseForAPI(snapshot, pushTarget, pushConfig, execDir, params, scriptResultResponse(pushResult), nil); err != nil {
+	if handled, check, err := runOutCheckResponseForAPI(snapshot, pushTarget, pushConfig, execDir, params, scriptResultResponse(pushResult), requestContext); err != nil {
 		logServiceError(slog.LevelError, "push_out_check_failed", err, "api", pushTarget)
 		return
 	} else if handled {
@@ -4399,21 +4568,21 @@ func performPushForTransport(snapshot *APIConfigSnapshot, scriptInfo map[string]
 		return
 	}
 
-	pushConnRaw, exists := pushConnections.Load(pushTarget)
-	if !exists {
+	connections := pushConnections.snapshot(pushTarget)
+	if len(connections) == 0 {
 		serviceLog(slog.LevelDebug, "push_no_subscribers", "api", pushTarget)
 		return
 	}
-	pushConn, ok := pushConnRaw.(*serverWebSocket)
-	if !ok {
-		serviceLog(slog.LevelWarn, "push_connection_invalid", "api", pushTarget)
-		return
+	message := []byte(pushResult)
+	for _, conn := range connections {
+		if err := conn.WriteMessage(messageType, message); err != nil {
+			logServiceError(slog.LevelWarn, "push_send_failed", err, "api", pushTarget)
+			pushConnections.remove(pushTarget, conn)
+			_ = conn.Close()
+			continue
+		}
+		serviceLog(slog.LevelDebug, "push_sent", "api", pushTarget, "bytes", len(message))
 	}
-	if err := pushConn.WriteMessage(messageType, []byte(pushResult)); err != nil {
-		logServiceError(slog.LevelWarn, "push_send_failed", err, "api", pushTarget)
-		return
-	}
-	serviceLog(slog.LevelDebug, "push_sent", "api", pushTarget, "bytes", len(pushResult))
 }
 
 // handleNyan は /nyan エンドポイントを処理します。
@@ -4921,6 +5090,18 @@ func legacyArrayItemsSchema(values []interface{}) map[string]interface{} {
 	return first
 }
 
+// Preserve server-observed request data, never user-supplied JS parameters.
+// Detached contexts have no response writer: getters work, but nyanSetCookie is a no-op.
+func readOnlyScriptRequestContext(source *gin.Context) *gin.Context {
+	if source == nil || source.Request == nil {
+		return nil
+	}
+	request := source.Request.Clone(source.Request.Context())
+	request.Body = nil
+	request.GetBody = nil
+	return &gin.Context{Request: request}
+}
+
 // gojaのVMのセットアップ
 func setupGojaVM(vm *goja.Runtime, ginCtx *gin.Context) {
 	setupGojaVMWithSnapshot(vm, currentAPISnapshot(), ginCtx)
@@ -4955,14 +5136,14 @@ func setupGojaVMForAPI(vm *goja.Runtime, snapshot *APIConfigSnapshot, apiName st
 	})
 
 	vm.Set("nyanGetCookie", func(name string) string {
-		if ginCtx == nil {
+		if ginCtx == nil || ginCtx.Request == nil {
 			return ""
 		}
 		v, _ := ginCtx.Cookie(name)
 		return v
 	})
 	vm.Set("nyanSetCookie", func(name, value string) {
-		if ginCtx != nil {
+		if ginCtx != nil && ginCtx.Writer != nil {
 			secure := ginCtx.Request != nil && ginCtx.Request.TLS != nil
 			ginCtx.SetCookie(name, value, 3600, "/", "", secure, true)
 		}
@@ -5211,14 +5392,14 @@ func setupGojaVMForAPI(vm *goja.Runtime, snapshot *APIConfigSnapshot, apiName st
 
 	//--リモートのIP UserAgent Header情報の取得-------------------------
 	vm.Set("nyanGetRemoteIP", func() string {
-		if ginCtx == nil {
+		if ginCtx == nil || ginCtx.Request == nil {
 			return ""
 		}
 		return getClientIP(ginCtx.Request)
 	})
 
 	vm.Set("nyanGetUserAgent", func() string {
-		if ginCtx == nil {
+		if ginCtx == nil || ginCtx.Request == nil {
 			return ""
 		}
 		return ginCtx.Request.UserAgent()
@@ -5226,7 +5407,7 @@ func setupGojaVMForAPI(vm *goja.Runtime, snapshot *APIConfigSnapshot, apiName st
 
 	vm.Set("nyanGetRequestHeaders", func() map[string]string {
 		out := map[string]string{}
-		if ginCtx == nil {
+		if ginCtx == nil || ginCtx.Request == nil {
 			return out
 		}
 		for k, v := range ginCtx.Request.Header {
@@ -5560,12 +5741,13 @@ func handleJSONRPC(c *gin.Context) {
 			statusCode = parsed
 		}
 	}
-	if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, scriptInfo, execDir, allParams, APIResponse{
+	response := APIResponse{
 		Status:      statusCode,
 		ContentType: "application/json",
 		Headers:     map[string]string{},
 		Body:        []byte(resultStr),
-	}, c); handled {
+	}
+	if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, scriptInfo, execDir, allParams, response, c); handled {
 		if err != nil {
 			respondJSONRPCError(c, rpcReq.ID, -32603, "outCheck script error", err.Error())
 			return
@@ -5586,8 +5768,9 @@ func handleJSONRPC(c *gin.Context) {
 		}
 	}
 
-	// 必要に応じてpush処理の実行
-	performPushWithSnapshot(snapshot, scriptInfo, scriptListData, allParams, execDir)
+	if responseAllowsPush(response) {
+		performPushWithContext(snapshot, scriptInfo, scriptListData, allParams, execDir, c)
+	}
 
 	// JSON-RPC成功レスポンスの生成
 	rpcResp := JSONRPCResponse{
