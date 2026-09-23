@@ -49,6 +49,16 @@
 | 17 | 入力パラメータの優先順位 | 現状維持 | 通常HTTPはクエリより本文を優先する |
 | 18 | リクエスト情報の引き継ぎ | 修正済み | WS・Push・HTTP MCPのJavaScriptへ実際のリクエスト情報を渡す |
 
+## 追加判断：nyanCallMeからのPush（2026-09-23）
+
+項目14・16・18に関連する追加対応として、内部呼び出し先APIの`push`も実行するよう変更した。呼び出し先の入力チェック・本体・出力チェック通過後、通常と同じ成功条件でPushを開始する。チェック拒否・例外・エラー結果・`checkOnly`では起動しない。Push先の前後チェックも行い、全購読接続へtextフレームで送る。
+
+Pushには内部呼び出し先のAPI名と引数、元のリクエスト情報、同じ設定スナップショットを渡す。Push先の拒否・実行エラーでも`nyanCallMe`の戻り値は維持する。子の配信は内部呼び出しが戻る前に行い、親APIのPushとは別に実行する。後から親が拒否・エラーになっても子の配信は取り消さない。
+
+調査では、直接HTTP実行と内部呼び出しの両方で配信されること、チェック未設定でも配信すること、親子のPushが各1回であること、エラーと`checkOnly`では配信しないことを追加確認する。Nyan8のテストは`TestNyanCallMePush`と`TestNyanCallMePushBeforeParentCompletes`。
+
+MCPはToolの参照先API自身の`push`を自動実行しないが、Tool内で`nyanCallMe`を実行した場合はその呼び出し先のPushが動作する。
+
 ## 共通のチェック仕様と調査の観点
 
 チェックの結果は`{success, status, result}`。通過条件は**真偽値の`success: true`かつ数値の`status: 200`**である。`success: true, status: 201`でもチェックは通過しない。通常の成功応答やPush開始条件と混同しない。
@@ -206,7 +216,7 @@ Nyan8ではOAuth専用環境の関数。標準Base64文字列をデコードし�
 
 拒否・`checkOnly`の結果はMCPの`structuredContent`と`content`のtextへ格納する。拒否は`isError: true`、成功した`checkOnly`は`isError: false`。チェック結果の`status`を、そのままMCP HTTP応答のステータスにはしない。チェック実行エラー・形式不正は詳細を含まないToolエラー。
 
-入力スキーマは通常どおり適用するため、`additionalProperties: false`などを使う場合は`nyan_mode`を許可する必要がある。必須項目も省略できない。MCP実行ではPushを行わない。
+入力スキーマは通常どおり適用するため、`additionalProperties: false`などを使う場合は`nyan_mode`を許可する必要がある。必須項目も省略できない。MCPは参照先API自身のPushを自動実行しない。ただし内部の`nyanCallMe`先のPushは実行対象。
 
 **調査ケース：** HTTP・stdioそれぞれで通常、両チェックの拒否・例外、入力チェックあり／なしの`checkOnly`、入力スキーマ違反、出力スキーマ違反、サイズ制限を確認する。認証ありの`checkOnly`も認証を省略しないことを確認する。
 
@@ -381,4 +391,6 @@ WebSocket接続後・Push先・HTTP MCPへ渡すコンテキストは読み取�
 go test -race ./... -run '^(TestScriptReadOnlyRequestSnapshot|TestWebSocket|TestPush|TestMCP)' -count=1
 ```
 
-本資料作成では、既存の確認一覧・現在のREADME・関連実装・テスト名を照合した。資料のみの追加であり、コード変更やGoテストの再実行は行っていない。上記の通過記録はNyan8についてのもので、NyanPUI・NyanQLの検証済みを意味しない。これからの調査では、各製品の実装時点と再現結果を別に記録する。
+初版作成では、既存の確認一覧・現在のREADME・関連実装・テスト名を照合した。資料のみの追加であり、コード変更やGoテストの再実行は行っていない。上記の通過記録はNyan8についてのもので、NyanPUI・NyanQLの検証済みを意味しない。これからの調査では、各製品の実装時点と再現結果を別に記録する。
+
+追補のnyanCallMe Push対応ではコード・テストも更新し、全通常テストと`TestNyanCallMe`を含む関連race検査を再実行して通過した。初版の作成時点とは区別して扱う。

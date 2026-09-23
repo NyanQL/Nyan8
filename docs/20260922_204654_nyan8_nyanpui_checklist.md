@@ -23,14 +23,15 @@
 | 11 | MCPのチェック | HTTP・stdioともにToolの参照先APIの `paramCheck`・`outCheck` を適用する。`checkOnly` は `paramCheck` の結果だけを返し、本体・`outCheck` を実行しない。 | Nyan8対応済み（2026-09-23） |
 | 12 | OAuthのチェック | OAuth用API・Go生成メタデータ・内部トークン検証に `paramCheck`・`outCheck` を適用する。HTTPの `checkOnly` は入力チェックだけで終了する。 | Nyan8対応済み（2026-09-23） |
 | 13 | PUIのWebSocket `checkOnly` | チェックが通過するかどうかが分かればよく、成功時の独自 `result` が `null` になる挙動は許容する。両製品の現行仕様を維持する。 | 方針確定・修正不要（2026-09-23） |
-| 14 | Pushの複数接続 | 同じAPIの全購読接続へ同じ結果を配信する。Push先のチェック・本体は各1回だけ実行する。 | Nyan8対応済み（2026-09-23） |
+| 14 | Pushの複数接続 | 同じAPIの全購読接続へ同じ結果を配信する。Push先のチェック・本体は各1回だけ実行する。`nyanCallMe`起点も対象。 | Nyan8対応済み（2026-09-23、内部呼び出し対応を追加） |
 | 15 | Push接続の解除 | 終了・送信失敗した接続だけを登録から外し、ほかの接続と新しい接続の登録を維持する。 | Nyan8対応済み（2026-09-23） |
-| 16 | Pushの実行条件 | 呼び出し元の `status` が200～399かつ `success` が真偽値の `false` ではない場合だけPushする。エラー結果ではPush先を実行しない。 | Nyan8対応済み（2026-09-23） |
+| 16 | Pushの実行条件 | 呼び出し元の `status` が200～399かつ `success` が真偽値の `false` ではない場合だけPushする。`nyanCallMe`も同じ条件とし、拒否・例外・`checkOnly`では起動しない。 | Nyan8対応済み（2026-09-23、内部呼び出し対応を追加） |
 | 17 | 入力パラメータの優先順位 | 通常HTTPでは本文の値を優先するNyan8の現行仕様を維持する。NyanPUI側は変更しない。 | 方針確定・Nyan8修正不要（2026-09-23） |
 | 18 | リクエスト情報の引き継ぎ | WebSocketは接続時、Pushは呼び出し元、HTTP MCPはそのリクエストのCookie・IP・User-Agent・ヘッダーを、チェックと本体から取得可能にする。 | Nyan8対応済み（2026-09-23） |
 
 ## 対応済みの作業
 
+- **項目14・16・18関連の追加対応：`nyanCallMe`からのPush（2026-09-23）**：内部からAPIを呼ぶ場合も同じように動作させる利用者の方針により、呼び出し先APIの本体・出力チェック通過後に`push`を実行するよう変更した。チェック未設定でも実行し、エラー結果・拒否・例外・`checkOnly`では起動しない。Push先の前後チェック・本体は各1回、全購読接続へtextフレームで配信する。内部呼び出し先のAPI名と引数、取得済み設定スナップショット、元のリクエスト情報を使用する。Push先の拒否・実行エラーは内部呼び出しの戻り値を置き換えない。子の配信は内部呼び出しが戻る前に完了し、親APIのPushとは独立するため、その後の親の拒否・エラーでも取り消さない。`main_test.go`に`TestNyanCallMePush`と`TestNyanCallMePushBeforeParentCompletes`を追加し、3接続への配信、実行順序、抑止条件、結果保持、リクエストなしの実行、Cookieとルートファイル基準・設定の保持、親子の配信を検証した。全通常テストと`TestNyanCallMe`・WebSocket・Push・MCP・リクエストコピーを対象とするrace検査が通過した。README・機能調査資料・PR資料を更新。MCPの参照先API自身のPush自動実行は変更していないが、Tool内の`nyanCallMe`先のPushは実行対象になる。
 - **項目18・リクエスト情報の引き継ぎ（2026-09-23）**：WebSocket接続後のメッセージ処理、HTTP・ルートHTTP・JSON-RPC・WebSocket起点のPush、HTTP MCPの `paramCheck`・本体・`outCheck` で、`nyanGetCookie`・`nyanGetRemoteIP`・`nyanGetUserAgent`・`nyanGetRequestHeaders` が実際のリクエスト情報を返すよう変更した。WebSocketは接続時、Pushは呼び出し元、HTTP MCPはTool呼び出しのリクエストを使用する。元のHTTPリクエストをコピーし、応答Writerを持たない読み取り専用の実行コンテキストとして渡す。`nyanCallMe` による内部呼び出しにも引き継ぐ。これらの経路の `nyanSetCookie` は応答を変更しない。stdioとリクエストのない実行では、取得関数は従来どおり空文字列／空オブジェクトを返す。入力パラメータや受信者のCookieを取得元にせず、転送ヘッダーによるIP上書きも行わない。`main_test.go` で各経路の前後チェック・本体・内部呼び出し、送信元と複数受信者の情報の分離、偽装パラメータの非採用、リクエストコピーの保持、Cookie設定の無効化、HTTP MCPとstdioの通常実行・`checkOnly` を検証した。`go test ./... -count=1` と関連する `go test -race` が通過し、READMEを更新した。NyanPUI側は変更していない。
 - **項目17・入力パラメータの優先順位（2026-09-23）**：利用者の判断により、URLクエリとJSON・フォーム本文の同名項目は本文を優先する方針に確定した。Nyan8の通常HTTP（通常パス・ルート経由）は既にこの動作のため、実装変更は不要。`nyan_mode` にも同じ優先順位を適用する。NyanPUIを修正しない既存方針を維持し、クエリ優先との差は許容する。READMEと確認一覧を更新した。コード変更・テストの再実行は行っていない。
 - **項目16・エラー結果でのPush抑止（2026-09-23）**：利用者の意向に従い、HTTP・ルートHTTP・WebSocket・JSON-RPCで呼び出し元の結果による共通のPush判定を追加した。`status` が200～399で、トップレベルの `success` が真偽値の `false` ではない場合だけPush先へ進む。400・409・500・503などのエラー結果や `success: false` では、Push先のチェック・本体・配信を実行しない。呼び出し元への応答内容・形式は維持し、HTTP・WebSocketではエラー結果の出力チェックも維持した。JSON-RPCの `success: false` は従来どおりエラー応答で終了し、出力チェック・Pushへ進まない。WebSocket・JSON-RPCのステータス省略とWebSocketのプレーンテキストは既存の既定値200を使う。`main_test.go` で4経路の正常・エラー結果、`success` と `status` の組み合わせ、省略・プレーンテキスト、例外、元の応答の保持、Push先の実行抑止と3接続への配信有無を検証した。`go test ./... -count=1` が通過し、READMEを更新した。NyanPUI側は変更していない。

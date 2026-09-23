@@ -346,7 +346,7 @@ schedule の `script` では通常の API と同じように `nyanAllParams`、`
 
 schedule は HTTP リクエストから実行されないため、`nyanGetRemoteIP()`、`nyanGetUserAgent()`、`nyanGetRequestHeaders()` などリクエスト情報に依存する関数は空の値を返します。`javascript_include` に設定した共通 JavaScript は、schedule の `script` 実行時にも毎回読み込まれます。
 
-schedule 定義自体には `paramCheck` / `outCheck` / `push` は適用されません。`nyanCallMe()` で通常APIを呼び出す場合は、呼び出し先の `paramCheck` / `outCheck` が実行されます。通知は schedule の `script` 内、または呼び出し先APIの本体に実装してください。
+schedule 定義自体には `paramCheck` / `outCheck` / `push` は適用されません。`nyanCallMe()` で通常APIを呼び出す場合は、呼び出し先の `paramCheck` / `outCheck` が実行されます。呼び出し先APIに `push` があれば、そのAPIのチェックと本体が成功した後にPushも実行します。
 
 動作確認例の [api.json](./api.json) にある `schedule_debug_every_minute` と [javascript/schedule_debug.js](./javascript/schedule_debug.js) は、HTTPサーバーモードで1分ごとに実行されます。`info` ではジョブ名と結果のバイト数を含む完了ログを記録します。スクリプトが `console.log` へ渡す実行時刻などの本文を確認する場合は、`log.Level` を `debug` に設定してください。
 
@@ -480,7 +480,7 @@ HTTP・stdioともに、`tools/call` は入力の `inputSchema` 検証 → 参�
 
 拒否・`checkOnly` のチェック結果 `{success, status, result}` は、MCP結果の `structuredContent` と `content` のtextへ格納します。拒否時は `isError: true`、成功した `checkOnly` は `isError: false` です。チェック結果には本体用の `outputSchema` を適用しません。チェック用JavaScriptの実行失敗・戻り値の形式不正は、詳細を含まないToolエラーとして返します。
 
-チェックからは、本体と同じ `nyanAllParams.api`・`mcp_tool`・`mcp_principal` を参照できます。HTTP経由では、その `tools/call` リクエストのCookie・IP・User-Agent・ヘッダーを取得関数で参照できます。stdioにはHTTPリクエストがないため、文字列の取得関数は空文字列、`nyanGetRequestHeaders()` は `{}` を返します。MCPからの実行では、従来どおりPushは実行しません。
+チェックからは、本体と同じ `nyanAllParams.api`・`mcp_tool`・`mcp_principal` を参照できます。HTTP経由では、その `tools/call` リクエストのCookie・IP・User-Agent・ヘッダーを取得関数で参照できます。stdioにはHTTPリクエストがないため、文字列の取得関数は空文字列、`nyanGetRequestHeaders()` は `{}` を返します。MCPはToolの参照先APIの `push` を自動実行しません。ただし、Tool内で `nyanCallMe()` を使う場合、その呼び出し先APIの `push` は実行対象です。
 
 #### WebSocketでのチェック
 
@@ -506,9 +506,9 @@ HTTP・stdioともに、`tools/call` は入力の `inputSchema` 検証 → 参�
 
 #### Push先APIのチェック
 
-HTTP（`/?api=...` を含む）、JSON-RPC、WebSocketからPushする場合は、Push先APIに設定された `paramCheck` → 本体 `script` → `outCheck` → 配信の順に処理します。呼び出し元APIのチェックとは独立して適用します。
+HTTP（`/?api=...` を含む）、JSON-RPC、WebSocket、`nyanCallMe()`からPushする場合は、Push先APIに設定された `paramCheck` → 本体 `script` → `outCheck` → 配信の順に処理します。呼び出し元APIのチェックとは独立して適用します。
 
-Pushを開始するのは、呼び出し元APIの結果が `status: 200`～`399` で、トップレベルの `success` が真偽値の `false` ではない場合だけです。`400`・`409`・`500` などのエラー結果や、`status: 200` でも `success: false` の場合は、Push先のチェック・本体・配信をすべて実行しません。`success` の省略は許容します。WebSocket・JSON-RPCで `status` を省略した結果とWebSocketのプレーンテキストは、判定上 `200` として扱います。
+Pushを開始するのは、呼び出し元APIの結果が `status: 200`～`399` で、トップレベルの `success` が真偽値の `false` ではない場合だけです。`400`・`409`・`500` などのエラー結果や、`status: 200` でも `success: false` の場合は、Push先のチェック・本体・配信をすべて実行しません。`success` の省略は許容します。WebSocket・JSON-RPC・`nyanCallMe()`で `status` を省略した結果とWebSocket・`nyanCallMe()`のプレーンテキストは、判定上 `200` として扱います。
 
 この判定によって呼び出し元への応答は変更しません。HTTP・WebSocketではエラー結果も呼び出し元の `outCheck` を実行してから応答します。JSON-RPCで本体が `success: false` を返した場合は、従来どおりJSON-RPCエラー応答で終了し、`outCheck` とPushへ進みません。例外・チェック拒否・`checkOnly` の場合もPushしません。
 
@@ -520,7 +520,7 @@ Push先のチェックの通過条件は `success: true` かつ `status: 200` �
 
 チェックと本体には、Pushを発生させた処理のパラメータを渡します。`nyanAllParams.api` も従来どおり呼び出し元のAPI名です。`nyanGetCookie()`・`nyanGetRemoteIP()`・`nyanGetUserAgent()`・`nyanGetRequestHeaders()` は、Pushを発生させた呼び出し元のリクエスト情報を返します。WebSocket起点では呼び出し元の接続時の情報です。受信者ごとのCookieやヘッダーを使うものではありません。WebSocket由来の接続情報は `nyanAllParams._headers` などでも参照できます。各スクリプトは同じAPI設定snapshotを使用します。
 
-`outCheck` の `nyan_output.body` は実際に配信する本文です。WebSocket起点では従来どおり先頭の `Push: ` を除いた後に検査します。`status` と `contentType` はWebSocket / `nyanCallMe()` と同じ規則で生成し、`headers` は空のオブジェクトです。HTTP・JSON-RPC起点はtextフレーム、WebSocket起点は受信したtext/binaryの種別で配信します。
+`outCheck` の `nyan_output.body` は実際に配信する本文です。WebSocket起点では従来どおり先頭の `Push: ` を除いた後に検査します。`status` と `contentType` はWebSocket / `nyanCallMe()` と同じ規則で生成し、`headers` は空のオブジェクトです。HTTP・JSON-RPC・`nyanCallMe()`起点はtextフレーム、WebSocket起点は受信したtext/binaryの種別で配信します。
 
 Push処理に渡されたパラメータが `nyan_mode=checkOnly` の場合は、Push先の `paramCheck` だけを実行し、本体・`outCheck`・配信を行いません。チェックは配信処理全体に対して実行し、受信者ごとの認可判定は行いません。
 
@@ -791,7 +791,9 @@ console.log(result); // { success: true, status: 200, data: ...}
 - `paramCheck` で拒否されると本体・`outCheck` は実行せず、チェック結果を返します。`outCheck` で拒否されると本体の結果の代わりにチェック結果を返します。
 - `nyan_mode: "checkOnly"` では本体・`outCheck` を実行せず、`paramCheck` の結果を返します。`paramCheck` が未設定の場合は `{ success: true, status: 200, result: null }` を返します。
 - `outCheck` には本体の返却内容を `nyan_output.body` などで渡します。JSONオブジェクトに数値の `status` があれば使用し、それ以外は `200` とします。`contentType` は有効なJSONなら `application/json`、それ以外は `text/plain`、`headers` は空のオブジェクトです。本体が `success: false` を返す場合も検査します。チェック通過時の戻り値は従来どおりです。
-- `push` は実行しません。
+- 呼び出し先APIの `push` を、本体と `outCheck` の通過後、戻り値を返す前に実行します。本体結果の `status` が200～399で、トップレベルの `success` が真偽値の `false` ではない場合が対象です。`status` 省略やプレーンテキストは200として扱います。チェック拒否・実行エラー・`checkOnly` ではPushしません。
+- Push先も `paramCheck` → 本体 → `outCheck` を実行し、全購読接続へtextフレームで配信します。Push先には内部呼び出し先のAPI名と引数、元のリクエスト情報を渡します。Push先の拒否・実行エラーでも、`nyanCallMe()`の戻り値は置き換えません。
+- 親APIにも `push` があれば、親の処理完了時に別途実行します。子のPushは内部呼び出しの完了時点で実行済みなので、その後の親の拒否・エラーでは取り消しません。
 - 本体やチェックの実行、チェックの戻り値の解析に失敗すると JavaScript 側で例外が投げられます。
 
 #### よくある使い方

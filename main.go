@@ -1502,15 +1502,15 @@ func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, 
 	if err != nil {
 		return "", fmt.Errorf("failed to run API %s: %v", apiName, err)
 	}
-	if getAPIString(apiMap, "outCheck", "outcheck") == "" {
-		return result, nil
-	}
-
-	if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, apiMap, execDir, params, scriptResultResponse(result), ginCtx); err != nil {
+	response := scriptResultResponse(result)
+	if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, apiMap, execDir, params, response, ginCtx); err != nil {
 		return "", fmt.Errorf("failed to run outCheck for API %s: %w", apiName, err)
 	} else if handled {
 		body, err := json.Marshal(checkResponse)
 		return string(body), err
+	}
+	if responseAllowsPush(response) {
+		performPushWithContext(snapshot, apiMap, snapshot.Definitions, params, execDir, ginCtx)
 	}
 	return result, nil
 }

@@ -9123,6 +9123,239 @@ if (nyanAllParams.api !== "target" || nyanCallMe({api:"identity"}).generation !=
 	}
 }
 
+func TestNyanCallMePush(t *testing.T) {
+	const allow = `({success:true,status:200,result:null});`
+	const deny = `({success:false,status:403,result:"blocked"});`
+	const normal = `{"status":200,"value":"original result"}`
+	for _, tc := range []struct {
+		name, body, param, out, pushParam, pushMain, pushOut, order, wantResult string
+		noChecks, noOut, checkOnly, wantPush, wantError, noRequest              bool
+	}{
+		{name: "allow", wantPush: true},
+		{name: "without output checker", noOut: true, wantPush: true, order: "param,main,push-param,push-main,push-out,"},
+		{name: "without checks or request", noChecks: true, noRequest: true, wantPush: true, order: "main,push-param,push-main,push-out,"},
+		{name: "plain text", body: "plain result", wantPush: true},
+		{name: "no status", body: `{"value":"ok"}`, wantPush: true},
+		{name: "created", body: `{"status":201}`, wantPush: true},
+		{name: "redirect", body: `{"status":302}`, wantPush: true},
+		{name: "last allowed status", body: `{"status":399}`, wantPush: true},
+		{name: "bad request", body: `{"status":400}`},
+		{name: "conflict", body: `{"status":409}`},
+		{name: "server error", body: `{"status":500,"success":true}`},
+		{name: "false with 200", body: `{"status":200,"success":false}`},
+		{name: "false without status", body: `{"success":false}`},
+		{name: "checkOnly", checkOnly: true, order: "param,", wantResult: `{"success":true,"status":200,"result":null}`},
+		{name: "checkOnly without checker", checkOnly: true, noChecks: true, order: "none", wantResult: `{"success":true,"status":200,"result":null}`},
+		{name: "input denied", param: deny, order: "param,", wantResult: `{"success":false,"status":403,"result":"blocked"}`},
+		{name: "input non-200", param: `({success:true,status:202,result:null});`, order: "param,", wantResult: `{"success":true,"status":202,"result":null}`},
+		{name: "output denied", out: deny, wantResult: `{"success":false,"status":403,"result":"blocked"}`},
+		{name: "input exception", param: `throw new Error("boom");`, wantError: true, order: "param,"},
+		{name: "main exception", body: "throw", wantError: true, order: "param,main,"},
+		{name: "output exception", out: `throw new Error("boom");`, wantError: true},
+		{name: "push input denied", pushParam: deny, order: "param,main,out,push-param,"},
+		{name: "push output denied", pushOut: deny, order: "param,main,out,push-param,push-main,push-out,"},
+		{name: "push main exception", pushMain: `throw new Error("boom");`, order: "param,main,out,push-param,push-main,"},
+		{name: "push input exception", pushParam: `throw new Error("boom");`, order: "param,main,out,push-param,"},
+		{name: "push output exception", pushOut: `throw new Error("boom");`, order: "param,main,out,push-param,push-main,push-out,"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, key := t.TempDir(), t.Name()
+			t.Cleanup(func() { storage.Delete(key) })
+			cookie := "source-cookie"
+			if tc.noRequest {
+				cookie = ""
+			}
+			write := func(stage, body string) string {
+				path := filepath.Join(dir, stage+".js")
+				guard := fmt.Sprintf(`
+if(nyanAllParams.api!=="child" || nyanAllParams.value!=="input" || nyanGetCookie("session")!==%q || nyanGetFile("data.txt")!=="root-data") throw new Error("wrong execution context");
+nyanSetItem(%q,nyanGetItem(%q)+%q);`, cookie, key, key, stage+",")
+				if strings.HasPrefix(stage, "push-") {
+					// Handshake checks have no internal-call parameters.
+					guard = `if(nyanAllParams.value==="input"){` + guard + `nyanSetCookie("push-cookie","ignored");}`
+					body = `if(nyanAllParams.value!=="input"){` + allow + `}else{` + body + `}`
+				}
+				writeHotReloadTestFile(t, path, guard+body)
+				return path
+			}
+			body := tc.body
+			if body == "" {
+				body = normal
+			}
+			mainScript := strconv.Quote(body) + ";"
+			if body == "throw" {
+				mainScript = `throw new Error("boom");`
+			}
+			orAllow := func(script string) string {
+				if script == "" {
+					return allow
+				}
+				return script
+			}
+			child := map[string]interface{}{"script": write("main", mainScript), "push": "sink"}
+			if !tc.noChecks {
+				child["paramCheck"] = write("param", orAllow(tc.param))
+				if !tc.noOut {
+					child["outCheck"] = write("out", orAllow(tc.out))
+				}
+			}
+			pushMain := tc.pushMain
+			if pushMain == "" {
+				pushMain = `"Push: notification";`
+			}
+			recovery := filepath.Join(dir, "recovery.js")
+			writeHotReloadTestFile(t, recovery, `"barrier";`)
+			f := newWebSocketCheckFixture(t, map[string]interface{}{
+				"child": child,
+				"sink": map[string]interface{}{
+					"paramCheck": write("push-param", orAllow(tc.pushParam)),
+					"script":     write("push-main", pushMain), "outCheck": write("push-out", orAllow(tc.pushOut)),
+				},
+				"recovery": map[string]interface{}{"script": recovery},
+			})
+			writeHotReloadTestFile(t, filepath.Join(f.dir, "data.txt"), "root-data")
+			barrier := func(conn *websocket.Conn) {
+				if got := exchangeWebSocketCheckFrame(t, conn, websocket.TextMessage, `{"api":"recovery"}`); got != "barrier" {
+					t.Fatalf("unexpected delivery: %s", got)
+				}
+			}
+			var subscribers []*websocket.Conn
+			for i := 0; i < 3; i++ {
+				conn := f.dial("/sink", http.Header{"Cookie": {"session=receiver-cookie"}})
+				barrier(conn)
+				subscribers = append(subscribers, conn)
+			}
+			// A newer published configuration must not replace the caller's snapshot.
+			captured := currentAPISnapshot()
+			publishAPISnapshot(newAPIConfigSnapshot(captured.RootPath, map[string]interface{}{
+				"recovery": captured.Definitions["recovery"],
+			}, nil, nil, nil, nil))
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/parent", nil)
+			ctx.Request.AddCookie(&http.Cookie{Name: "session", Value: cookie})
+			if tc.noRequest {
+				ctx = nil
+			}
+			vm := goja.New()
+			setupGojaVMWithSnapshot(vm, captured, ctx)
+			mode := ""
+			if tc.checkOnly {
+				mode = "checkOnly"
+			}
+			value, err := vm.RunString(fmt.Sprintf(`nyanCallMe({api:"child",value:"input",nyan_mode:%q});`, mode))
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "boom") {
+					t.Fatalf("error=%v, want boom", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantText := body
+				if tc.wantResult != "" {
+					wantText = tc.wantResult
+				}
+				var want interface{}
+				if json.Unmarshal([]byte(wantText), &want) != nil {
+					want = wantText
+				}
+				if !reflect.DeepEqual(value.Export(), want) {
+					t.Fatalf("return value=%#v, want %#v", value.Export(), want)
+				}
+			}
+			order := tc.order
+			if order == "" {
+				order = "param,main,out,"
+				if tc.wantPush {
+					order += "push-param,push-main,push-out,"
+				}
+			} else if order == "none" {
+				order = ""
+			}
+			gotOrder, _ := storage.Load(key)
+			if gotOrder == nil {
+				gotOrder = ""
+			}
+			if gotOrder != order {
+				t.Fatalf("order=%v want=%s", gotOrder, order)
+			}
+			if len(recorder.Header()) != 0 || recorder.Body.Len() != 0 {
+				t.Fatalf("Push modified the caller response: %v %s", recorder.Header(), recorder.Body.String())
+			}
+			for _, conn := range subscribers {
+				if tc.wantPush {
+					kind, data, err := conn.ReadMessage()
+					if err != nil || kind != websocket.TextMessage || string(data) != "Push: notification" {
+						t.Fatalf("Push=(%d,%q,%v)", kind, data, err)
+					}
+				}
+				barrier(conn) // Proves absence of rejected or duplicate deliveries.
+			}
+		})
+	}
+}
+
+func TestNyanCallMePushBeforeParentCompletes(t *testing.T) {
+	for _, rejectParent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reject parent=%t", rejectParent), func(t *testing.T) {
+			dir := t.TempDir()
+			write := func(name, body string) string {
+				path := filepath.Join(dir, name+".js")
+				writeHotReloadTestFile(t, path, body)
+				return path
+			}
+			f := newWebSocketCheckFixture(t, map[string]interface{}{
+				"parent": map[string]interface{}{
+					"script":   write("parent", `const child=nyanCallMe({api:"child"}); JSON.stringify({status:200,child:child});`),
+					"outCheck": write("parent-out", fmt.Sprintf(`({success:%t,status:200,result:"parent denied"});`, !rejectParent)), "push": "sink",
+				},
+				"child":    map[string]interface{}{"script": write("child", `JSON.stringify({status:200,value:"child result"});`), "push": "sink"},
+				"sink":     map[string]interface{}{"script": write("sink", `JSON.stringify({api:nyanAllParams.api,cookie:nyanGetCookie("session")});`)},
+				"recovery": map[string]interface{}{"script": write("recovery", `"barrier";`)},
+			})
+			sink := f.dial("/sink", nil)
+			if got := exchangeWebSocketCheckFrame(t, sink, websocket.TextMessage, `{"api":"recovery"}`); got != "barrier" {
+				t.Fatal(got)
+			}
+			request, err := http.NewRequest(http.MethodGet, f.server.URL+"/parent", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.AddCookie(&http.Cookie{Name: "session", Value: "parent-cookie"})
+			response, err := f.server.Client().Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(response.Body)
+			response.Body.Close()
+			if err != nil || response.StatusCode != 200 {
+				t.Fatalf("response=%s err=%v", body, err)
+			}
+			if rejectParent {
+				if !containsJSONValue(body, "result", "parent denied") {
+					t.Fatalf("parent rejection lost: %s", body)
+				}
+			} else if !strings.Contains(string(body), "child result") {
+				t.Fatalf("child result lost: %s", body)
+			}
+			apis := []string{"child"}
+			if !rejectParent {
+				apis = append(apis, "parent")
+			}
+			for _, api := range apis {
+				kind, data, err := sink.ReadMessage()
+				if err != nil || kind != websocket.TextMessage || !containsJSONValue(data, "api", api) || !containsJSONValue(data, "cookie", "parent-cookie") {
+					t.Fatalf("Push=%s err=%v, want api=%s", data, err, api)
+				}
+			}
+			if got := exchangeWebSocketCheckFrame(t, sink, websocket.TextMessage, `{"api":"recovery"}`); got != "barrier" {
+				t.Fatalf("duplicate Push: %s", got)
+			}
+		})
+	}
+}
+
 func TestPushTargetChecksAcrossTransports(t *testing.T) {
 	const allow = `({success:true,status:200,result:null});`
 	cases := []struct {
