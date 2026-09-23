@@ -252,6 +252,18 @@ var ginContext *gin.Context
 
 var pushConnections sync.Map
 
+// Push and request replies can write to the same connection concurrently.
+type serverWebSocket struct {
+	*websocket.Conn
+	writeMu sync.Mutex
+}
+
+func (conn *serverWebSocket) WriteMessage(messageType int, data []byte) error {
+	conn.writeMu.Lock()
+	defer conn.writeMu.Unlock()
+	return conn.Conn.WriteMessage(messageType, data)
+}
+
 var websocketConnectionCount = struct {
 	sync.Mutex
 	Active int
@@ -1040,6 +1052,9 @@ func handleAPIRequest(c *gin.Context) {
 		respondWithError(c, http.StatusBadRequest, fmt.Sprintf("API %s is not an HTTP/WebSocket endpoint", scriptValueKey), nil)
 		return
 	}
+	if allowed, handled := runParamCheckWithSnapshot(snapshot, c, scriptInfo, execDir, allParams); handled || !allowed {
+		return
+	}
 
 	// スクリプトのパスを取得
 	scriptPath, ok := scriptInfo["script"].(string)
@@ -1072,10 +1087,14 @@ func handleAPIRequest(c *gin.Context) {
 		return
 	}
 
-	// HTTP リクエストから push を発生させる処理
+	response := APIResponse{Status: int(status), ContentType: "application/json", Headers: map[string]string{}, Body: []byte(result)}
+	if handled := runOutCheckWithSnapshot(snapshot, c, scriptInfo, execDir, allParams, response); handled {
+		return
+	}
+	// 出力チェックを通過したHTTPリクエストからPushを実行する。
 	performPushWithSnapshot(snapshot, scriptInfo, scriptListData, allParams, execDir)
 
-	c.JSON(int(status), jsonData)
+	c.JSON(response.Status, jsonData)
 }
 
 // handleWebSocket はWebSocketリクエストを処理します。
@@ -1087,24 +1106,20 @@ func handleWebSocket(c *gin.Context) {
 		return
 	}
 	defer release()
-	// WebSocket 接続をアップグレード
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	// Resolve and check the subscription target before upgrading or registering it.
+	execPath, err := filepath.Abs(filepath.Dir(os.Args[0]))
 	if err != nil {
-		logServiceError(slog.LevelWarn, "websocket_upgrade_failed", err)
+		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, "Failed to resolve execution directory"))
 		return
 	}
-	// http.Server.ReadTimeout protects ordinary request bodies from slow
-	// clients.  A successful WebSocket upgrade is intentionally long-lived,
-	// so clear the inherited socket deadline before entering its read loop.
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		logServiceError(slog.LevelWarn, "websocket_deadline_clear_failed", err)
-		conn.Close()
-		return
+	if isTemporaryDirectory(execPath) {
+		execPath, err = os.Getwd()
+		if err != nil {
+			writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, "Failed to resolve working directory"))
+			return
+		}
 	}
-	// 接続終了時に登録を解除
-	defer conn.Close()
-
-	// API 名の取得（ルートパラメータがなければ URL から取得）
+	execDir := apiBaseDir(execPath)
 	apiNameValue, _ := c.Get("nyan_api_name")
 	apiNameString, _ := apiNameValue.(string)
 	if apiNameString == "" {
@@ -1113,22 +1128,54 @@ func handleWebSocket(c *gin.Context) {
 	if apiNameString == "" {
 		apiNameString = strings.TrimPrefix(c.Request.URL.Path, "/")
 	}
-	// push受信用にこの接続を登録
+	if apiNameString == "" {
+		apiNameString = c.Query("api")
+	}
+	params, err := collectRequestParams(c)
+	if err != nil {
+		writeParamCheckResponse(c, newParamCheckError(http.StatusBadRequest, "Invalid request parameters"))
+		return
+	}
+	params["api"] = apiNameString
+	addWebSocketRequestMetadata(params, c.Request)
+	if apiNameString != "" {
+		snapshot, err := loadAPIConfigSnapshot(apiJSONPath(execDir), execDir)
+		if err != nil {
+			writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, "Failed to load API configuration"))
+			return
+		}
+		apiMap, ok := snapshot.Definitions[apiNameString].(map[string]interface{})
+		if !ok || getAPIType(apiMap) != apiTypeAPI {
+			writeParamCheckResponse(c, newParamCheckError(http.StatusNotFound, "API not found"))
+			return
+		}
+		if !apiWebSocketAllowed(apiMap) {
+			c.Status(http.StatusForbidden)
+			return
+		}
+		if allowed, handled := runParamCheckWithSnapshot(snapshot, c, apiMap, execDir, params); handled || !allowed {
+			return
+		}
+	} else if isCheckOnlyMode(params) {
+		writeParamCheckResponse(c, ParamCheckResponse{Success: true, Status: http.StatusOK})
+		return
+	}
+
+	rawConn, err := upgrader.Upgrade(c.Writer, c.Request, c.Writer.Header())
+	if err != nil {
+		logServiceError(slog.LevelWarn, "websocket_upgrade_failed", err)
+		return
+	}
+	conn := &serverWebSocket{Conn: rawConn}
+	// An upgraded connection is long-lived; clear the HTTP read deadline.
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		logServiceError(slog.LevelWarn, "websocket_deadline_clear_failed", err)
+		conn.Close()
+		return
+	}
+	defer conn.Close()
 	pushConnections.Store(apiNameString, conn)
 	defer pushConnections.Delete(apiNameString)
-
-	// 実行ファイルのディレクトリ取得
-	execPath, err := filepath.Abs(filepath.Dir(os.Args[0]))
-	if err != nil {
-		fatalServiceError("executable_path_failed", err)
-	}
-	if isTemporaryDirectory(execPath) {
-		execPath, err = os.Getwd()
-		if err != nil {
-			fatalServiceError("working_directory_failed", err)
-		}
-	}
-	execDir := apiBaseDir(execPath)
 
 	for {
 		// WebSocket からメッセージを読み取る
@@ -1156,13 +1203,7 @@ func handleWebSocket(c *gin.Context) {
 			continue
 		}
 
-		receivedData["_remote_ip"] = getClientIP(c.Request)
-		receivedData["_user_agent"] = c.Request.UserAgent()
-		headersMap := make(map[string]string)
-		for k, v := range c.Request.Header {
-			headersMap[k] = strings.Join(v, ",")
-		}
-		receivedData["_headers"] = headersMap
+		addWebSocketRequestMetadata(receivedData, c.Request)
 
 		// Pin one configuration generation for this message, including nested calls.
 		apiJsonPath := apiJSONPath(execDir)
@@ -1241,51 +1282,23 @@ func handleWebSocket(c *gin.Context) {
 			break
 		}
 
-		// push 項目が設定されている場合、push 対象APIの処理を実行
-		if pushTargetRaw, exists := scriptInfo["push"]; exists {
-			if pushTarget, ok := pushTargetRaw.(string); ok && pushTarget != "" {
-				// push 対象APIの設定を取得
-				if pushConfigRaw, exists := scriptListData[pushTarget]; exists {
-					if pushConfig, ok := pushConfigRaw.(map[string]interface{}); ok {
-						pushScript, ok := pushConfig["script"].(string)
-						if ok && pushScript != "" {
-							pushScriptPath := resolvePathFromBase(execDir, pushScript)
-							// push API を実行
-							pushResult, err := runJavaScriptForAPI(snapshot, pushTarget, pushScriptPath, receivedData, nil)
-							if err != nil {
-								logServiceError(slog.LevelError, "push_script_failed", err, "api", pushTarget)
-							} else {
-								// 先頭の "Push: " を取り除く
-								pushResult = strings.TrimPrefix(pushResult, "Push: ")
-								// push対象のWebSocket接続があれば、push結果を送信
-								if pushConnRaw, ok := pushConnections.Load(pushTarget); ok {
-									if pushConn, ok := pushConnRaw.(*websocket.Conn); ok {
-										if err := pushConn.WriteMessage(messageType, []byte(pushResult)); err != nil {
-											logServiceError(slog.LevelWarn, "push_send_failed", err, "api", pushTarget)
-										} else {
-											serviceLog(slog.LevelDebug, "push_sent", "api", pushTarget, "bytes", len(pushResult))
-										}
-									} else {
-										serviceLog(slog.LevelWarn, "push_connection_invalid", "api", pushTarget)
-									}
-								} else {
-									serviceLog(slog.LevelDebug, "push_no_subscribers", "api", pushTarget)
-								}
-							}
-						} else {
-							serviceLog(slog.LevelWarn, "push_script_missing", "api", pushTarget)
-						}
-					}
-				} else {
-					serviceLog(slog.LevelWarn, "push_api_missing", "api", pushTarget)
-				}
-			}
-		}
+		performPushForTransport(snapshot, scriptInfo, scriptListData, receivedData, execDir, messageType, true)
 	}
 }
 
+// Connection metadata is server-owned, both before upgrade and for each message.
+func addWebSocketRequestMetadata(params map[string]interface{}, request *http.Request) {
+	params["_remote_ip"] = getClientIP(request)
+	params["_user_agent"] = request.UserAgent()
+	headers := make(map[string]string)
+	for name, values := range request.Header {
+		headers[name] = strings.Join(values, ",")
+	}
+	params["_headers"] = headers
+}
+
 // エラーレスポンスの送信
-func sendErrorMessage(conn *websocket.Conn, message string) {
+func sendErrorMessage(conn *serverWebSocket, message string) {
 	errMessage := map[string]interface{}{
 		"error": message,
 	}
@@ -1293,7 +1306,7 @@ func sendErrorMessage(conn *websocket.Conn, message string) {
 	conn.WriteMessage(websocket.TextMessage, jsonMessage)
 }
 
-func writeWebSocketCheckResponse(conn *websocket.Conn, messageType int, response ParamCheckResponse) error {
+func writeWebSocketCheckResponse(conn *serverWebSocket, messageType int, response ParamCheckResponse) error {
 	body, err := json.Marshal(response)
 	if err != nil {
 		logServiceError(slog.LevelError, "websocket_check_response_invalid", err)
@@ -1919,6 +1932,11 @@ func runParamCheckWithSnapshot(snapshot *APIConfigSnapshot, c *gin.Context, apiM
 
 // runParamCheckResponseWithSnapshot evaluates checks without writing an HTTP response.
 func runParamCheckResponseWithSnapshot(snapshot *APIConfigSnapshot, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, ginCtx *gin.Context) (bool, ParamCheckResponse, error) {
+	apiName, _ := allParams["api"].(string)
+	return runParamCheckResponseForAPI(snapshot, apiName, apiMap, execDir, allParams, ginCtx)
+}
+
+func runParamCheckResponseForAPI(snapshot *APIConfigSnapshot, apiName string, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, ginCtx *gin.Context) (bool, ParamCheckResponse, error) {
 	checkOnly := isCheckOnlyMode(allParams)
 	paramCheckPath := getAPIString(apiMap, "paramCheck", "paramcheck", "check")
 	if paramCheckPath == "" {
@@ -1929,7 +1947,7 @@ func runParamCheckResponseWithSnapshot(snapshot *APIConfigSnapshot, apiMap map[s
 	if err != nil {
 		return true, ParamCheckResponse{}, err
 	}
-	resultValue, err := runJavaScriptValueWithSnapshot(snapshot, fullPath, allParams, ginCtx)
+	resultValue, err := runJavaScriptValueForAPI(snapshot, apiName, fullPath, allParams, ginCtx)
 	if err != nil {
 		return true, ParamCheckResponse{}, err
 	}
@@ -1956,6 +1974,11 @@ func runOutCheckWithSnapshot(snapshot *APIConfigSnapshot, c *gin.Context, apiMap
 }
 
 func runOutCheckResponseWithSnapshot(snapshot *APIConfigSnapshot, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response APIResponse, ginCtx *gin.Context) (bool, ParamCheckResponse, error) {
+	apiName, _ := allParams["api"].(string)
+	return runOutCheckResponseForAPI(snapshot, apiName, apiMap, execDir, allParams, response, ginCtx)
+}
+
+func runOutCheckResponseForAPI(snapshot *APIConfigSnapshot, apiName string, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response APIResponse, ginCtx *gin.Context) (bool, ParamCheckResponse, error) {
 	outCheckPath := getAPIString(apiMap, "outCheck", "outcheck")
 	if outCheckPath == "" {
 		return false, ParamCheckResponse{}, nil
@@ -1982,7 +2005,7 @@ func runOutCheckResponseWithSnapshot(snapshot *APIConfigSnapshot, apiMap map[str
 	if err != nil {
 		return true, ParamCheckResponse{}, err
 	}
-	resultValue, err := runJavaScriptValueWithSnapshot(snapshot, fullPath, checkParams, ginCtx)
+	resultValue, err := runJavaScriptValueForAPI(snapshot, apiName, fullPath, checkParams, ginCtx)
 	if err != nil {
 		return true, ParamCheckResponse{}, err
 	}
@@ -2785,6 +2808,15 @@ func executeMCPTool(snapshot *APIConfigSnapshot, tool *MCPToolConfig, rawArgumen
 	if !ok || getAPIType(backing) != apiTypeAPI {
 		return nil, "Tool backing API is unavailable."
 	}
+	execDir, err := javaScriptFileBaseDir(snapshot)
+	if err != nil {
+		return nil, "Tool execution failed."
+	}
+	if handled, check, err := runParamCheckResponseForAPI(snapshot, tool.API, backing, execDir, arguments, nil); err != nil {
+		return nil, "Tool paramCheck failed."
+	} else if handled {
+		return mcpCheckResult(check)
+	}
 	scriptPath := getAPIString(backing, "script")
 	if scriptPath == "" {
 		return nil, "Tool backing API is unavailable."
@@ -2800,6 +2832,11 @@ func executeMCPTool(snapshot *APIConfigSnapshot, tool *MCPToolConfig, rawArgumen
 	if len(body) > maxMCPToolResultBytes {
 		return nil, "Tool result is too large."
 	}
+	if handled, check, err := runOutCheckResponseForAPI(snapshot, tool.API, backing, execDir, arguments, scriptResultResponse(string(body)), nil); err != nil {
+		return nil, "Tool outCheck failed."
+	} else if handled {
+		return mcpCheckResult(check)
+	}
 	if tool.OutputSchema != nil {
 		if err := validateMCPJSONSchemaValue(tool.OutputSchema, structured); err != nil {
 			return nil, "Tool result does not match outputSchema."
@@ -2809,6 +2846,19 @@ func executeMCPTool(snapshot *APIConfigSnapshot, tool *MCPToolConfig, rawArgumen
 		"content":           []map[string]interface{}{{"type": "text", "text": string(body)}},
 		"structuredContent": structured,
 		"isError":           false,
+	}, ""
+}
+
+// Check responses are separate from the API's normal outputSchema.
+func mcpCheckResult(check ParamCheckResponse) (map[string]interface{}, string) {
+	body, err := json.Marshal(check)
+	if err != nil || len(body) > maxMCPToolResultBytes {
+		return nil, "Tool check result is invalid or too large."
+	}
+	return map[string]interface{}{
+		"content":           []map[string]interface{}{{"type": "text", "text": string(body)}},
+		"structuredContent": map[string]interface{}{"success": check.Success, "status": check.Status, "result": check.Result},
+		"isError":           !check.Success || check.Status != http.StatusOK,
 	}, ""
 }
 
@@ -3681,12 +3731,19 @@ func setupOAuthGojaVM(vm *goja.Runtime, _ *APIConfigSnapshot, mcp *MCPServerConf
 		}
 		return keys
 	})
-	vm.Set("nyanRandomBase64URL", func(size int) string {
+	vm.Set("nyanRandomBase64URL", func(call goja.FunctionCall) goja.Value {
+		size := 32
+		if len(call.Arguments) > 0 {
+			size = int(call.Arguments[0].ToInteger())
+		}
+		if size < 1 || size > 1024 {
+			panic(vm.NewTypeError("random byte count is outside the allowed range"))
+		}
 		value, err := secureRandomBase64URL(size)
 		if err != nil {
 			panic(vm.ToValue("secure random generation failed"))
 		}
-		return value
+		return vm.ToValue(value)
 	})
 	vm.Set("nyanSHA256Base64URL", sha256Base64URL)
 	vm.Set("nyanArgon2idHash", func(password string) string {
@@ -3708,8 +3765,8 @@ func setupOAuthGojaVM(vm *goja.Runtime, _ *APIConfigSnapshot, mcp *MCPServerConf
 }
 
 func secureRandomBase64URL(size int) (string, error) {
-	if size < 16 || size > 128 {
-		return "", fmt.Errorf("random size must be between 16 and 128 bytes")
+	if size < 1 || size > 1024 {
+		return "", fmt.Errorf("random size must be between 1 and 1024 bytes")
 	}
 	data := make([]byte, size)
 	if _, err := rand.Read(data); err != nil {
@@ -4293,45 +4350,70 @@ func performPush(scriptInfo map[string]interface{}, scriptListData map[string]in
 }
 
 func performPushWithSnapshot(snapshot *APIConfigSnapshot, scriptInfo map[string]interface{}, scriptListData map[string]interface{}, allParams map[string]interface{}, execDir string) {
-	if pushTargetRaw, exists := scriptInfo["push"]; exists {
-		if pushTarget, ok := pushTargetRaw.(string); ok && pushTarget != "" {
-			// push 対象の設定を取得
-			if pushConfigRaw, exists := scriptListData[pushTarget]; exists {
-				if pushConfig, ok := pushConfigRaw.(map[string]interface{}); ok {
-					pushScript, ok := pushConfig["script"].(string)
-					if ok && pushScript != "" {
-						pushScriptPath := resolvePathFromBase(execDir, pushScript)
-						// push 対象の API のスクリプトを実行
-						pushResult, err := runJavaScriptForAPI(snapshot, pushTarget, pushScriptPath, allParams, nil)
-						if err != nil {
-							logServiceError(slog.LevelError, "push_script_failed", err, "api", pushTarget)
-						} else {
-							serviceLog(slog.LevelDebug, "push_script_completed", "api", pushTarget, "result_bytes", len(pushResult))
-							// pushConnections から対象の WebSocket 接続を取得し、pushResult を送信
-							if pushConnRaw, ok := pushConnections.Load(pushTarget); ok {
-								if pushConn, ok := pushConnRaw.(*websocket.Conn); ok {
-									pushMessage := []byte(pushResult)
-									if err := pushConn.WriteMessage(websocket.TextMessage, pushMessage); err != nil {
-										logServiceError(slog.LevelWarn, "push_send_failed", err, "api", pushTarget)
-									} else {
-										serviceLog(slog.LevelDebug, "push_sent", "api", pushTarget, "bytes", len(pushResult))
-									}
-								} else {
-									serviceLog(slog.LevelWarn, "push_connection_invalid", "api", pushTarget)
-								}
-							} else {
-								serviceLog(slog.LevelDebug, "push_no_subscribers", "api", pushTarget)
-							}
-						}
-					} else {
-						serviceLog(slog.LevelWarn, "push_script_missing", "api", pushTarget)
-					}
-				}
-			} else {
-				serviceLog(slog.LevelWarn, "push_api_missing", "api", pushTarget)
-			}
-		}
+	performPushForTransport(snapshot, scriptInfo, scriptListData, allParams, execDir, websocket.TextMessage, false)
+}
+
+// Keep HTTP and WebSocket Push checks identical while preserving their frame
+// types and the legacy WebSocket-only removal of the "Push: " prefix.
+func performPushForTransport(snapshot *APIConfigSnapshot, scriptInfo map[string]interface{}, scriptListData map[string]interface{}, allParams map[string]interface{}, execDir string, messageType int, stripPrefix bool) {
+	pushTarget, _ := scriptInfo["push"].(string)
+	if pushTarget == "" {
+		return
 	}
+	pushConfig, ok := scriptListData[pushTarget].(map[string]interface{})
+	if !ok {
+		serviceLog(slog.LevelWarn, "push_api_missing", "api", pushTarget)
+		return
+	}
+
+	// Preserve the triggering API in nyanAllParams.api, but execute all three
+	// scripts with the Push target's definition and the same captured snapshot.
+	params := cloneParams(allParams)
+	if handled, check, err := runParamCheckResponseForAPI(snapshot, pushTarget, pushConfig, execDir, params, nil); err != nil {
+		logServiceError(slog.LevelError, "push_param_check_failed", err, "api", pushTarget)
+		return
+	} else if handled {
+		serviceLog(slog.LevelDebug, "push_check_stopped", "api", pushTarget, "check", "paramCheck", "status", check.Status)
+		return
+	}
+
+	pushScript := getAPIString(pushConfig, "script")
+	if pushScript == "" {
+		serviceLog(slog.LevelWarn, "push_script_missing", "api", pushTarget)
+		return
+	}
+	pushScriptPath := resolvePathFromBase(execDir, pushScript)
+	pushResult, err := runJavaScriptForAPI(snapshot, pushTarget, pushScriptPath, params, nil)
+	if err != nil {
+		logServiceError(slog.LevelError, "push_script_failed", err, "api", pushTarget)
+		return
+	}
+	if stripPrefix {
+		pushResult = strings.TrimPrefix(pushResult, "Push: ")
+	}
+	if handled, check, err := runOutCheckResponseForAPI(snapshot, pushTarget, pushConfig, execDir, params, scriptResultResponse(pushResult), nil); err != nil {
+		logServiceError(slog.LevelError, "push_out_check_failed", err, "api", pushTarget)
+		return
+	} else if handled {
+		serviceLog(slog.LevelDebug, "push_check_stopped", "api", pushTarget, "check", "outCheck", "status", check.Status)
+		return
+	}
+
+	pushConnRaw, exists := pushConnections.Load(pushTarget)
+	if !exists {
+		serviceLog(slog.LevelDebug, "push_no_subscribers", "api", pushTarget)
+		return
+	}
+	pushConn, ok := pushConnRaw.(*serverWebSocket)
+	if !ok {
+		serviceLog(slog.LevelWarn, "push_connection_invalid", "api", pushTarget)
+		return
+	}
+	if err := pushConn.WriteMessage(messageType, []byte(pushResult)); err != nil {
+		logServiceError(slog.LevelWarn, "push_send_failed", err, "api", pushTarget)
+		return
+	}
+	serviceLog(slog.LevelDebug, "push_sent", "api", pushTarget, "bytes", len(pushResult))
 }
 
 // handleNyan は /nyan エンドポイントを処理します。
@@ -4849,8 +4931,8 @@ func setupGojaVMWithSnapshot(vm *goja.Runtime, snapshot *APIConfigSnapshot, ginC
 }
 
 func setupGojaVMForAPI(vm *goja.Runtime, snapshot *APIConfigSnapshot, apiName string, ginCtx *gin.Context) {
-	// Capture the API definition's directory once, independently of JS parameters.
-	fileBaseDir, fileBaseErr := javaScriptFileBaseDir(snapshot, apiName)
+	// Capture the root API configuration's directory once, independently of JS parameters.
+	fileBaseDir, fileBaseErr := javaScriptFileBaseDir(snapshot)
 	filePath := func(path string) string {
 		if filepath.IsAbs(path) {
 			return path
@@ -4881,7 +4963,8 @@ func setupGojaVMForAPI(vm *goja.Runtime, snapshot *APIConfigSnapshot, apiName st
 	})
 	vm.Set("nyanSetCookie", func(name, value string) {
 		if ginCtx != nil {
-			ginCtx.SetCookie(name, value, 3600, "/", "", false, true)
+			secure := ginCtx.Request != nil && ginCtx.Request.TLS != nil
+			ginCtx.SetCookie(name, value, 3600, "/", "", secure, true)
 		}
 	})
 
@@ -4934,7 +5017,7 @@ func setupGojaVMForAPI(vm *goja.Runtime, snapshot *APIConfigSnapshot, apiName st
 	vm.Set("nyanGetFile", newNyanGetFile(vm, filePath))
 
 	vm.Set("nyanCallMe", func(call goja.FunctionCall) goja.Value {
-		apiName := "hello2"
+		apiName := ""
 		params := map[string]interface{}{}
 
 		if len(call.Arguments) >= 1 {
@@ -4955,6 +5038,9 @@ func setupGojaVMForAPI(vm *goja.Runtime, snapshot *APIConfigSnapshot, apiName st
 			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
 				apiName = s
 			}
+		}
+		if apiName == "" {
+			panic(vm.ToValue("nyanCallMe: api is required (non-empty string)"))
 		}
 		params["api"] = apiName
 
@@ -5210,13 +5296,12 @@ func execCommand(commandLine string) (*ExecResult, error) {
 	}
 
 	if err != nil {
-		// 終了コードを取得
+		// A completed command reports failure through its result, not a JS exception.
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			result.ExitCode = exitErr.ExitCode()
-		} else {
-			result.ExitCode = -1
+			return result, nil
 		}
-
+		result.ExitCode = -1
 		return result, fmt.Errorf("failed to exec: %w", err)
 	}
 
@@ -5224,16 +5309,12 @@ func execCommand(commandLine string) (*ExecResult, error) {
 	return result, nil
 }
 
-// javaScriptFileBaseDir follows the owning API JSON, including mounted definitions.
-// Snapshots without source metadata still retain the root configuration path.
-func javaScriptFileBaseDir(snapshot *APIConfigSnapshot, apiName string) (string, error) {
+// javaScriptFileBaseDir anchors file operations to the captured root API JSON.
+// Included definitions share this base regardless of their source directory.
+func javaScriptFileBaseDir(snapshot *APIConfigSnapshot) (string, error) {
 	apiPath := servicePaths.API.Path
-	if snapshot != nil {
-		if source := snapshot.Sources[apiName]; source != "" {
-			apiPath = source
-		} else if snapshot.RootPath != "" {
-			apiPath = snapshot.RootPath
-		}
+	if snapshot != nil && snapshot.RootPath != "" {
+		apiPath = snapshot.RootPath
 	}
 	if apiPath != "" {
 		return filepath.Abs(filepath.Dir(apiPath))

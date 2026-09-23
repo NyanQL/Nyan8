@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -418,6 +419,165 @@ if (nyanAllParams.allow === "1") {
 	}
 	if got, want := body["body"], "main ok"; got != want {
 		t.Fatalf("body = %v, want %q; response=%q", got, want, rec.Body.String())
+	}
+}
+
+func TestRootHTTPChecksMatchNamedEndpoint(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	oldSnapshot, oldConfig, oldPaths, oldContext := currentAPISnapshot(), globalConfig, servicePaths, ginContext
+	t.Cleanup(func() {
+		publishAPISnapshot(oldSnapshot)
+		globalConfig, servicePaths, ginContext = oldConfig, oldPaths, oldContext
+	})
+	globalConfig = Config{}
+	const allow = `({success:true,status:200,result:{checked:true}});`
+	const denyParam = `({success:false,status:403,result:{reason:"input denied"}});`
+	const denyOut = `({success:false,status:409,result:{reason:"output denied"}});`
+	for _, tc := range []struct {
+		name, param, out, main, paramKey, outKey, order, result string
+		status                                                  int
+		checkOnly                                               bool
+	}{
+		{name: "allow", param: allow, out: allow, status: 201, order: "param,main,out,push,", result: `{"status":201,"value":"日本語"}`},
+		{name: "no checks", status: 201, order: "main,push,", result: `{"status":201,"value":"日本語"}`},
+		{name: "param denied", param: denyParam, out: allow, status: 403, order: "param,", result: `{"success":false,"status":403,"result":{"reason":"input denied"}}`},
+		{name: "param false with 200", param: `({success:false,status:200,result:"denied"});`, out: allow, status: 200, order: "param,", result: `{"success":false,"status":200,"result":"denied"}`},
+		{name: "param non-200", param: `({success:true,status:202,result:"pending"});`, out: allow, status: 202, order: "param,", result: `{"success":true,"status":202,"result":"pending"}`},
+		{name: "out denied", param: allow, out: denyOut, status: 409, order: "param,main,out,", result: `{"success":false,"status":409,"result":{"reason":"output denied"}}`},
+		{name: "out non-200", param: allow, out: `({success:true,status:202,result:"pending"});`, status: 202, order: "param,main,out,", result: `{"success":true,"status":202,"result":"pending"}`},
+		{name: "checkOnly", param: allow, out: allow, checkOnly: true, status: 200, order: "param,", result: `{"success":true,"status":200,"result":{"checked":true}}`},
+		{name: "checkOnly denied", param: denyParam, out: allow, checkOnly: true, status: 403, order: "param,", result: `{"success":false,"status":403,"result":{"reason":"input denied"}}`},
+		{name: "checkOnly without param", out: allow, checkOnly: true, status: 200, order: "", result: `{"success":true,"status":200,"result":null}`},
+		{name: "lowercase aliases", param: allow, out: denyOut, paramKey: "paramcheck", outKey: "outcheck", status: 409, order: "param,main,out,", result: `{"success":false,"status":409,"result":{"reason":"output denied"}}`},
+		{name: "legacy check", param: denyParam, paramKey: "check", status: 403, order: "param,", result: `{"success":false,"status":403,"result":{"reason":"input denied"}}`},
+		{name: "param exception", param: `throw new Error("param failed");`, out: allow, status: 500, order: "param,"},
+		{name: "param invalid", param: `({success:true});`, out: allow, status: 500, order: "param,"},
+		{name: "param missing", param: "missing", out: allow, status: 500, order: ""},
+		{name: "out exception", param: allow, out: `throw new Error("out failed");`, status: 500, order: "param,main,out,"},
+		{name: "out invalid", param: allow, out: `"not JSON";`, status: 500, order: "param,main,out,"},
+		{name: "out missing", param: allow, out: "missing", status: 500, order: "param,main,"},
+		{name: "main exception", param: allow, out: allow, main: `throw new Error("main failed");`, status: 500, order: "param,main,"},
+		{name: "main invalid JSON", param: allow, out: allow, main: `"not JSON";`, status: 500, order: "param,main,"},
+		{name: "main missing status", param: allow, out: allow, main: `JSON.stringify({value:"missing status"});`, status: 500, order: "param,main,"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, key := t.TempDir(), "root HTTP checks: "+t.Name()
+			t.Cleanup(func() { storage.Delete(key) })
+			writeScript := func(stage, body string) string {
+				path := filepath.Join(dir, stage+".js")
+				if body != "missing" {
+					prefix := fmt.Sprintf(`nyanSetItem(%q,nyanGetItem(%q)+%q);`, key, key, stage+",")
+					if stage == "param" || stage == "out" {
+						prefix += `if(nyanAllParams.api!=="nested/target" || nyanAllParams.value!=="payload" || nyanGetCookie("session")!=="test-cookie" || nyanGetRequestHeaders()["X-Test"]!=="test-header") throw new Error("wrong check context");`
+					}
+					if stage == "out" {
+						prefix += `if(nyanAllParams.nyan_output.status!==201 || nyanAllParams.nyan_output.contentType!=="application/json" || JSON.parse(nyanAllParams.nyan_output_body).value!=="日本語" || nyanAllParams.nyan_output_body_base64!=="eyJzdGF0dXMiOjIwMSwidmFsdWUiOiLml6XmnKzoqp4ifQ==") throw new Error("wrong output metadata");`
+					}
+					writeHotReloadTestFile(t, path, prefix+body)
+				}
+				return path
+			}
+			main := tc.main
+			if main == "" {
+				main = `JSON.stringify({status:201,value:"日本語"});`
+			}
+			entry := map[string]interface{}{"script": writeScript("main", main), "push": "root-check-sink"}
+			paramKey, outKey := tc.paramKey, tc.outKey
+			if paramKey == "" {
+				paramKey = "paramCheck"
+			}
+			if outKey == "" {
+				outKey = "outCheck"
+			}
+			if tc.param != "" {
+				entry[paramKey] = writeScript("param", tc.param)
+			}
+			if tc.out != "" {
+				entry[outKey] = writeScript("out", tc.out)
+			}
+			definitions := map[string]interface{}{
+				"nested/target":   entry,
+				"root-check-sink": map[string]interface{}{"paramCheck": writeScript("push", allow), "script": filepath.Join(dir, "sink.js")},
+			}
+			// Only the Push check is marked, so checkOnly cannot hide a Push invocation.
+			writeHotReloadTestFile(t, filepath.Join(dir, "sink.js"), `"message";`)
+			rootPath := filepath.Join(dir, "api.json")
+			data, err := json.Marshal(definitions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeHotReloadTestFile(t, rootPath, string(data))
+			loaded, err := readAPIConfigFile(rootPath, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			publishAPISnapshot(loaded.Snapshot)
+			servicePaths.API.Path = rootPath
+			router := gin.New()
+			router.Any("/", handleRequest)
+			if err := registerDynamicEndpoints(router, dir); err != nil {
+				t.Fatal(err)
+			}
+			for _, input := range []string{"query", "JSON", "form"} {
+				t.Run(input, func(t *testing.T) {
+					var previous map[string]interface{}
+					for _, path := range []string{"/nested/target", "/"} {
+						storage.Delete(key)
+						params := url.Values{"api": {"nested/target"}, "value": {"payload"}}
+						if tc.checkOnly {
+							params.Set("nyan_mode", "checkOnly")
+						}
+						var request *http.Request
+						switch input {
+						case "query":
+							request = httptest.NewRequest(http.MethodGet, path+"?"+params.Encode(), nil)
+						case "JSON":
+							values := map[string]string{}
+							for key := range params {
+								values[key] = params.Get(key)
+							}
+							body, _ := json.Marshal(values)
+							request = httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+							request.Header.Set("Content-Type", "application/json")
+						case "form":
+							request = httptest.NewRequest(http.MethodPost, path, strings.NewReader(params.Encode()))
+							request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+						}
+						request.AddCookie(&http.Cookie{Name: "session", Value: "test-cookie"})
+						request.Header.Set("X-Test", "test-header")
+						recorder := httptest.NewRecorder()
+						router.ServeHTTP(recorder, request)
+						if recorder.Code != tc.status {
+							t.Fatalf("%s status=%d body=%s, want %d", path, recorder.Code, recorder.Body.String(), tc.status)
+						}
+						order, _ := storage.Load(key)
+						if order == nil {
+							order = ""
+						}
+						if order != tc.order {
+							t.Fatalf("%s order=%q, want %q", path, order, tc.order)
+						}
+						var got map[string]interface{}
+						if err := json.Unmarshal(recorder.Body.Bytes(), &got); err != nil {
+							t.Fatal(err)
+						}
+						if tc.result != "" {
+							var want map[string]interface{}
+							if err := json.Unmarshal([]byte(tc.result), &want); err != nil {
+								t.Fatal(err)
+							}
+							if !reflect.DeepEqual(got, want) {
+								t.Fatalf("%s body=%s, want %s", path, recorder.Body.String(), tc.result)
+							}
+						}
+						if previous != nil && !reflect.DeepEqual(got, previous) {
+							t.Fatalf("root body=%v, named endpoint body=%v", got, previous)
+						}
+						previous = got
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -4148,6 +4308,218 @@ func TestMCPOAuthStateDirectoryUsesRuntimeConfigRoot(t *testing.T) {
 	}
 }
 
+func TestMCPToolChecksAcrossHTTPAndStdio(t *testing.T) {
+	const allow = `({success:true,status:200,result:{checked:true}});`
+	const denyParam = `({success:false,status:403,result:{reason:"input denied"}});`
+	const denyOut = `({success:false,status:409,result:{reason:"output denied"}});`
+	const normalResult = `{"ok":true,"service":"Nyan8","items":[1,2,3]}`
+	for _, tc := range []struct {
+		name, param, out, main, paramKey, outKey, arguments, order, result, failure string
+		checkOnly, isError                                                          bool
+	}{
+		{name: "allow", param: allow, out: allow, order: "param,main,out,", result: normalResult},
+		{name: "no checks", order: "main,", result: normalResult},
+		{name: "native object", param: allow, out: allow, main: `({ok:true,service:"Nyan8",items:[1,2,3]});`, order: "param,main,out,", result: normalResult},
+		{name: "param denied", param: denyParam, out: allow, order: "param,", isError: true, result: `{"success":false,"status":403,"result":{"reason":"input denied"}}`},
+		{name: "param non-200", param: `({success:true,status:202,result:"pending"});`, out: allow, order: "param,", isError: true, result: `{"success":true,"status":202,"result":"pending"}`},
+		{name: "param false with 200", param: `({success:false,status:200,result:"denied"});`, out: allow, order: "param,", isError: true, result: `{"success":false,"status":200,"result":"denied"}`},
+		{name: "out denied", param: allow, out: denyOut, order: "param,main,out,", isError: true, result: `{"success":false,"status":409,"result":{"reason":"output denied"}}`},
+		{name: "out non-200", param: allow, out: `({success:true,status:202,result:"pending"});`, order: "param,main,out,", isError: true, result: `{"success":true,"status":202,"result":"pending"}`},
+		{name: "checkOnly", param: allow, out: allow, checkOnly: true, order: "param,", result: `{"success":true,"status":200,"result":{"checked":true}}`},
+		{name: "checkOnly denied", param: denyParam, out: allow, checkOnly: true, order: "param,", isError: true, result: `{"success":false,"status":403,"result":{"reason":"input denied"}}`},
+		{name: "checkOnly without param", out: allow, checkOnly: true, order: "", result: `{"success":true,"status":200,"result":null}`},
+		{name: "lowercase aliases", param: allow, out: denyOut, paramKey: "paramcheck", outKey: "outcheck", order: "param,main,out,", isError: true, result: `{"success":false,"status":409,"result":{"reason":"output denied"}}`},
+		{name: "legacy check", param: denyParam, paramKey: "check", order: "param,", isError: true, result: `{"success":false,"status":403,"result":{"reason":"input denied"}}`},
+		{name: "param exception", param: `throw new Error("private param failure");`, out: allow, order: "param,", failure: "Tool paramCheck failed."},
+		{name: "param invalid", param: `({success:true});`, out: allow, order: "param,", failure: "Tool paramCheck failed."},
+		{name: "param missing", param: "missing", out: allow, order: "", failure: "Tool paramCheck failed."},
+		{name: "out exception", param: allow, out: `throw new Error("private out failure");`, order: "param,main,out,", failure: "Tool outCheck failed."},
+		{name: "out invalid", param: allow, out: `"not JSON";`, order: "param,main,out,", failure: "Tool outCheck failed."},
+		{name: "out missing", param: allow, out: "missing", order: "param,main,", failure: "Tool outCheck failed."},
+		{name: "main exception", param: allow, out: allow, main: `throw new Error("private main failure");`, order: "param,main,", failure: "Tool execution failed."},
+		{name: "main invalid JSON", param: allow, out: allow, main: `"not JSON";`, order: "param,main,", failure: "Tool returned invalid JSON."},
+		{name: "output schema", param: allow, out: allow, main: `({ok:true});`, order: "param,main,out,", failure: "Tool result does not match outputSchema."},
+		{name: "input schema before checkOnly", param: allow, out: allow, arguments: `{"nyan_mode":"checkOnly","value":123}`, order: "", failure: "Tool arguments do not match inputSchema."},
+		{name: "param result oversized", param: fmt.Sprintf(`({success:false,status:403,result:"x".repeat(%d)});`, maxMCPToolResultBytes), out: allow, order: "param,", failure: "Tool check result is invalid or too large."},
+		{name: "out result oversized", param: allow, out: fmt.Sprintf(`({success:false,status:409,result:"x".repeat(%d)});`, maxMCPToolResultBytes), order: "param,main,out,", failure: "Tool check result is invalid or too large."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, definitions := newMCPPhase12Definitions(t)
+			key := "MCP checks: " + t.Name()
+			t.Cleanup(func() { storage.Delete(key) })
+			writeHotReloadTestFile(t, filepath.Join(dir, "oauth-hook.js"), mcpPhase2GapAuthenticatedHook())
+			writeHotReloadTestFile(t, filepath.Join(dir, "data.txt"), "root-data")
+			writeScript := func(stage, code string) string {
+				path := filepath.Join(dir, stage+".js")
+				if code != "missing" {
+					prefix := fmt.Sprintf(`nyanSetItem(%q,nyanGetItem(%q)+%q);`, key, key, stage+",")
+					prefix += `if(nyanAllParams.api!=="sample" || nyanAllParams.mcp_tool!=="sample" || !["phase2","local-process"].includes(nyanAllParams.mcp_principal.user_id) || nyanGetFile("data.txt")!=="root-data") throw new Error("wrong Tool context");`
+					if stage == "out" {
+						prefix += `if(nyanAllParams.nyan_output_status!==200 || nyanAllParams.nyan_output_content_type!=="application/json" || nyanAllParams.nyan_output.body!==nyanAllParams.nyan_output_body || !JSON.parse(nyanAllParams.nyan_output_body).ok) throw new Error("wrong output metadata");`
+					}
+					writeHotReloadTestFile(t, path, prefix+code)
+				}
+				return path
+			}
+			entry := definitions["sample"].(map[string]interface{})
+			delete(entry, "paramCheck")
+			delete(entry, "outCheck")
+			main := tc.main
+			if main == "" {
+				main = `JSON.stringify({ok:true,service:"Nyan8",items:[1,2,3]});`
+			}
+			entry["script"] = writeScript("main", main)
+			paramKey, outKey := tc.paramKey, tc.outKey
+			if paramKey == "" {
+				paramKey = "paramCheck"
+			}
+			if outKey == "" {
+				outKey = "outCheck"
+			}
+			if tc.param != "" {
+				entry[paramKey] = writeScript("param", tc.param)
+			}
+			if tc.out != "" {
+				entry[outKey] = writeScript("out", tc.out)
+			}
+			entry["push"] = "unexpected-push"
+			definitions["unexpected-push"] = map[string]interface{}{"script": writeScript("push", `"unexpected";`)}
+			definitions["local-mcp"] = map[string]interface{}{"type": "mcp", "transport": "stdio", "tools": []interface{}{"sample"}}
+			loaded, err := loadMCPPhase12Config(dir, definitions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Give normal Tool outputs a schema that check responses do not match.
+			for _, server := range loaded.Snapshot.MCPServers {
+				tool := findMCPTool(server, "sample")
+				tool.InputSchema = map[string]interface{}{"type": "object", "properties": map[string]interface{}{"value": map[string]interface{}{"type": "string"}, "nyan_mode": map[string]interface{}{"type": "string"}}, "additionalProperties": false}
+				tool.OutputSchema = map[string]interface{}{"type": "object", "required": []interface{}{"ok", "service", "items"}}
+			}
+			router := publishMCPPhase12Snapshot(t, loaded)
+			arguments := tc.arguments
+			if arguments == "" {
+				arguments = `{"value":"input"}`
+			}
+			if tc.checkOnly {
+				arguments = `{"value":"input","nyan_mode":"checkOnly"}`
+			}
+			for _, transport := range []string{"http", "stdio"} {
+				t.Run(transport, func(t *testing.T) {
+					storage.Delete(key)
+					var envelope map[string]interface{}
+					if transport == "http" {
+						response := mcpPhase2GapToolCall(router, arguments, "Bearer phase2")
+						if response.Code != http.StatusOK {
+							t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+						}
+						envelope = oauthPhase4JSONBody(t, response)
+					} else {
+						call := fmt.Sprintf(`{"jsonrpc":"2.0","id":"checked","method":"tools/call","params":{"name":"sample","arguments":%s}}`, arguments)
+						input := mcpPhase12InitializeBody(mcpProtocol20251125) + "\n" + `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}` + "\n" + call + "\n"
+						var output bytes.Buffer
+						if err := serveMCPStdio(strings.NewReader(input), &output, loaded.Snapshot, loaded.Snapshot.MCPServers["local-mcp"]); err != nil {
+							t.Fatal(err)
+						}
+						lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+						if len(lines) != 2 {
+							t.Fatalf("stdio output=%s", output.String())
+						}
+						if err := json.Unmarshal([]byte(lines[1]), &envelope); err != nil {
+							t.Fatal(err)
+						}
+					}
+					order, _ := storage.Load(key)
+					if order == nil {
+						order = ""
+					}
+					if order != tc.order {
+						t.Fatalf("order=%q, want %q", order, tc.order)
+					}
+					result, ok := envelope["result"].(map[string]interface{})
+					if !ok {
+						t.Fatalf("not a Tool result: %v", envelope)
+					}
+					if result["isError"] != (tc.isError || tc.failure != "") {
+						t.Fatalf("isError=%v", result["isError"])
+					}
+					content, ok := result["content"].([]interface{})
+					if !ok || len(content) != 1 {
+						t.Fatalf("content=%v", result["content"])
+					}
+					text, _ := content[0].(map[string]interface{})["text"].(string)
+					if tc.failure != "" {
+						if text != tc.failure {
+							t.Fatalf("error=%q, want %q", text, tc.failure)
+						}
+						if _, exists := result["structuredContent"]; exists {
+							t.Fatal("failed execution returned structured content")
+						}
+						return
+					}
+					var want, gotText interface{}
+					if err := json.Unmarshal([]byte(tc.result), &want); err != nil {
+						t.Fatal(err)
+					}
+					if err := json.Unmarshal([]byte(text), &gotText); err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(want, result["structuredContent"]) || !reflect.DeepEqual(want, gotText) {
+						t.Fatalf("unexpected result=%v", result)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestMCPOutCheckUsesReturnedJSONMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name, script string
+		status       int
+	}{
+		{name: "native object", script: `({status:201,value:"日本語"});`, status: 201},
+		{name: "JSON text", script: `' { "status": 409, "value": "日本語" } ';`, status: 409},
+		{name: "array", script: `[1,"日本語"];`, status: 200},
+		{name: "number", script: `42;`, status: 200},
+		{name: "JSON null", script: `"null";`, status: 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, key := t.TempDir(), "MCP output: "+t.Name()
+			t.Cleanup(func() { storage.Delete(key) })
+			mainPath, outPath := filepath.Join(dir, "main.js"), filepath.Join(dir, "out.js")
+			writeHotReloadTestFile(t, mainPath, tc.script)
+			writeHotReloadTestFile(t, outPath, fmt.Sprintf(`nyanSetItem(%q,JSON.stringify(nyanAllParams.nyan_output)); ({success:true,status:200,result:null});`, key))
+			snapshot := newAPIConfigSnapshot(filepath.Join(dir, "api.json"), map[string]interface{}{"target": map[string]interface{}{"script": mainPath, "outCheck": outPath}}, nil, nil, nil, nil)
+			result, failure := executeMCPTool(snapshot, &MCPToolConfig{Name: "tool", API: "target", InputSchema: map[string]interface{}{"type": "object"}}, nil, nil)
+			if failure != "" {
+				t.Fatal(failure)
+			}
+			body := result["content"].([]map[string]interface{})[0]["text"].(string)
+			var observed struct {
+				Status          int               `json:"status"`
+				ContentType     string            `json:"contentType"`
+				Body            string            `json:"body"`
+				BodyBase64      string            `json:"bodyBase64"`
+				BodyLength      int               `json:"bodyLength"`
+				BodyLengthBytes int               `json:"bodyLengthBytes"`
+				Headers         map[string]string `json:"headers"`
+			}
+			raw, ok := storage.Load(key)
+			if !ok {
+				t.Fatal("outCheck did not run")
+			}
+			if err := json.Unmarshal([]byte(raw.(string)), &observed); err != nil {
+				t.Fatal(err)
+			}
+			if observed.Status != tc.status || observed.ContentType != "application/json" || observed.Body != body ||
+				observed.BodyBase64 != base64.StdEncoding.EncodeToString([]byte(body)) || observed.BodyLength != len(body) ||
+				observed.BodyLengthBytes != len(body) || observed.Headers == nil || len(observed.Headers) != 0 {
+				t.Fatalf("output metadata=%s, result body=%q", raw, body)
+			}
+		})
+	}
+}
+
 func TestMCPStdioProtocolAndToolExecution(t *testing.T) {
 	initTestLogger()
 	loaded, server := newMCPStdioTestConfig(t)
@@ -4633,6 +5005,52 @@ func TestOAuthPhase3ConcurrentConsumeSucceedsOnce(t *testing.T) {
 	}
 	if successes != 1 {
 		t.Fatalf("successful consumers = %d, want 1", successes)
+	}
+}
+
+func TestOAuthRandomBase64URLDefaultAndSizes(t *testing.T) {
+	for _, tc := range []struct {
+		argument string
+		bytes    int
+	}{
+		{argument: "", bytes: 32},
+		{argument: "1", bytes: 1},
+		{argument: "8", bytes: 8},
+		{argument: "16", bytes: 16},
+		{argument: "32", bytes: 32},
+		{argument: "128", bytes: 128},
+		{argument: "256", bytes: 256},
+		{argument: "1024", bytes: 1024},
+	} {
+		t.Run("argument="+tc.argument, func(t *testing.T) {
+			vm := goja.New()
+			setupOAuthGojaVM(vm, nil, &MCPServerConfig{})
+			value, err := vm.RunString("nyanRandomBase64URL(" + tc.argument + ");")
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, ok := value.Export().(string)
+			if !ok {
+				t.Fatalf("result is not a string: %#v", value.Export())
+			}
+			decoded, err := base64.RawURLEncoding.Strict().DecodeString(encoded)
+			if err != nil || len(decoded) != tc.bytes {
+				t.Fatalf("decoded length=%d error=%v, want %d bytes", len(decoded), err, tc.bytes)
+			}
+			if len(encoded) != base64.RawURLEncoding.EncodedLen(tc.bytes) || strings.ContainsAny(encoded, "=+/\r\n") {
+				t.Fatalf("unexpected Base64URL format: %q", encoded)
+			}
+		})
+	}
+	for _, argument := range []string{"0", "-1", "1025", "undefined", "null"} {
+		t.Run("invalid="+argument, func(t *testing.T) {
+			vm := goja.New()
+			setupOAuthGojaVM(vm, nil, &MCPServerConfig{})
+			_, err := vm.RunString("nyanRandomBase64URL(" + argument + ");")
+			if err == nil || !strings.Contains(err.Error(), "outside the allowed range") {
+				t.Fatalf("error=%v, want range exception", err)
+			}
+		})
 	}
 }
 
@@ -5735,10 +6153,25 @@ func TestMCPPhase2GapToolAndResponseSizeLimits(t *testing.T) {
 }
 
 func TestMCPPhase2GapRequestUsesCapturedSnapshot(t *testing.T) {
+	key := "MCP captured checks: " + t.Name()
+	t.Cleanup(func() { storage.Delete(key) })
+	configureChecks := func(dir string, definitions map[string]interface{}, generation string) {
+		writeHotReloadTestFile(t, filepath.Join(dir, "generation.txt"), generation)
+		for _, stage := range []string{"param", "out"} {
+			path := filepath.Join(dir, stage+"-generation.js")
+			writeHotReloadTestFile(t, path, fmt.Sprintf(`nyanSetItem(%q,nyanGetItem(%q)+%q+nyanGetFile("generation.txt")+",");
+			if(nyanCallMe({api:"identity"}).generation!==nyanGetFile("generation.txt")) throw new Error("mixed snapshot");
+			({success:true,status:200,result:null});`, key, key, stage+":"))
+			definitions["sample"].(map[string]interface{})[stage+"Check"] = path
+		}
+		identityPath := filepath.Join(dir, "identity.js")
+		writeHotReloadTestFile(t, identityPath, fmt.Sprintf(`JSON.stringify({generation:%q});`, generation))
+		definitions["identity"] = map[string]interface{}{"script": identityPath}
+	}
 	oldDir, oldDefinitions := newMCPPhase12Definitions(t)
 	writeHotReloadTestFile(t, filepath.Join(oldDir, "oauth-hook.js"), mcpPhase2GapAuthenticatedHook())
 	writeHotReloadTestFile(t, filepath.Join(oldDir, "sample.js"), `({generation:"old"});`)
-	delete(oldDefinitions["sample"].(map[string]interface{}), "outCheck")
+	configureChecks(oldDir, oldDefinitions, "old")
 	oldLoaded, err := loadMCPPhase12Config(oldDir, oldDefinitions)
 	if err != nil {
 		t.Fatal(err)
@@ -5747,7 +6180,7 @@ func TestMCPPhase2GapRequestUsesCapturedSnapshot(t *testing.T) {
 	newDir, newDefinitions := newMCPPhase12Definitions(t)
 	writeHotReloadTestFile(t, filepath.Join(newDir, "oauth-hook.js"), mcpPhase2GapAuthenticatedHook())
 	writeHotReloadTestFile(t, filepath.Join(newDir, "sample.js"), `({generation:"new"});`)
-	delete(newDefinitions["sample"].(map[string]interface{}), "outCheck")
+	configureChecks(newDir, newDefinitions, "new")
 	newLoaded, err := loadMCPPhase12Config(newDir, newDefinitions)
 	if err != nil {
 		t.Fatal(err)
@@ -5768,6 +6201,9 @@ func TestMCPPhase2GapRequestUsesCapturedSnapshot(t *testing.T) {
 	structured, _ := result["structuredContent"].(map[string]interface{})
 	if structured["generation"] != "old" {
 		t.Fatalf("structuredContent=%#v, want captured old snapshot while current snapshot is new", structured)
+	}
+	if order, _ := storage.Load(key); order != "param:old,out:old," {
+		t.Fatalf("check snapshot order=%v", order)
 	}
 }
 
@@ -6510,7 +6946,7 @@ func TestPhase5IncomingWebSocketResponseAndPush(t *testing.T) {
 	}
 	waitForHotReloadCondition(t, "sink WebSocket registration", func() bool {
 		connection, exists := pushConnections.Load("sink")
-		_, isServerWebSocket := connection.(*websocket.Conn)
+		_, isServerWebSocket := connection.(*serverWebSocket)
 		return exists && isServerWebSocket
 	})
 	sourceConnection, _, err = dialer.Dial(websocketURL+"/source", nil)
@@ -6519,7 +6955,7 @@ func TestPhase5IncomingWebSocketResponseAndPush(t *testing.T) {
 	}
 	waitForHotReloadCondition(t, "source WebSocket registration", func() bool {
 		connection, exists := pushConnections.Load("source")
-		_, isServerWebSocket := connection.(*websocket.Conn)
+		_, isServerWebSocket := connection.(*serverWebSocket)
 		return exists && isServerWebSocket
 	})
 
@@ -7398,5 +7834,1530 @@ func checkHTTPProcessLogging(t *testing.T, level string) {
 	}
 	if strings.Contains(stderr.String(), "private-console") != (level == "debug") {
 		t.Fatalf("console level mismatch: %s", stderr.String())
+	}
+}
+
+type filePathFixture struct {
+	rootDir, childDir, scriptDir, cwd string
+	snapshot                          *APIConfigSnapshot
+}
+
+func newFilePathFixture(t *testing.T) filePathFixture {
+	t.Helper()
+	previousConfig, previousPaths, previousSnapshot := globalConfig, servicePaths, currentAPISnapshot()
+	globalConfig = Config{}
+	servicePaths = serviceFilePaths{}
+	t.Cleanup(func() {
+		globalConfig, servicePaths = previousConfig, previousPaths
+		publishAPISnapshot(previousSnapshot)
+	})
+	base := t.TempDir()
+	f := filePathFixture{
+		rootDir: filepath.Join(base, "config"), childDir: filepath.Join(base, "included"),
+		scriptDir: filepath.Join(base, "scripts"), cwd: filepath.Join(base, "cwd"),
+	}
+	for dir, data := range map[string]string{f.rootDir: "root-data", f.childDir: "child-data", f.scriptDir: "script-data", f.cwd: "cwd-data"} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeHotReloadTestFile(t, filepath.Join(dir, "data.txt"), data)
+	}
+	t.Chdir(f.cwd)
+	commonPath := filepath.Join(f.scriptDir, "read.js")
+	writeHotReloadTestFile(t, commonPath, `JSON.stringify({
+		text: nyanGetFile(nyanAllParams.path || "data.txt"),
+		base64: nyanReadFileB64(nyanAllParams.path || "data.txt"),
+		attachment: nyanSendMailAttachment(nyanAllParams.path || "data.txt")
+	})`)
+	rootPath := filepath.Join(f.rootDir, "api.json")
+	childPath := filepath.Join(f.childDir, "api.json")
+	writeHotReloadTestFile(t, rootPath, fmt.Sprintf(`{"root":{"script":%q},"child":{"type":"include","path":%q}}`, commonPath, childPath))
+	grandchildDir := filepath.Join(f.childDir, "nested")
+	if err := os.MkdirAll(grandchildDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeHotReloadTestFile(t, filepath.Join(grandchildDir, "data.txt"), "grandchild-data")
+	writeHotReloadTestFile(t, childPath, fmt.Sprintf(`{"read":{"script":%q},"nested":{"type":"include","path":"nested/api.json"}}`, commonPath))
+	writeHotReloadTestFile(t, filepath.Join(grandchildDir, "api.json"), fmt.Sprintf(`{"read":{"script":%q}}`, commonPath))
+	loaded, err := readAPIConfigFile(rootPath, f.rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.snapshot = loaded.Snapshot
+	return f
+}
+
+func assertFilePathResult(t *testing.T, result, want string) {
+	t.Helper()
+	var got struct {
+		Text       string `json:"text"`
+		Base64     string `json:"base64"`
+		Attachment struct {
+			Filename    string `json:"filename"`
+			DataBase64  string `json:"dataBase64"`
+			ContentType string `json:"contentType"`
+		} `json:"attachment"`
+	}
+	if err := json.Unmarshal([]byte(result), &got); err != nil {
+		t.Fatalf("decode file helper result %q: %v", result, err)
+	}
+	wantBase64 := base64.StdEncoding.EncodeToString([]byte(want))
+	if got.Text != want || got.Base64 != wantBase64 || got.Attachment.DataBase64 != wantBase64 || got.Attachment.Filename != "data.txt" || !strings.HasPrefix(got.Attachment.ContentType, "text/plain") {
+		t.Fatalf("file helper result = %s, want all helpers to read %q", result, want)
+	}
+}
+
+func TestRuntimeFilePathsUseRootAPIConfigDirectory(t *testing.T) {
+	f := newFilePathFixture(t)
+	for _, tc := range []struct {
+		name, api, path, want string
+	}{
+		{name: "root", api: "root", path: "./data.txt", want: "root-data"},
+		{name: "included", api: "child/read", path: "data.txt", want: "root-data"},
+		{name: "nested include", api: "child/nested/read", path: "data.txt", want: "root-data"},
+		{name: "absolute", api: "root", path: filepath.Join(f.childDir, "data.txt"), want: "child-data"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := runJavaScriptWithSnapshot(f.snapshot, filepath.Join(f.scriptDir, "read.js"), map[string]interface{}{"api": tc.api, "path": tc.path}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertFilePathResult(t, result, tc.want)
+			cwd, err := os.Getwd()
+			if err != nil || cwd != f.cwd {
+				t.Fatalf("runtime changed process directory: got %q, want %q; err=%v", cwd, f.cwd, err)
+			}
+		})
+	}
+}
+
+func TestRuntimeFilePathsFallbacks(t *testing.T) {
+	f := newFilePathFixture(t)
+	previousArgs := os.Args
+	os.Args = append([]string{filepath.Join(t.TempDir(), "Nyan8")}, os.Args[1:]...)
+	t.Cleanup(func() { os.Args = previousArgs })
+	withoutSources := newAPIConfigSnapshot(f.snapshot.RootPath, f.snapshot.Definitions, nil, nil, nil, nil)
+	for _, tc := range []struct {
+		name     string
+		snapshot *APIConfigSnapshot
+		apiPath  string
+		want     string
+	}{
+		{name: "snapshot root without source metadata", snapshot: withoutSources, apiPath: filepath.Join(f.childDir, "api.json"), want: "root-data"},
+		{name: "configured API path without snapshot", apiPath: f.snapshot.RootPath, want: "root-data"},
+		{name: "default config directory for temporary executable", want: "cwd-data"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			servicePaths.API.Path = tc.apiPath
+			result, err := runJavaScriptWithSnapshot(tc.snapshot, filepath.Join(f.scriptDir, "read.js"), map[string]interface{}{"api": "root"}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertFilePathResult(t, result, tc.want)
+		})
+	}
+}
+
+func TestRuntimeFilePathsKeepCapturedRootDespiteReloadAndAPIChange(t *testing.T) {
+	f := newFilePathFixture(t)
+	newSnapshot := newAPIConfigSnapshot(filepath.Join(f.childDir, "api.json"), f.snapshot.Definitions, map[string]string{"root": filepath.Join(f.childDir, "api.json")}, nil, nil, nil)
+	publishAPISnapshot(newSnapshot)
+	servicePaths.API.Path = newSnapshot.RootPath
+	script := filepath.Join(f.scriptDir, "mutate.js")
+	writeHotReloadTestFile(t, script, `nyanAllParams.api = "child/read";
+		JSON.stringify({text:nyanGetFile("data.txt"),base64:nyanReadFileB64("data.txt"),attachment:nyanSendMailAttachment("data.txt")})`)
+	result, err := runJavaScriptWithSnapshot(f.snapshot, script, map[string]interface{}{"api": "root"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFilePathResult(t, result, "root-data")
+}
+
+func TestRuntimeFilePathsPreserveMissingFileAndDirectoryBehavior(t *testing.T) {
+	f := newFilePathFixture(t)
+	script := filepath.Join(f.scriptDir, "missing.js")
+	writeHotReloadTestFile(t, script, `function throws(fn) { try { fn(); return false; } catch (_) { return true; } }
+		JSON.stringify([
+			nyanGetFile("missing.txt") === null, nyanGetFile(".") === null,
+			throws(function(){nyanReadFileB64("missing.txt")}), throws(function(){nyanReadFileB64(".")}),
+			throws(function(){nyanSendMailAttachment("missing.txt")}), throws(function(){nyanSendMailAttachment(".")})
+		])`)
+	result, err := runJavaScriptWithSnapshot(f.snapshot, script, map[string]interface{}{"api": "child/read"}, nil)
+	if err != nil || result != "[true,true,true,true,true,true]" {
+		t.Fatalf("missing/directory result = %q, err = %v", result, err)
+	}
+}
+
+func TestRuntimeFilePathsNyanCallMeAndChecksUseRootConfig(t *testing.T) {
+	f := newFilePathFixture(t)
+	parentScript := filepath.Join(f.scriptDir, "parent.js")
+	paramScript := filepath.Join(f.scriptDir, "param.js")
+	outScript := filepath.Join(f.scriptDir, "out.js")
+	writeHotReloadTestFile(t, paramScript, `({success:true,status:200,result:nyanGetFile("data.txt")})`)
+	writeHotReloadTestFile(t, outScript, `({success:!nyanAllParams.rejectOutput,status:nyanAllParams.rejectOutput?409:200,
+		result:{file:nyanSendMailAttachment("data.txt").dataBase64,body:JSON.parse(nyanAllParams.nyan_output_body).text}})`)
+	writeHotReloadTestFile(t, parentScript, `JSON.stringify({
+		before:nyanGetFile("data.txt"),
+		normal:nyanCallMe({api:"child/read"}),
+		param:nyanCallMe({api:"child/read",nyan_mode:"checkOnly"}),
+		out:nyanCallMe({api:"child/read",rejectOutput:true}),
+		after:nyanGetFile("data.txt")
+	})`)
+	definitions := map[string]interface{}{
+		"root":       map[string]interface{}{"script": parentScript},
+		"child/read": map[string]interface{}{"script": filepath.Join(f.scriptDir, "read.js"), "paramCheck": paramScript, "outCheck": outScript},
+	}
+	snapshot := newAPIConfigSnapshot(f.snapshot.RootPath, definitions, f.snapshot.Sources, nil, nil, nil)
+	result, err := runJavaScriptWithSnapshot(snapshot, parentScript, map[string]interface{}{"api": "root"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Before string          `json:"before"`
+		After  string          `json:"after"`
+		Normal json.RawMessage `json:"normal"`
+		Param  struct {
+			Result string `json:"result"`
+		} `json:"param"`
+		Out struct {
+			Status int `json:"status"`
+			Result struct {
+				File string `json:"file"`
+				Body string `json:"body"`
+			} `json:"result"`
+		} `json:"out"`
+	}
+	if err := json.Unmarshal([]byte(result), &got); err != nil {
+		t.Fatal(err)
+	}
+	assertFilePathResult(t, string(got.Normal), "root-data")
+	if got.Before != "root-data" || got.After != "root-data" || got.Param.Result != "root-data" || got.Out.Status != 409 || got.Out.Result.File != base64.StdEncoding.EncodeToString([]byte("root-data")) || got.Out.Result.Body != "root-data" {
+		t.Fatalf("nested/check helper paths = %s", result)
+	}
+}
+
+func TestRuntimeFilePathsSendMailAttachmentPath(t *testing.T) {
+	f := newFilePathFixture(t)
+	host, port, smtpResult := newPhase5SMTPServer(t)
+	globalConfig.SMTP = SMTPConfig{Host: host, Port: port, Username: "local-test", Password: "local-test", FromEmail: "sender@example.test"}
+	script := filepath.Join(f.scriptDir, "mail.js")
+	writeHotReloadTestFile(t, script, fmt.Sprintf(`nyanSendMail({to:"recipient@example.test",subject:"paths",body:"paths",attachments:[{path:"data.txt"},{path:%q}]})`, filepath.Join(f.childDir, "data.txt")))
+	result, err := runJavaScriptWithSnapshot(f.snapshot, script, map[string]interface{}{"api": "child/read"}, nil)
+	if err != nil || result != "true" {
+		t.Fatalf("local mock mail = %q, err=%v", result, err)
+	}
+	var captured phase5SMTPResult
+	select {
+	case captured = <-smtpResult:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for local SMTP mock")
+	}
+	if captured.err != nil {
+		t.Fatal(captured.err)
+	}
+	message, err := mail.ReadMessage(bytes.NewReader(captured.message))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, params, err := mime.ParseMediaType(message.Header.Get("Content-Type"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := multipart.NewReader(message.Body, params["boundary"])
+	var attachments []string
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		disposition, _, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
+		if disposition != "attachment" {
+			continue
+		}
+		var body io.Reader = part
+		if strings.EqualFold(part.Header.Get("Content-Transfer-Encoding"), "base64") {
+			body = base64.NewDecoder(base64.StdEncoding, part)
+		}
+		data, err := io.ReadAll(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attachments = append(attachments, string(data))
+	}
+	if strings.Join(attachments, ",") != "root-data,child-data" {
+		t.Fatalf("relative/absolute attachments = %#v", attachments)
+	}
+}
+
+func TestRuntimeFilePathsPushUsesRootConfigAndPreservesSourceAPI(t *testing.T) {
+	f := newFilePathFixture(t)
+	script := filepath.Join(f.scriptDir, "push.js")
+	writeHotReloadTestFile(t, script, `JSON.stringify({api:nyanAllParams.api,text:nyanGetFile("data.txt")})`)
+	check := filepath.Join(f.scriptDir, "push-check.js")
+	writeHotReloadTestFile(t, check, `
+if(nyanAllParams.api!=="root" || nyanGetFile("data.txt")!=="root-data") throw new Error("wrong Push check context");
+({success:true,status:200,result:null});`)
+	definitions := map[string]interface{}{"root": map[string]interface{}{"push": "child/read"}, "child/read": map[string]interface{}{"script": script, "paramCheck": check, "outCheck": check}}
+	snapshot := newAPIConfigSnapshot(f.snapshot.RootPath, definitions, f.snapshot.Sources, nil, nil, nil)
+	publishAPISnapshot(snapshot)
+	connections := make(chan *websocket.Conn, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connection, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		connections <- connection
+	}))
+	t.Cleanup(server.Close)
+	client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	var connection *websocket.Conn
+	select {
+	case connection = <-connections:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for local WebSocket")
+	}
+	previousConnection, hadConnection := pushConnections.Load("child/read")
+	pushConnections.Store("child/read", &serverWebSocket{Conn: connection})
+	t.Cleanup(func() {
+		_ = connection.Close()
+		if hadConnection {
+			pushConnections.Store("child/read", previousConnection)
+		} else {
+			pushConnections.Delete("child/read")
+		}
+	})
+	params := map[string]interface{}{"api": "root"}
+	performPush(definitions["root"].(map[string]interface{}), snapshot.Definitions, params, f.rootDir)
+	if err := client.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, response, err := client.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		API  string `json:"api"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(response, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.API != "root" || got.Text != "root-data" || params["api"] != "root" {
+		t.Fatalf("push response=%s source params=%#v", response, params)
+	}
+}
+
+func TestNyanSetCookieSecureFollowsReceivedTLS(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name, target, forwardedProto string
+		wantSecure                   bool
+	}{
+		{name: "HTTP", target: "http://example.test/", wantSecure: false},
+		{name: "HTTPS", target: "https://example.test/", wantSecure: true},
+		{name: "HTTP with forwarded HTTPS", target: "http://example.test/", forwardedProto: "https", wantSecure: false},
+		{name: "HTTPS with forwarded HTTP", target: "https://example.test/", forwardedProto: "http", wantSecure: true},
+		{name: "no request", wantSecure: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			if tc.target != "" {
+				ctx.Request = httptest.NewRequest(http.MethodGet, tc.target, nil)
+				if tc.forwardedProto != "" {
+					ctx.Request.Header.Set("X-Forwarded-Proto", tc.forwardedProto)
+					ctx.Request.Header.Set("Forwarded", "proto="+tc.forwardedProto)
+				}
+			}
+			vm := goja.New()
+			setupGojaVMWithSnapshot(vm, nil, ctx)
+			if _, err := vm.RunString(`nyanSetCookie("session", "abc123");`); err != nil {
+				t.Fatal(err)
+			}
+			response := recorder.Result()
+			defer response.Body.Close()
+			cookies := response.Cookies()
+			if len(cookies) != 1 {
+				t.Fatalf("cookies=%v, want one cookie", cookies)
+			}
+			cookie := cookies[0]
+			if cookie.Secure != tc.wantSecure || !cookie.HttpOnly || cookie.MaxAge != 3600 ||
+				cookie.Path != "/" || cookie.Domain != "" || cookie.Name != "session" || cookie.Value != "abc123" {
+				t.Fatalf("unexpected cookie: %s", cookie.String())
+			}
+		})
+	}
+	t.Run("no HTTP context", func(t *testing.T) {
+		vm := goja.New()
+		setupGojaVMWithSnapshot(vm, nil, nil)
+		if _, err := vm.RunString(`nyanSetCookie("session", "abc123");`); err != nil {
+			t.Fatalf("cookie setter without HTTP context: %v", err)
+		}
+	})
+}
+
+func TestNyanHostExecReturnsCommandResults(t *testing.T) {
+	for _, exitCode := range []int{0, 1, 7} {
+		t.Run(fmt.Sprintf("exit %d", exitCode), func(t *testing.T) {
+			command := fmt.Sprintf("echo processing; echo problem >&2; exit %d", exitCode)
+			if runtime.GOOS == "windows" {
+				command = fmt.Sprintf("echo processing& echo problem 1>&2& exit /b %d", exitCode)
+			}
+			vm := goja.New()
+			setupGojaVMWithSnapshot(vm, nil, nil)
+			if err := vm.Set("command", command); err != nil {
+				t.Fatal(err)
+			}
+			value, err := vm.RunString(`nyanHostExec(command);`)
+			if err != nil {
+				t.Fatalf("command exit %d threw an exception: %v", exitCode, err)
+			}
+			if _, ok := value.Export().(map[string]interface{}); !ok {
+				t.Fatalf("result is not an object: %#v", value.Export())
+			}
+			encoded, err := json.Marshal(value.Export())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result ExecResult
+			if err := json.Unmarshal(encoded, &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Success != (exitCode == 0) || result.ExitCode != exitCode ||
+				strings.TrimSpace(result.Stdout) != "processing" || strings.TrimSpace(result.Stderr) != "problem" {
+				t.Fatalf("unexpected result: %s", encoded)
+			}
+		})
+	}
+	t.Run("command not found", func(t *testing.T) {
+		vm := goja.New()
+		setupGojaVMWithSnapshot(vm, nil, nil)
+		value, err := vm.RunString(`const result = nyanHostExec("nyan8_missing_command_643acf5e");
+			result.success === false && result.exit_code !== 0 && result.stderr.length > 0;`)
+		if err != nil || !value.ToBoolean() {
+			t.Fatalf("missing command result=%v error=%v", value, err)
+		}
+	})
+}
+
+func TestNyanHostExecInvocationErrorsRemainExceptions(t *testing.T) {
+	t.Run("missing argument", func(t *testing.T) {
+		vm := goja.New()
+		setupGojaVMWithSnapshot(vm, nil, nil)
+		if _, err := vm.RunString(`nyanHostExec();`); err == nil || !strings.Contains(err.Error(), "command required") {
+			t.Fatalf("missing argument error=%v", err)
+		}
+	})
+	t.Run("shell unavailable", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Windows can locate cmd through system directories independently of PATH")
+		}
+		t.Setenv("PATH", t.TempDir())
+		vm := goja.New()
+		setupGojaVMWithSnapshot(vm, nil, nil)
+		if _, err := vm.RunString(`nyanHostExec("echo test");`); err == nil || !strings.Contains(err.Error(), "failed to exec") {
+			t.Fatalf("missing shell error=%v", err)
+		}
+	})
+}
+
+func TestNyanCallMeRequiresExplicitAPI(t *testing.T) {
+	initTestLogger()
+	gin.SetMode(gin.TestMode)
+	f := newFilePathFixture(t)
+	key := "nyanCallMe required API: " + t.Name()
+	t.Cleanup(func() { storage.Delete(key) })
+	caller := filepath.Join(f.rootDir, "caller.js")
+	target := filepath.Join(f.rootDir, "target.js")
+	check := filepath.Join(f.rootDir, "check.js")
+	writeHotReloadTestFile(t, check, fmt.Sprintf(`nyanSetItem(%q,"executed"); ({success:true,status:200,result:null});`, key))
+	writeHotReloadTestFile(t, target, `JSON.stringify({status:200,called:nyanAllParams.api});`)
+	rootPath := filepath.Join(f.rootDir, "api.json")
+	writeHotReloadTestFile(t, rootPath, `{
+		"caller":{"script":"caller.js"},
+		"hello2":{"script":"target.js","paramCheck":"check.js"}
+	}`)
+	loaded, err := readAPIConfigFile(rootPath, f.rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishAPISnapshot(loaded.Snapshot)
+	servicePaths.API.Path = rootPath
+	router := gin.New()
+	router.GET("/caller", func(c *gin.Context) { executeAPIEndpoint(c, "caller", f.rootDir) })
+	for _, tc := range []struct{ name, args string }{
+		{"no arguments", ""},
+		{"undefined", "undefined"},
+		{"null", "null"},
+		{"empty object", "{}"},
+		{"parameters without API", `{id:123}`},
+		{"checkOnly without API", `{nyan_mode:"checkOnly"}`},
+		{"empty API", `{api:""}`},
+		{"blank API", `{api:" \t\n"}`},
+		{"undefined API", `{api:undefined}`},
+		{"null API", `{api:null}`},
+		{"numeric API", `{api:123}`},
+		{"boolean API", `{api:true}`},
+		{"object API", `{api:{}}`},
+		{"array API", `{api:["hello2"]}`},
+		{"string argument", `"hello2"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := "nyanCallMe(" + tc.args + ");"
+			vm := goja.New()
+			setupGojaVMWithSnapshot(vm, loaded.Snapshot, nil)
+			if _, err := vm.RunString(script); err == nil || !strings.Contains(err.Error(), "nyanCallMe: api is required") {
+				t.Fatalf("error = %v, want missing API exception", err)
+			}
+			writeHotReloadTestFile(t, caller, script)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/caller", nil))
+			if recorder.Code != http.StatusInternalServerError {
+				t.Fatalf("status=%d body=%s, want 500", recorder.Code, recorder.Body.String())
+			}
+			if _, executed := storage.Load(key); executed {
+				t.Fatal("missing API executed the hello2 check")
+			}
+		})
+	}
+	// The exception can be caught without writing an HTTP response from the helper.
+	writeHotReloadTestFile(t, caller, `try { nyanCallMe(); } catch (err) { JSON.stringify({status:200,error:String(err)}); }`)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/caller", nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "nyanCallMe: api is required") {
+		t.Fatalf("caught exception: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	// hello2 remains callable when explicitly named.
+	writeHotReloadTestFile(t, caller, `JSON.stringify(nyanCallMe({api:"hello2"}));`)
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/caller", nil))
+	if recorder.Code != http.StatusOK || !containsJSONValue(recorder.Body.Bytes(), "called", "hello2") {
+		t.Fatalf("explicit API: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if _, executed := storage.Load(key); !executed {
+		t.Fatal("explicit API did not execute its check")
+	}
+}
+
+func TestNyanCallMeRunsChecksInOrder(t *testing.T) {
+	initTestLogger()
+	gin.SetMode(gin.TestMode)
+	const allow = `({success:true,status:200,result:{checked:true}});`
+	const denyParam = `({success:false,status:403,result:{message:"input blocked"}});`
+	const denyOut = `({success:false,status:409,result:{message:"output blocked"}});`
+	tests := []struct {
+		name       string
+		param      string
+		out        string
+		main       string
+		paramKey   string
+		outKey     string
+		checkOnly  bool
+		wantOrder  string
+		wantResult string
+		wantError  string
+	}{
+		{name: "allow", param: allow, out: allow, wantOrder: "param,main,out,", wantResult: `{"status":201,"value":"private result"}`},
+		{name: "param rejection", param: denyParam, out: allow, wantOrder: "param,", wantResult: `{"success":false,"status":403,"result":{"message":"input blocked"}}`},
+		{name: "param non-200", param: `({success:true,status:202,result:"pending"});`, out: allow, wantOrder: "param,", wantResult: `{"success":true,"status":202,"result":"pending"}`},
+		{name: "output rejection", param: allow, out: denyOut, wantOrder: "param,main,out,", wantResult: `{"success":false,"status":409,"result":{"message":"output blocked"}}`},
+		{name: "failed main response is checked", param: allow, out: denyOut, main: `JSON.stringify({success:false,status:403,value:"private result"});`, wantOrder: "param,main,out,", wantResult: `{"success":false,"status":409,"result":{"message":"output blocked"}}`},
+		{name: "checkOnly", param: allow, out: allow, checkOnly: true, wantOrder: "param,", wantResult: `{"success":true,"status":200,"result":{"checked":true}}`},
+		{name: "checkOnly without param checker", out: allow, checkOnly: true, wantOrder: "", wantResult: `{"success":true,"status":200,"result":null}`},
+		{name: "lowercase aliases", param: allow, out: allow, paramKey: "paramcheck", outKey: "outcheck", wantOrder: "param,main,out,", wantResult: `{"status":201,"value":"private result"}`},
+		{name: "legacy check alias", param: denyParam, out: allow, paramKey: "check", wantOrder: "param,", wantResult: `{"success":false,"status":403,"result":{"message":"input blocked"}}`},
+		{name: "param exception", param: `throw new Error("param exploded");`, out: allow, wantOrder: "param,", wantError: "param exploded"},
+		{name: "invalid param response", param: `({success:true});`, out: allow, wantOrder: "param,", wantError: "paramCheck response status must be a number"},
+		{name: "output exception", param: allow, out: `throw new Error("out exploded");`, wantOrder: "param,main,out,", wantError: "out exploded"},
+		{name: "invalid output response", param: allow, out: `"not JSON";`, wantOrder: "param,main,out,", wantError: "outCheck string response must be JSON"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rootDir := t.TempDir()
+			key := "nyanCallMe checks: " + t.Name()
+			t.Cleanup(func() { storage.Delete(key) })
+			writeScript := func(name, body string) string {
+				path := filepath.Join(rootDir, name+".js")
+				writeHotReloadTestFile(t, path, fmt.Sprintf(`nyanSetItem(%q,nyanGetItem(%q)+%q);`, key, key, name+",")+body)
+				return path
+			}
+			mainScript := tt.main
+			if mainScript == "" {
+				mainScript = `JSON.stringify({status:201,value:"private result"});`
+			}
+			entry := map[string]interface{}{"script": writeScript("main", mainScript)}
+			if tt.param != "" {
+				paramKey := tt.paramKey
+				if paramKey == "" {
+					paramKey = "paramCheck"
+				}
+				entry[paramKey] = writeScript("param", tt.param)
+			}
+			if tt.out != "" {
+				outKey := tt.outKey
+				if outKey == "" {
+					outKey = "outCheck"
+				}
+				entry[outKey] = writeScript("out", tt.out)
+			}
+			snapshot := newAPIConfigSnapshot(filepath.Join(rootDir, "api.json"), map[string]interface{}{"target": entry}, nil, nil, nil, nil)
+			recorder := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(recorder)
+			ginCtx.Request = httptest.NewRequest(http.MethodGet, "/parent", nil)
+			vm := goja.New()
+			setupGojaVMWithSnapshot(vm, snapshot, ginCtx)
+			params := `{api:"target"}`
+			if tt.checkOnly {
+				params = `{api:"target",nyan_mode:"checkOnly"}`
+			}
+			value, err := vm.RunString("nyanCallMe(" + params + ");")
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("error = %v, want %q", err, tt.wantError)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := json.Marshal(value.Export())
+				if err != nil {
+					t.Fatal(err)
+				}
+				var gotResult, wantResult interface{}
+				if err := json.Unmarshal(got, &gotResult); err != nil {
+					t.Fatal(err)
+				}
+				if err := json.Unmarshal([]byte(tt.wantResult), &wantResult); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(gotResult, wantResult) {
+					t.Fatalf("result = %s, want %s", got, tt.wantResult)
+				}
+			}
+			order, _ := storage.Load(key)
+			if order == nil {
+				order = ""
+			}
+			if order != tt.wantOrder {
+				t.Errorf("execution order = %q, want %q", order, tt.wantOrder)
+			}
+			if ginCtx.Writer.Written() || recorder.Body.Len() != 0 || len(recorder.Header()) != 0 {
+				t.Errorf("internal call wrote parent response: headers=%v body=%q", recorder.Header(), recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestNyanCallMeOutCheckPreservesResultFormats(t *testing.T) {
+	initTestLogger()
+	for _, tt := range []struct {
+		name        string
+		body        string
+		status      int
+		contentType string
+	}{
+		{"JSON object with status", `{"status":201,"value":"created"}`, 201, "application/json"},
+		{"JSON without status", `{"value":"unchanged"}`, 200, "application/json"},
+		{"failed JSON result", `{"success":false,"status":403,"value":"denied"}`, 403, "application/json"},
+		{"JSON array", `[1,"two",null]`, 200, "application/json"},
+		{"JSON null", `null`, 200, "application/json"},
+		{"JSON string", `"text"`, 200, "application/json"},
+		{"plain text", "raw 日本語", 200, "text/plain"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rootDir := t.TempDir()
+			mainPath := filepath.Join(rootDir, "main.js")
+			outPath := filepath.Join(rootDir, "out.js")
+			writeHotReloadTestFile(t, mainPath, strconv.Quote(tt.body)+";")
+			key := "nyanCallMe output: " + t.Name()
+			t.Cleanup(func() { storage.Delete(key) })
+			writeHotReloadTestFile(t, outPath, fmt.Sprintf(`
+nyanSetItem(%q, JSON.stringify({api:nyanAllParams.api, output:nyanAllParams.nyan_output,
+ status:nyanAllParams.nyan_output_status, contentType:nyanAllParams.nyan_output_content_type,
+ body:nyanAllParams.nyan_output_body, base64:nyanAllParams.nyan_output_body_base64}));
+({success:true,status:200,result:null});`, key))
+			snapshot := newAPIConfigSnapshot(filepath.Join(rootDir, "api.json"), map[string]interface{}{
+				"nested/target": map[string]interface{}{"script": mainPath, "outCheck": outPath},
+			}, nil, nil, nil, nil)
+			vm := goja.New()
+			setupGojaVMWithSnapshot(vm, snapshot, nil)
+			value, err := vm.RunString(`nyanCallMe({api:"nested/target"});`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var want interface{}
+			if err := json.Unmarshal([]byte(tt.body), &want); err != nil {
+				want = tt.body
+			}
+			if !reflect.DeepEqual(value.Export(), want) {
+				t.Errorf("result = %#v, want %#v", value.Export(), want)
+			}
+			raw, ok := storage.Load(key)
+			if !ok {
+				t.Fatal("outCheck did not execute")
+			}
+			var observed struct {
+				API         string `json:"api"`
+				Status      int    `json:"status"`
+				ContentType string `json:"contentType"`
+				Body        string `json:"body"`
+				Base64      string `json:"base64"`
+				Output      struct {
+					Status          int    `json:"status"`
+					ContentType     string `json:"contentType"`
+					Body            string `json:"body"`
+					Base64          string `json:"bodyBase64"`
+					BodyLength      int    `json:"bodyLength"`
+					BodyLengthBytes int    `json:"bodyLengthBytes"`
+				} `json:"output"`
+			}
+			if err := json.Unmarshal([]byte(raw.(string)), &observed); err != nil {
+				t.Fatal(err)
+			}
+			encoded := base64.StdEncoding.EncodeToString([]byte(tt.body))
+			if observed.API != "nested/target" || observed.Body != tt.body || observed.Output.Body != tt.body ||
+				observed.Status != tt.status || observed.Output.Status != tt.status ||
+				observed.ContentType != tt.contentType || observed.Output.ContentType != tt.contentType ||
+				observed.Base64 != encoded || observed.Output.Base64 != encoded ||
+				observed.Output.BodyLength != len(tt.body) || observed.Output.BodyLengthBytes != len(tt.body) {
+				t.Fatalf("outCheck observed unexpected output: %s", raw)
+			}
+		})
+	}
+}
+
+func TestNyanCallMeChecksKeepSnapshotAndRequestContext(t *testing.T) {
+	initTestLogger()
+	gin.SetMode(gin.TestMode)
+	rootDir := t.TempDir()
+	writeScript := func(name, body string) string {
+		path := filepath.Join(rootDir, name+".js")
+		writeHotReloadTestFile(t, path, body)
+		return path
+	}
+	oldIdentity := writeScript("old", `JSON.stringify({generation:"old"});`)
+	newIdentity := writeScript("new", `JSON.stringify({generation:"new"});`)
+	checker := writeScript("check", `
+if (nyanAllParams.api !== "target" || nyanCallMe({api:"identity"}).generation !== "old" || nyanGetCookie("session") !== "original-request") {
+ throw new Error("checker lost captured snapshot or request context");
+}
+({success:true,status:200,result:null});`)
+	mainScript := writeScript("main", `JSON.stringify({generation:nyanCallMe({api:"identity"}).generation,cookie:nyanGetCookie("session")});`)
+	captured := newAPIConfigSnapshot(filepath.Join(rootDir, "api.json"), map[string]interface{}{
+		"target":   map[string]interface{}{"script": mainScript, "paramCheck": checker, "outCheck": checker},
+		"identity": map[string]interface{}{"script": oldIdentity},
+	}, nil, nil, nil, nil)
+	original := currentAPISnapshot()
+	t.Cleanup(func() { publishAPISnapshot(original) })
+	publishAPISnapshot(newAPIConfigSnapshot(filepath.Join(rootDir, "api.json"), map[string]interface{}{
+		"identity": map[string]interface{}{"script": newIdentity},
+	}, nil, nil, nil, nil))
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/parent", nil)
+	ginCtx.Request.AddCookie(&http.Cookie{Name: "session", Value: "original-request"})
+	vm := goja.New()
+	setupGojaVMWithSnapshot(vm, captured, ginCtx)
+	value, err := vm.RunString(`nyanCallMe({api:"target"});`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]interface{}{"generation": "old", "cookie": "original-request"}
+	if !reflect.DeepEqual(value.Export(), want) {
+		t.Fatalf("nested result = %#v, want %#v", value.Export(), want)
+	}
+}
+
+func TestPushTargetChecksAcrossTransports(t *testing.T) {
+	const allow = `({success:true,status:200,result:null});`
+	cases := []struct {
+		name, param, out, wantOrder                                                   string
+		missingParam, missingOut, mainError, noChecks, aliases, legacyAlias, wantPush bool
+	}{
+		{name: "allow", param: allow, out: allow, wantOrder: "param,main,out,", wantPush: true},
+		{name: "no checks", noChecks: true, wantOrder: "main,", wantPush: true},
+		{name: "aliases", param: allow, out: allow, aliases: true, wantOrder: "param,main,out,", wantPush: true},
+		{name: "legacy alias", param: allow, out: allow, legacyAlias: true, wantOrder: "param,main,out,", wantPush: true},
+		{name: "param denial", param: `({success:false,status:403,result:"denied"});`, out: allow, wantOrder: "param,"},
+		{name: "param non-200", param: `({success:true,status:202,result:null});`, out: allow, wantOrder: "param,"},
+		{name: "param exception", param: `throw new Error("check failed");`, out: allow, wantOrder: "param,"},
+		{name: "invalid param result", param: `({success:true});`, out: allow, wantOrder: "param,"},
+		{name: "missing param", missingParam: true, out: allow},
+		{name: "out denial", param: allow, out: `({success:false,status:409,result:"denied"});`, wantOrder: "param,main,out,"},
+		{name: "out non-200", param: allow, out: `({success:true,status:202,result:null});`, wantOrder: "param,main,out,"},
+		{name: "out exception", param: allow, out: `throw new Error("check failed");`, wantOrder: "param,main,out,"},
+		{name: "invalid out result", param: allow, out: `"invalid";`, wantOrder: "param,main,out,"},
+		{name: "missing out", param: allow, missingOut: true, wantOrder: "param,main,"},
+		{name: "main exception", param: allow, out: allow, mainError: true, wantOrder: "param,main,"},
+	}
+	for _, transport := range []string{"http", "root", "jsonrpc", "websocket"} {
+		for _, tc := range cases {
+			t.Run(transport+"/"+tc.name, func(t *testing.T) {
+				dir, key := t.TempDir(), t.Name()
+				t.Cleanup(func() { storage.Delete(key) })
+				writeScript := func(name, code string) string {
+					path := filepath.Join(dir, name+".js")
+					code = fmt.Sprintf(`nyanSetItem(%q,nyanGetItem(%q)+%q);`, key, key, name+",") + code
+					if name == "param" {
+						// Permit the receiver's handshake; exercise Push checks on
+						// the triggering source API's parameters afterward.
+						code = `if(nyanAllParams.api==="sink") { ({success:true,status:200,result:null}); } else {` + code + `}`
+					}
+					writeHotReloadTestFile(t, path, code)
+					return path
+				}
+				const payload = `{"status":201,"value":"通知"}`
+				wireBody := "Push: " + payload
+				contentType, status := "text/plain", 200
+				if transport == "websocket" {
+					wireBody, contentType, status = payload, "application/json", 201
+				}
+				contextCheck := `if(nyanAllParams.api!=="source" || nyanAllParams.value!=="input") throw new Error("wrong parameters");`
+				main := contextCheck + strconv.Quote("Push: "+payload) + ";"
+				if tc.mainError {
+					main = `throw new Error("main failed");`
+				}
+				target := map[string]interface{}{"script": writeScript("main", main)}
+				paramKey, outKey := "paramCheck", "outCheck"
+				if tc.aliases {
+					paramKey, outKey = "paramcheck", "outcheck"
+				}
+				if tc.legacyAlias {
+					paramKey = "check"
+				}
+				if !tc.noChecks {
+					target[paramKey] = writeScript("param", contextCheck+tc.param)
+					outputCheck := fmt.Sprintf(`
+var o=nyanAllParams.nyan_output;
+if(o.body!==%q || o.bodyBase64!==%q || o.bodyLength!==%d || o.bodyLengthBytes!==%d || o.status!==%d || o.contentType!==%q || Object.keys(o.headers).length!==0) throw new Error("wrong output metadata");
+if(nyanAllParams.nyan_output_body!==o.body || nyanAllParams.nyan_output_body_base64!==o.bodyBase64) throw new Error("wrong output aliases");
+`, wireBody, base64.StdEncoding.EncodeToString([]byte(wireBody)), len(wireBody), len(wireBody), status, contentType)
+					target[outKey] = writeScript("out", contextCheck+outputCheck+tc.out)
+				}
+				if tc.missingParam {
+					target[paramKey] = writeScript("param", allow)
+				}
+				if tc.missingOut {
+					target[outKey] = filepath.Join(dir, "missing-out.js")
+				}
+				source, recovery := filepath.Join(dir, "source.js"), filepath.Join(dir, "recovery.js")
+				writeHotReloadTestFile(t, source, `JSON.stringify({status:200,body:"origin response"});`)
+				writeHotReloadTestFile(t, recovery, `"barrier";`)
+				f := newWebSocketCheckFixture(t, map[string]interface{}{
+					"source":   map[string]interface{}{"script": source, "push": "sink"},
+					"sink":     target,
+					"recovery": map[string]interface{}{"script": recovery},
+				})
+				sink := f.dial("/sink", nil)
+				// Confirm the receiver is registered before triggering Push.
+				if got := exchangeWebSocketCheckFrame(t, sink, websocket.TextMessage, `{"api":"recovery"}`); got != "barrier" {
+					t.Fatal(got)
+				}
+				if tc.missingParam {
+					// Remove the checker after the receiver has connected.
+					if err := os.Remove(target[paramKey].(string)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				frameType := websocket.TextMessage
+				if transport == "websocket" {
+					frameType = websocket.BinaryMessage
+					origin := f.dial("/source", nil)
+					got := exchangeWebSocketCheckFrame(t, origin, frameType, `{"api":"source","value":"input"}`)
+					if !containsJSONValue([]byte(got), "body", "origin response") {
+						t.Fatalf("origin response changed: %s", got)
+					}
+					// Wait until the source handler has finished its Push dispatch.
+					if got := exchangeWebSocketCheckFrame(t, origin, websocket.TextMessage, `{"api":"recovery"}`); got != "barrier" {
+						t.Fatal(got)
+					}
+				} else {
+					method, path, body := http.MethodGet, "/source?value=input", ""
+					if transport == "root" {
+						path = "/?api=source&value=input"
+					} else if transport == "jsonrpc" {
+						method, path = http.MethodPost, "/nyan-rpc"
+						body = `{"jsonrpc":"2.0","method":"source","params":{"value":"input"},"id":1}`
+					}
+					req, err := http.NewRequest(method, f.server.URL+path, strings.NewReader(body))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if body != "" {
+						req.Header.Set("Content-Type", "application/json")
+					}
+					resp, err := f.server.Client().Do(req)
+					if err != nil {
+						t.Fatal(err)
+					}
+					data, err := io.ReadAll(resp.Body)
+					resp.Body.Close()
+					if err != nil {
+						t.Fatal(err)
+					}
+					var value map[string]interface{}
+					if err := json.Unmarshal(data, &value); err != nil {
+						t.Fatal(err)
+					}
+					if transport == "jsonrpc" {
+						value, _ = value["result"].(map[string]interface{})
+					}
+					if resp.StatusCode != http.StatusOK || value["body"] != "origin response" {
+						t.Fatalf("origin response changed: status=%d body=%s", resp.StatusCode, data)
+					}
+				}
+				order, _ := storage.Load(key)
+				if order == nil {
+					order = ""
+				}
+				if order != tc.wantOrder {
+					t.Fatalf("execution order=%q, want %q", order, tc.wantOrder)
+				}
+				if tc.wantPush {
+					if err := sink.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+						t.Fatal(err)
+					}
+					gotType, got, err := sink.ReadMessage()
+					if err != nil {
+						t.Fatal(err)
+					}
+					if gotType != frameType || string(got) != wireBody {
+						t.Fatalf("Push=(%d,%q), want (%d,%q)", gotType, got, frameType, wireBody)
+					}
+				}
+				// A barrier frame proves rejected data/check results were not sent,
+				// without relying on a timeout to assert the absence of a Push.
+				if got := exchangeWebSocketCheckFrame(t, sink, websocket.TextMessage, `{"api":"recovery"}`); got != "barrier" {
+					t.Fatalf("unexpected Push or check response: %s", got)
+				}
+			})
+		}
+	}
+}
+
+func TestPushCheckOnlyStopsBeforeMain(t *testing.T) {
+	for _, configured := range []bool{true, false} {
+		t.Run(strconv.FormatBool(configured), func(t *testing.T) {
+			key, dir := t.Name(), t.TempDir()
+			t.Cleanup(func() { storage.Delete(key) })
+			path := filepath.Join(dir, "check.js")
+			writeHotReloadTestFile(t, path, fmt.Sprintf(`nyanSetItem(%q,"checked");({success:true,status:200,result:null});`, key))
+			mainPath, outPath := filepath.Join(dir, "main.js"), filepath.Join(dir, "out.js")
+			writeHotReloadTestFile(t, mainPath, fmt.Sprintf(`nyanSetItem(%q,"main");"unexpected Push";`, key))
+			writeHotReloadTestFile(t, outPath, fmt.Sprintf(`nyanSetItem(%q,"out");({success:true,status:200,result:null});`, key))
+			target := map[string]interface{}{"script": mainPath, "outCheck": outPath}
+			if configured {
+				target["paramCheck"] = path
+			}
+			snapshot := newAPIConfigSnapshot(filepath.Join(dir, "api.json"), map[string]interface{}{"sink": target}, nil, nil, nil, nil)
+			performPushWithSnapshot(snapshot, map[string]interface{}{"push": "sink"}, snapshot.Definitions, map[string]interface{}{"api": "source", "nyan_mode": "checkOnly"}, dir)
+			value, ran := storage.Load(key)
+			if ran != configured || (configured && value != "checked") {
+				t.Fatalf("execution marker=%v, want only paramCheck configured=%v", value, configured)
+			}
+		})
+	}
+}
+
+func TestPushChecksKeepCapturedSnapshot(t *testing.T) {
+	dir, key := t.TempDir(), t.Name()
+	t.Cleanup(func() { storage.Delete(key) })
+	writeScript := func(name, body string) string {
+		path := filepath.Join(dir, name+".js")
+		writeHotReloadTestFile(t, path, body)
+		return path
+	}
+	marker := fmt.Sprintf(`nyanSetItem(%q,nyanGetItem(%q)+nyanCallMe({api:"identity"}).generation+",");`, key, key)
+	target := map[string]interface{}{
+		"paramCheck": writeScript("param", marker+`({success:true,status:200,result:null});`),
+		"script":     writeScript("main", marker+`"notification";`),
+		"outCheck":   writeScript("out", marker+`({success:true,status:200,result:null});`),
+	}
+	f := newWebSocketCheckFixture(t, map[string]interface{}{
+		"sink":     target,
+		"identity": map[string]interface{}{"script": writeScript("old", `JSON.stringify({generation:"old"});`)},
+	})
+	captured := currentAPISnapshot()
+	publishAPISnapshot(newAPIConfigSnapshot(captured.RootPath, map[string]interface{}{
+		"sink":     target,
+		"identity": map[string]interface{}{"script": writeScript("new", `JSON.stringify({generation:"new"});`)},
+	}, nil, nil, nil, nil))
+	performPushWithSnapshot(captured, map[string]interface{}{"push": "sink"}, captured.Definitions, map[string]interface{}{"api": "source"}, f.dir)
+	if got, _ := storage.Load(key); got != "old,old,old," {
+		t.Fatalf("Push check/main snapshots=%v, want old,old,old,", got)
+	}
+}
+
+// A real upgraded connection exercises frame types and the message loop. Wait for
+// hijacked handlers explicitly: httptest.Server.Close does not wait for them.
+type websocketCheckFixture struct {
+	t      *testing.T
+	dir    string
+	server *httptest.Server
+	conns  []*websocket.Conn
+}
+
+func newWebSocketCheckFixture(t *testing.T, definitions map[string]interface{}) *websocketCheckFixture {
+	t.Helper()
+	previousSnapshot, previousConfig, previousPaths, previousLogger := currentAPISnapshot(), globalConfig, servicePaths, logger
+	previousPush := map[interface{}]interface{}{}
+	pushConnections.Range(func(key, value interface{}) bool {
+		previousPush[key] = value
+		pushConnections.Delete(key)
+		return true
+	})
+	f := &websocketCheckFixture{t: t, dir: t.TempDir()}
+	var handlers sync.WaitGroup
+	t.Cleanup(func() {
+		for _, conn := range f.conns {
+			closePhase5WebSocket(conn)
+		}
+		if f.server != nil {
+			f.server.Close()
+		}
+		done := make(chan struct{})
+		go func() { handlers.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("WebSocket handlers did not stop")
+		}
+		pushConnections.Range(func(key, _ interface{}) bool { pushConnections.Delete(key); return true })
+		for key, value := range previousPush {
+			pushConnections.Store(key, value)
+		}
+		publishAPISnapshot(previousSnapshot)
+		globalConfig, servicePaths, logger = previousConfig, previousPaths, previousLogger
+	})
+	apiPath := filepath.Join(f.dir, "api.json")
+	data, err := json.Marshal(definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeHotReloadTestFile(t, apiPath, string(data))
+	loaded, err := readAPIConfigFile(apiPath, f.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	globalConfig = Config{}
+	servicePaths.API.Path = apiPath
+	logger = log.New(io.Discard, "", 0)
+	publishAPISnapshot(loaded.Snapshot)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Any("/", handleRequest)
+	router.POST("/nyan-rpc", handleJSONRPC)
+	if err := registerDynamicEndpoints(router, f.dir); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("local TCP listener is unavailable: %v", err)
+	}
+	f.server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlers.Add(1)
+		defer handlers.Done()
+		router.ServeHTTP(w, r)
+	}))
+	f.server.Listener = listener
+	f.server.Start()
+	return f
+}
+
+func (f *websocketCheckFixture) dial(path string, headers http.Header) *websocket.Conn {
+	f.t.Helper()
+	dialer := websocket.Dialer{HandshakeTimeout: 3 * time.Second}
+	conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(f.server.URL, "http")+path, headers)
+	if err != nil {
+		f.t.Fatalf("dial WebSocket %s: %v", path, err)
+	}
+	f.conns = append(f.conns, conn)
+	return conn
+}
+
+func exchangeWebSocketCheckFrame(t *testing.T, conn *websocket.Conn, frameType int, body string) string {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteMessage(frameType, []byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	gotType, response, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotType != frameType {
+		t.Fatalf("response frame type = %d, want %d", gotType, frameType)
+	}
+	return string(response)
+}
+
+func TestWebSocketChecksMessageFlow(t *testing.T) {
+	const allow = `({success:true,status:200,result:{checked:true}});`
+	const denyParam = `({success:false,status:403,result:{message:"input blocked"}});`
+	const denyOut = `({success:false,status:409,result:{message:"output blocked"}});`
+	const mainBody = `{"success":false,"status":403,"value":"private result"}`
+	tests := []struct {
+		name, param, out, paramKey, outKey, wantOrder, wantBody string
+		checkOnly, binary, missingParam, missingOut             bool
+	}{
+		{name: "allow failed main response", param: allow, out: allow, wantOrder: "param,main,out,push,", wantBody: mainBody},
+		{name: "param denial", param: denyParam, out: allow, binary: true, wantOrder: "param,", wantBody: `{"success":false,"status":403,"result":{"message":"input blocked"}}`},
+		{name: "param non-200", param: `({success:true,status:202,result:null});`, out: allow, wantOrder: "param,", wantBody: `{"success":true,"status":202,"result":null}`},
+		{name: "output denial", param: allow, out: denyOut, binary: true, wantOrder: "param,main,out,", wantBody: `{"success":false,"status":409,"result":{"message":"output blocked"}}`},
+		{name: "output non-200", param: allow, out: `({success:true,status:202,result:null});`, wantOrder: "param,main,out,", wantBody: `{"success":true,"status":202,"result":null}`},
+		{name: "checkOnly", param: allow, out: allow, checkOnly: true, binary: true, wantOrder: "param,", wantBody: `{"success":true,"status":200,"result":{"checked":true}}`},
+		{name: "checkOnly without param", out: allow, checkOnly: true, wantBody: `{"success":true,"status":200,"result":null}`},
+		{name: "aliases", param: allow, out: allow, paramKey: "paramcheck", outKey: "outcheck", wantOrder: "param,main,out,push,", wantBody: mainBody},
+		{name: "legacy check alias", param: denyParam, out: allow, paramKey: "check", wantOrder: "param,", wantBody: `{"success":false,"status":403,"result":{"message":"input blocked"}}`},
+		{name: "param exception", param: `throw new Error("private exception");`, out: allow, binary: true, wantOrder: "param,", wantBody: `{"success":false,"status":500,"result":{"message":"Failed to run paramCheck"}}`},
+		{name: "invalid param result", param: `({success:true});`, out: allow, wantOrder: "param,", wantBody: `{"success":false,"status":500,"result":{"message":"Failed to run paramCheck"}}`},
+		{name: "missing param file", missingParam: true, out: allow, wantBody: `{"success":false,"status":500,"result":{"message":"Failed to run paramCheck"}}`},
+		{name: "output exception", param: allow, out: `throw new Error("private exception");`, binary: true, wantOrder: "param,main,out,", wantBody: `{"success":false,"status":500,"result":{"message":"Failed to run outCheck"}}`},
+		{name: "invalid output result", param: allow, out: `"not JSON";`, wantOrder: "param,main,out,", wantBody: `{"success":false,"status":500,"result":{"message":"Failed to run outCheck"}}`},
+		{name: "unserializable denial", param: allow, out: `({success:false,status:403,result:NaN});`, binary: true, wantOrder: "param,main,out,", wantBody: `{"success":false,"status":500,"result":{"message":"Failed to encode check response"}}`},
+		{name: "missing output file", param: allow, missingOut: true, wantOrder: "param,main,", wantBody: `{"success":false,"status":500,"result":{"message":"Failed to run outCheck"}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			key := "WebSocket flow: " + t.Name()
+			t.Cleanup(func() { storage.Delete(key) })
+			writeScript := func(name, body string) string {
+				path := filepath.Join(dir, name+".js")
+				writeHotReloadTestFile(t, path, fmt.Sprintf(`nyanSetItem(%q,nyanGetItem(%q)+%q);`, key, key, name+",")+body)
+				return path
+			}
+			target := map[string]interface{}{"script": writeScript("main", strconv.Quote(mainBody)+";"), "push": "sink"}
+			if tt.paramKey == "" {
+				tt.paramKey = "paramCheck"
+			}
+			if tt.outKey == "" {
+				tt.outKey = "outCheck"
+			}
+			if tt.param != "" {
+				target[tt.paramKey] = writeScript("param", tt.param)
+			}
+			if tt.out != "" {
+				target[tt.outKey] = writeScript("out", tt.out)
+			}
+			if tt.missingParam {
+				target[tt.paramKey] = filepath.Join(dir, "missing-param.js")
+			}
+			if tt.missingOut {
+				target[tt.outKey] = filepath.Join(dir, "missing-out.js")
+			}
+			recovery := filepath.Join(dir, "recovery.js")
+			writeHotReloadTestFile(t, recovery, `"connection remains usable";`)
+			f := newWebSocketCheckFixture(t, map[string]interface{}{
+				"target":   target,
+				"sink":     map[string]interface{}{"script": writeScript("push", `"push";`)},
+				"recovery": map[string]interface{}{"script": recovery},
+			})
+			conn := f.dial("/", nil)
+			if order, exists := storage.Load(key); exists {
+				t.Fatalf("handshake ran scripts: %v", order)
+			}
+			request := `{"api":"target"}`
+			if tt.checkOnly {
+				request = `{"api":"target","nyan_mode":"checkOnly"}`
+			}
+			frameType := websocket.TextMessage
+			if tt.binary {
+				frameType = websocket.BinaryMessage
+			}
+			got := exchangeWebSocketCheckFrame(t, conn, frameType, request)
+			var gotJSON, wantJSON interface{}
+			if err := json.Unmarshal([]byte(got), &gotJSON); err != nil {
+				t.Fatalf("response %q: %v", got, err)
+			}
+			if err := json.Unmarshal([]byte(tt.wantBody), &wantJSON); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(gotJSON, wantJSON) {
+				t.Errorf("response = %s, want %s", got, tt.wantBody)
+			}
+			// The next response also proves the previous iteration (including any
+			// Push dispatch) completed before we inspect execution markers.
+			if got := exchangeWebSocketCheckFrame(t, conn, websocket.TextMessage, `{"api":"recovery"}`); got != "connection remains usable" {
+				t.Fatalf("recovery response = %q", got)
+			}
+			order, _ := storage.Load(key)
+			if order == nil {
+				order = ""
+			}
+			if order != tt.wantOrder {
+				t.Fatalf("execution order = %q, want %q", order, tt.wantOrder)
+			}
+		})
+	}
+}
+
+func TestWebSocketChecksTargetAndOutputMetadata(t *testing.T) {
+	formats := []struct {
+		name, body, contentType string
+		status                  int
+	}{
+		{"JSON status", ` {"status":201,"value":"created"} `, "application/json", 201},
+		{"JSON failure", `{"success":false,"status":403,"value":"private"}`, "application/json", 403},
+		{"JSON no status", `{"value":"unchanged"}`, "application/json", 200},
+		{"JSON array", `[1,"two",null]`, "application/json", 200},
+		{"JSON null", `null`, "application/json", 200},
+		{"JSON string", `"日本語"`, "application/json", 200},
+		{"plain text", "raw 日本語", "text/plain", 200},
+	}
+	for index, tt := range formats {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			key := "WebSocket metadata: " + t.Name()
+			t.Cleanup(func() { storage.Delete(key) })
+			writeScript := func(name, body string) string {
+				path := filepath.Join(dir, name+".js")
+				writeHotReloadTestFile(t, path, body)
+				return path
+			}
+			trustedParams := `
+if (nyanAllParams.api !== "nested/target" || nyanAllParams._headers.Authorization !== "Bearer trusted-header" ||
+ nyanAllParams._user_agent !== "check-test-agent" || nyanAllParams._remote_ip !== "127.0.0.1") {
+ throw new Error("checker received untrusted request metadata or wrong target");
+}
+`
+			param := writeScript("param", trustedParams+`({success:true,status:200,result:null});`)
+			out := writeScript("out", trustedParams+fmt.Sprintf(`nyanSetItem(%q,JSON.stringify(nyanAllParams));
+({success:true,status:200,result:null});`, key))
+			channel := writeScript("channel", `throw new Error("connection URL main/out scripts must not execute");`)
+			channelCheck := writeScript("channel-check", `if(nyanAllParams.api!=="channel") throw new Error("wrong connection target"); ({success:true,status:200,result:null});`)
+			f := newWebSocketCheckFixture(t, map[string]interface{}{
+				"channel":       map[string]interface{}{"script": channel, "paramCheck": channelCheck, "outCheck": channel},
+				"nested/target": map[string]interface{}{"script": writeScript("main", strconv.Quote(tt.body)+";"), "paramCheck": param, "outCheck": out},
+			})
+			path := []string{"/channel", "/api/channel", "/"}[index%3]
+			conn := f.dial(path, http.Header{"Authorization": {"Bearer trusted-header"}, "User-Agent": {"check-test-agent"}, "X-Forwarded-For": {"203.0.113.10"}})
+			got := exchangeWebSocketCheckFrame(t, conn, websocket.BinaryMessage,
+				`{"api":"nested/target","_headers":{"Authorization":"forged"},"_user_agent":"forged","_remote_ip":"203.0.113.10","nyan_output_status":599,"nyan_output_body":"forged"}`)
+			if got != tt.body {
+				t.Fatalf("raw response = %q, want %q", got, tt.body)
+			}
+			raw, exists := storage.Load(key)
+			if !exists {
+				t.Fatal("outCheck did not execute")
+			}
+			var params struct {
+				Status      int    `json:"nyan_output_status"`
+				ContentType string `json:"nyan_output_content_type"`
+				Body        string `json:"nyan_output_body"`
+				Base64      string `json:"nyan_output_body_base64"`
+				Output      struct {
+					Status          int    `json:"status"`
+					ContentType     string `json:"contentType"`
+					Body            string `json:"body"`
+					Base64          string `json:"bodyBase64"`
+					BodyLength      int    `json:"bodyLength"`
+					BodyLengthBytes int    `json:"bodyLengthBytes"`
+				} `json:"nyan_output"`
+			}
+			if err := json.Unmarshal([]byte(raw.(string)), &params); err != nil {
+				t.Fatal(err)
+			}
+			encoded := base64.StdEncoding.EncodeToString([]byte(tt.body))
+			if params.Status != tt.status || params.Output.Status != tt.status ||
+				params.ContentType != tt.contentType || params.Output.ContentType != tt.contentType ||
+				params.Body != tt.body || params.Output.Body != tt.body || params.Base64 != encoded || params.Output.Base64 != encoded ||
+				params.Output.BodyLength != len(tt.body) || params.Output.BodyLengthBytes != len(tt.body) {
+				t.Fatalf("outCheck metadata = %s", raw)
+			}
+		})
+	}
+}
+
+func TestWebSocketChecksKeepSnapshotUntilNextMessage(t *testing.T) {
+	dir := t.TempDir()
+	startedKey, releaseKey, outputKey := t.Name()+":started", t.Name()+":release", t.Name()+":output"
+	t.Cleanup(func() {
+		storage.Delete(startedKey)
+		storage.Delete(releaseKey)
+		storage.Delete(outputKey)
+	})
+	writeScript := func(name, body string) string {
+		path := filepath.Join(dir, name+".js")
+		writeHotReloadTestFile(t, path, body)
+		return path
+	}
+	param := writeScript("param", fmt.Sprintf(`
+nyanSetItem(%q,nyanCallMe({api:"identity"}).generation);
+var deadline = Date.now() + 2000;
+while (nyanGetItem(%q) !== "released" && Date.now() < deadline) {}
+if (nyanGetItem(%q) !== "released") { throw new Error("reload barrier timed out"); }
+({success:true,status:200,result:null});`, startedKey, releaseKey, releaseKey))
+	out := writeScript("out", fmt.Sprintf(`nyanSetItem(%q,nyanCallMe({api:"identity"}).generation);
+({success:true,status:200,result:null});`, outputKey))
+	main := writeScript("main", `JSON.stringify(nyanCallMe({api:"identity"}));`)
+	oldIdentity := writeScript("old", `JSON.stringify({generation:"old"});`)
+	newIdentity := writeScript("new", `JSON.stringify({generation:"new"});`)
+	target := map[string]interface{}{"script": main, "paramCheck": param, "outCheck": out}
+	f := newWebSocketCheckFixture(t, map[string]interface{}{
+		"target":   target,
+		"identity": map[string]interface{}{"script": oldIdentity},
+	})
+	t.Cleanup(func() { storage.Store(releaseKey, "released") })
+	conn := f.dial("/", nil)
+	if err := conn.SetWriteDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"api":"target"}`)); err != nil {
+		t.Fatal(err)
+	}
+	waitForHotReloadCondition(t, "paramCheck reload barrier", func() bool {
+		value, exists := storage.Load(startedKey)
+		return exists && value == "old"
+	})
+	publishAPISnapshot(newAPIConfigSnapshot(filepath.Join(f.dir, "api.json"), map[string]interface{}{
+		"target":   target,
+		"identity": map[string]interface{}{"script": newIdentity},
+	}, nil, nil, nil, nil))
+	storage.Store(releaseKey, "released")
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, got, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != `{"generation":"old"}` {
+		t.Fatalf("in-flight main response = %s, want old snapshot", got)
+	}
+	if generation, _ := storage.Load(outputKey); generation != "old" {
+		t.Fatalf("in-flight outCheck used snapshot %v, want old", generation)
+	}
+	if got := exchangeWebSocketCheckFrame(t, conn, websocket.TextMessage, `{"api":"target"}`); got != `{"generation":"new"}` {
+		t.Fatalf("next message main response = %s, want new snapshot", got)
+	}
+	if generation, _ := storage.Load(startedKey); generation != "new" {
+		t.Errorf("next message paramCheck used snapshot %v, want new", generation)
+	}
+	if generation, _ := storage.Load(outputKey); generation != "new" {
+		t.Errorf("next message outCheck used snapshot %v, want new", generation)
+	}
+}
+
+func TestWebSocketHandshakeChecks(t *testing.T) {
+	const allow = `({success:true,status:200,result:{checked:true}});`
+	for _, route := range []string{"/nested/channel", "/api/nested/channel", "/?api=nested/channel"} {
+		for _, tc := range []struct {
+			name, code                         string
+			status                             int
+			checkOnly, noCheck, missing, alias bool
+		}{
+			{name: "allow", code: allow, status: 101},
+			{name: "alias", code: allow, alias: true, status: 101},
+			{name: "no checker", noCheck: true, status: 101},
+			{name: "deny", code: `({success:false,status:403,result:"denied"});`, status: 403},
+			{name: "non-200", code: `({success:true,status:202,result:null});`, status: 202},
+			{name: "exception", code: `throw new Error("check failed");`, status: 500},
+			{name: "invalid result", code: `({success:true});`, status: 500},
+			{name: "missing checker", missing: true, status: 500},
+			{name: "checkOnly", code: allow, checkOnly: true, status: 200},
+			{name: "checkOnly denied", code: `({success:false,status:403,result:"denied"});`, checkOnly: true, status: 403},
+			{name: "checkOnly without checker", noCheck: true, checkOnly: true, status: 200},
+		} {
+			t.Run(route+"/"+tc.name, func(t *testing.T) {
+				dir, key := t.TempDir(), t.Name()
+				t.Cleanup(func() { storage.Delete(key) })
+				param, main, out, recovery := filepath.Join(dir, "param.js"), filepath.Join(dir, "main.js"), filepath.Join(dir, "out.js"), filepath.Join(dir, "recovery.js")
+				writeHotReloadTestFile(t, param, fmt.Sprintf(`
+nyanSetItem(%q,nyanGetItem(%q)+"param,");
+if(nyanAllParams.api!=="nested/channel" || nyanAllParams.token!=="allowed" || nyanAllParams._remote_ip!=="127.0.0.1" || nyanAllParams._headers.Origin!=="https://trusted.example" || nyanAllParams._user_agent!=="handshake-test") throw new Error("wrong connection parameters");
+if(nyanGetCookie("session")!=="trusted" || nyanGetRequestHeaders().Origin!=="https://trusted.example" || nyanGetUserAgent()!=="handshake-test") throw new Error("missing HTTP context");
+`, key, key)+tc.code)
+				writeHotReloadTestFile(t, main, fmt.Sprintf(`nyanSetItem(%q,"main");"main";`, key))
+				writeHotReloadTestFile(t, out, fmt.Sprintf(`nyanSetItem(%q,"out");({success:true,status:200,result:null});`, key))
+				writeHotReloadTestFile(t, recovery, `"ready";`)
+				entry := map[string]interface{}{"script": main, "outCheck": out}
+				if !tc.noCheck {
+					field := "paramCheck"
+					if tc.alias {
+						field = "check"
+					}
+					entry[field] = param
+					if tc.missing {
+						entry[field] = filepath.Join(dir, "missing.js")
+					}
+				}
+				f := newWebSocketCheckFixture(t, map[string]interface{}{
+					"nested/channel": entry, "recovery": map[string]interface{}{"script": recovery},
+				})
+				separator := "?"
+				if strings.Contains(route, "?") {
+					separator = "&"
+				}
+				path := route + separator + "token=allowed&_remote_ip=forged&_headers=forged&_user_agent=forged"
+				if tc.checkOnly {
+					path += "&nyan_mode=checkOnly"
+				}
+				headers := http.Header{"Origin": {"https://trusted.example"}, "Cookie": {"session=trusted"}, "User-Agent": {"handshake-test"}}
+				if tc.status == http.StatusSwitchingProtocols {
+					conn := f.dial(path, headers)
+					if got := exchangeWebSocketCheckFrame(t, conn, websocket.TextMessage, `{"api":"recovery"}`); got != "ready" {
+						t.Fatal(got)
+					}
+					if _, exists := pushConnections.Load("nested/channel"); !exists {
+						t.Fatal("approved connection was not registered under canonical API name")
+					}
+				} else {
+					dialer := websocket.Dialer{HandshakeTimeout: 3 * time.Second}
+					conn, resp, err := dialer.Dial("ws"+strings.TrimPrefix(f.server.URL, "http")+path, headers)
+					if conn != nil {
+						conn.Close()
+						t.Fatal("rejected/checkOnly request was upgraded")
+					}
+					if err == nil || resp == nil {
+						t.Fatalf("expected HTTP check response, got response=%v err=%v", resp, err)
+					}
+					body, err := io.ReadAll(resp.Body)
+					resp.Body.Close()
+					if err != nil {
+						t.Fatal(err)
+					}
+					var check ParamCheckResponse
+					if err := json.Unmarshal(body, &check); err != nil {
+						t.Fatalf("response=%s: %v", body, err)
+					}
+					if resp.StatusCode != tc.status || check.Status != tc.status {
+						t.Fatalf("HTTP=%d check=%s, want %d", resp.StatusCode, body, tc.status)
+					}
+					if tc.checkOnly && tc.status == 200 {
+						if !check.Success {
+							t.Fatalf("checkOnly failed: %s", body)
+						}
+						if tc.noCheck {
+							if check.Result != nil {
+								t.Fatalf("expected null result: %s", body)
+							}
+						} else if result, ok := check.Result.(map[string]interface{}); !ok || result["checked"] != true {
+							t.Fatalf("check result lost: %s", body)
+						}
+					}
+					if _, exists := pushConnections.Load("nested/channel"); exists {
+						t.Fatal("rejected/checkOnly connection registered for Push")
+					}
+				}
+				want := "param,"
+				if tc.noCheck || tc.missing {
+					want = ""
+				}
+				got, _ := storage.Load(key)
+				if got == nil {
+					got = ""
+				}
+				if got != want {
+					t.Fatalf("handshake order=%q, want %q", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestWebSocketRootHandshakeRejectsUnavailableAPI(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		definition map[string]interface{}
+		status     int
+	}{
+		{name: "missing", status: 404},
+		{name: "disabled", definition: map[string]interface{}{"script": "unused.js", "websocket": false}, status: 403},
+		{name: "public", definition: map[string]interface{}{"type": "public", "path": "."}, status: 404},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			definitions := map[string]interface{}{}
+			if tc.definition != nil {
+				definitions["target"] = tc.definition
+			}
+			f := newWebSocketCheckFixture(t, definitions)
+			conn, resp, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(f.server.URL, "http")+"/?api=target", nil)
+			if conn != nil {
+				conn.Close()
+				t.Fatal("unavailable API accepted a subscription")
+			}
+			if resp != nil {
+				defer resp.Body.Close()
+			}
+			if err == nil || resp == nil || resp.StatusCode != tc.status {
+				t.Fatalf("response=%v err=%v, want %d", resp, err, tc.status)
+			}
+		})
+	}
+}
+
+func TestWebSocketChecksHandshakeThenEachMessage(t *testing.T) {
+	dir, key := t.TempDir(), t.Name()
+	t.Cleanup(func() { storage.Delete(key) })
+	write := func(name, body string) string {
+		path := filepath.Join(dir, name+".js")
+		writeHotReloadTestFile(t, path, fmt.Sprintf(`nyanSetItem(%q,nyanGetItem(%q)+%q);`, key, key, name+",")+body)
+		return path
+	}
+	f := newWebSocketCheckFixture(t, map[string]interface{}{
+		"target": map[string]interface{}{
+			"paramCheck": write("param", `({success:true,status:200,result:{checked:true}});`),
+			"script":     write("main", `"body";`),
+			"outCheck":   write("out", `({success:nyanAllParams.nyan_output.body==="body",status:200,result:null});`),
+		},
+	})
+	conn := f.dial("/target", nil)
+	if got, _ := storage.Load(key); got != "param," {
+		t.Fatalf("connection order=%v", got)
+	}
+	if got := exchangeWebSocketCheckFrame(t, conn, websocket.BinaryMessage, `{"api":"target"}`); got != "body" {
+		t.Fatal(got)
+	}
+	if got, _ := storage.Load(key); got != "param,param,main,out," {
+		t.Fatalf("first message order=%v", got)
+	}
+	body := exchangeWebSocketCheckFrame(t, conn, websocket.TextMessage, `{"api":"target","nyan_mode":"checkOnly"}`)
+	assertParamCheckResponse(t, []byte(body), true, http.StatusOK)
+	if got, _ := storage.Load(key); got != "param,param,main,out,param," {
+		t.Fatalf("checkOnly message order=%v", got)
+	}
+	if got := exchangeWebSocketCheckFrame(t, conn, websocket.TextMessage, `{"api":"target"}`); got != "body" {
+		t.Fatal(got)
+	}
+	if got, _ := storage.Load(key); got != "param,param,main,out,param,param,main,out," {
+		t.Fatalf("next message order=%v", got)
+	}
+}
+
+func TestWebSocketRootCheckOnlyDoesNotUpgrade(t *testing.T) {
+	f := newWebSocketCheckFixture(t, map[string]interface{}{})
+	conn, resp, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(f.server.URL, "http")+"/?nyan_mode=checkOnly", nil)
+	if conn != nil {
+		conn.Close()
+		t.Fatal("checkOnly upgraded")
+	}
+	if resp == nil || err == nil {
+		t.Fatalf("response=%v err=%v", resp, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("HTTP=%d body=%s", resp.StatusCode, body)
+	}
+	assertParamCheckResponse(t, body, true, http.StatusOK)
+	if _, exists := pushConnections.Load(""); exists {
+		t.Fatal("checkOnly registered a root subscription")
 	}
 }
