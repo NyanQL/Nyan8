@@ -44,6 +44,81 @@ func initTestLogger() {
 	servicePaths = serviceFilePaths{}
 }
 
+type headerTestTransport func(*http.Request) (*http.Response, error)
+
+func (transport headerTestTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
+
+func TestJSONAPIAdditionalHeaders(t *testing.T) {
+	originalTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+	for _, functionName := range []string{"nyanJsonAPI", "nyanCallAPI"} {
+		for _, tc := range []struct {
+			name, argument string
+			wantHeaders    map[string]string
+			wantError      bool
+		}{
+			{name: "omitted"},
+			{name: "empty_object", argument: `{}`},
+			{name: "empty_json_object", argument: `'{}'`},
+			{name: "null", argument: `null`},
+			{name: "json_null", argument: `'null'`},
+			{name: "object", argument: `{"Authorization":"Bearer test-token","X-Audit":"sent","Content-Type":"application/custom+json"}`, wantHeaders: map[string]string{"Authorization": "Bearer test-token", "X-Audit": "sent", "Content-Type": "application/custom+json"}},
+			{name: "json_string", argument: `'{"Authorization":"Bearer test-token","X-Audit":"sent","Content-Type":"application/custom+json"}'`, wantHeaders: map[string]string{"Authorization": "Bearer test-token", "X-Audit": "sent", "Content-Type": "application/custom+json"}},
+			{name: "object_values", argument: `{"X-Number":123,"X-Boolean":true}`, wantHeaders: map[string]string{"X-Number": "123", "X-Boolean": "true"}},
+			{name: "json_null_value", argument: `'{"X-Empty":null}'`, wantHeaders: map[string]string{"X-Empty": ""}},
+			{name: "invalid_json", argument: `'not-json'`, wantError: true},
+			{name: "trailing_json", argument: `'{}{}'`, wantError: true},
+			{name: "json_array", argument: `'[]'`, wantError: true},
+			{name: "json_numeric_value", argument: `'{"X-Number":123}'`, wantError: true},
+			{name: "undefined", argument: `undefined`, wantError: true},
+			{name: "number", argument: `123`, wantError: true},
+		} {
+			t.Run(functionName+"/"+tc.name, func(t *testing.T) {
+				requests := 0
+				http.DefaultTransport = headerTestTransport(func(request *http.Request) (*http.Response, error) {
+					requests++
+					if request.Method != http.MethodPost || request.URL.String() != "http://headers.test/echo" {
+						t.Fatalf("unexpected request: %s %s", request.Method, request.URL)
+					}
+					body, err := io.ReadAll(request.Body)
+					if err != nil || string(body) != `{"message":"hello"}` {
+						t.Fatalf("body=%q error=%v", body, err)
+					}
+					wantHeaders := map[string]string{"Content-Type": "application/json", "Authorization": "Basic dXNlcjpwYXNz"}
+					for name, value := range tc.wantHeaders {
+						wantHeaders[name] = value
+					}
+					for name, want := range wantHeaders {
+						values, exists := request.Header[http.CanonicalHeaderKey(name)]
+						if !exists || len(values) != 1 || values[0] != want {
+							t.Errorf("header %s=%q, want %q", name, values, want)
+						}
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"ok":true}`)), Request: request}, nil
+				})
+				vm := goja.New()
+				setupGojaVMWithSnapshot(vm, nil, nil)
+				script := functionName + `("http://headers.test/echo",'{"message":"hello"}',"user","pass"`
+				if tc.argument != "" {
+					script += "," + tc.argument
+				}
+				value, err := vm.RunString(script + ")")
+				if tc.wantError {
+					if err == nil || !strings.Contains(err.Error(), "Invalid header JSON:") || requests != 0 {
+						t.Fatalf("invalid headers: error=%v requests=%d, want exception before sending", err, requests)
+					}
+					return
+				}
+				if err != nil || requests != 1 || value.String() != `{"ok":true}` {
+					t.Fatalf("value=%v error=%v requests=%d, want response and one request", value, err, requests)
+				}
+			})
+		}
+	}
+}
+
 func TestResolveServiceFilePathsDefaultsToExecDir(t *testing.T) {
 	initTestLogger()
 
@@ -5005,6 +5080,37 @@ func TestOAuthPhase3ConcurrentConsumeSucceedsOnce(t *testing.T) {
 	}
 	if successes != 1 {
 		t.Fatalf("successful consumers = %d, want 1", successes)
+	}
+}
+
+func TestNyanSHA256Base64URLArguments(t *testing.T) {
+	vm := goja.New()
+	setupOAuthGojaVM(vm, nil, &MCPServerConfig{})
+	value, err := vm.RunString(`
+(function () {
+  try { nyanSHA256Base64URL(); }
+  catch (error) {
+    return error instanceof TypeError && error.message === "nyanSHA256Base64URL requires a string";
+  }
+  return false;
+})()`)
+	if err != nil || !value.ToBoolean() {
+		t.Fatalf("missing argument must throw a catchable TypeError: value=%v error=%v", value, err)
+	}
+	for _, tc := range []struct{ argument, want string }{
+		{`""`, "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"},
+		{`"abc"`, "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0"},
+		{`"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"`, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"},
+		{`undefined`, "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"},
+		{`null`, "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"},
+		{`"abc", "ignored"`, "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0"},
+	} {
+		t.Run(tc.argument, func(t *testing.T) {
+			value, err := vm.RunString("nyanSHA256Base64URL(" + tc.argument + ")")
+			if err != nil || value.String() != tc.want {
+				t.Fatalf("hash=%v error=%v, want %q", value, err, tc.want)
+			}
+		})
 	}
 }
 

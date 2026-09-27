@@ -645,8 +645,12 @@ let res3 = nyanCallAPI(
 ```
 
 > **ポイント**  
-> 5 番目の `headers` 引数は **オブジェクト**（`{key: "val"}`）のみ受け付けます。  
-> JSON文字列を渡したい場合は、上位側で文字列をオブジェクト化してください。
+> 5 番目の `headers` 引数は **オブジェクト**（`{key: "val"}`）と **JSON文字列**（`'{"key":"val"}'`）の両方を受け付けます。
+> `JSON.stringify(headers)` をそのまま渡すこともできます。不正なJSON文字列は、HTTPリクエストを送信する前に `Invalid header JSON: ...` のJavaScript例外になります。
+
+オブジェクトのヘッダー値は文字列へ変換します。JSON文字列形式では値を文字列で指定してください（数値・真偽値・配列・オブジェクトの値は例外になります）。NyanQL・NyanPUIと同じく、第5引数の省略、空オブジェクト、`null`、JSON文字列の `"null"` は追加ヘッダーなしとして扱います。JSON内のヘッダー値の `null` は空文字列になります。明示的な `undefined` は例外になります。
+
+従来はオブジェクト以外の第5引数を無視して送信していました。JSON文字列で指定したヘッダーも反映されるようになり、不正な指定の場合は送信せず例外になるため、既存の呼び出しで該当するものは引数を確認してください。
 
 ---
 
@@ -1326,7 +1330,7 @@ MCP Toolの `arguments.nyan_mode` は `verifyAccess` に引き継ぎません。
 | `nyanOAuthConsume(key)` | stateのJSON文字列を取得して削除する。同一プロセス内では1回だけ取得でき、存在しない場合は空文字 |
 | `nyanOAuthList(namespace)` | 指定namespaceのstateキーの一覧を返す |
 | `nyanRandomBase64URL(size)` | 1〜1024バイトの暗号乱数を生成し、パディングなしのBase64URL文字列を返す。引数省略時は32バイト（出力は43文字）。`size` はエンコード前のバイト数で、範囲外はJavaScript例外 |
-| `nyanSHA256Base64URL(value)` | 文字列のSHA-256を、パディングなしのBase64URL文字列で返す |
+| `nyanSHA256Base64URL(value)` | 文字列のSHA-256を、パディングなしのBase64URL文字列で返す。引数省略時は `TypeError`。明示した空文字列は有効 |
 | `nyanArgon2idHash(password)` | 1〜4096バイトのpasswordからArgon2idハッシュ文字列を生成する |
 | `nyanArgon2idVerify(password, encoded)` | passwordと `nyanArgon2idHash()` で生成したハッシュ文字列が一致するかを真偽値で返す。不一致や非対応の形式・パラメーターでは `false` |
 | `nyanOAuthAdminAuthorized(authorization)` | Authorizationヘッダー全体を受け取り、`config.json` の `oauth_admin` に対するBasic認証の結果を真偽値で返す |

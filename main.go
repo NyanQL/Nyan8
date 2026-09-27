@@ -1584,15 +1584,19 @@ func CORSMiddleware() gin.HandlerFunc {
 	}
 }
 
-func extractHeaders(arg goja.Value) map[string]string {
+func extractHeaders(arg goja.Value) (map[string]string, error) {
 	if m, ok := arg.Export().(map[string]interface{}); ok {
 		hdr := make(map[string]string, len(m))
 		for k, v := range m {
 			hdr[k] = fmt.Sprint(v)
 		}
-		return hdr
+		return hdr, nil
 	}
-	return nil
+	var headers map[string]string
+	if err := json.Unmarshal([]byte(arg.String()), &headers); err != nil {
+		return nil, fmt.Errorf("Invalid header JSON: %w", err)
+	}
+	return headers, nil
 }
 
 func getAPI(url, username, password string) (string, error) {
@@ -3909,7 +3913,17 @@ func setupOAuthGojaVM(vm *goja.Runtime, _ *APIConfigSnapshot, mcp *MCPServerConf
 		}
 		return vm.ToValue(value)
 	})
-	vm.Set("nyanSHA256Base64URL", sha256Base64URL)
+	vm.Set("nyanSHA256Base64URL", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			panic(vm.NewTypeError("nyanSHA256Base64URL requires a string"))
+		}
+		// Preserve the original Go string conversion for explicitly supplied values.
+		var value string
+		if err := vm.ExportTo(call.Argument(0), &value); err != nil {
+			panic(vm.NewTypeError("%s", err.Error()))
+		}
+		return vm.ToValue(sha256Base64URL(value))
+	})
 	vm.Set("nyanArgon2idHash", func(password string) string {
 		encoded, err := argon2idHash(password)
 		if err != nil {
@@ -5169,7 +5183,11 @@ func setupGojaVMForAPI(vm *goja.Runtime, snapshot *APIConfigSnapshot, apiName st
 
 		var hdr map[string]string
 		if len(call.Arguments) >= 5 {
-			hdr = extractHeaders(call.Argument(4))
+			var err error
+			hdr, err = extractHeaders(call.Argument(4))
+			if err != nil {
+				panic(vm.ToValue(err.Error()))
+			}
 		}
 		res, err := jsonAPI(url, []byte(data), user, pass, hdr)
 		if err != nil {
