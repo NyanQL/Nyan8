@@ -1025,52 +1025,14 @@ func handleAPIRequest(c *gin.Context) {
 	}
 	scriptListData := snapshot.Definitions
 
-	// 全てのパラメータをマージ
-	allParams := make(map[string]interface{})
-	allParams["api"] = c.Request.URL.Path[1:]
-
-	// POSTの場合、フォームデータをパースする
-	if c.Request.Method == http.MethodPost && strings.HasPrefix(c.ContentType(), "application/x-www-form-urlencoded") {
-		if err := c.Request.ParseForm(); err != nil {
-			respondWithError(c, http.StatusBadRequest, "Failed to parse form data", err)
-			return
-		}
+	// Root requests share the same input rules as named API endpoints.
+	allParams, err := collectRequestParams(c)
+	if err != nil {
+		respondWithError(c, http.StatusBadRequest, "Invalid JSON data", err)
+		return
 	}
-
-	// GETの場合はクエリパラメータでOK
-	queryParams := make(map[string]interface{})
-	for key, values := range c.Request.URL.Query() {
-		queryParams[key] = values[0]
-	}
-
-	// POSTフォームの場合
-	postFormParams := make(map[string]interface{})
-	if c.Request.Method == http.MethodPost {
-		for key, values := range c.Request.PostForm {
-			postFormParams[key] = values[0]
-		}
-	}
-
-	// JSONの場合
-	jsonBodyParams := make(map[string]interface{})
-	if c.ContentType() == "application/json" {
-		var requestData map[string]interface{}
-		if err := c.BindJSON(&requestData); err != nil {
-			respondWithError(c, http.StatusBadRequest, "Invalid JSON data", err)
-			return
-		}
-		jsonBodyParams = requestData
-	}
-
-	// 全てのパラメータをマージする
-	for key, value := range queryParams {
-		allParams[key] = value
-	}
-	for key, value := range postFormParams {
-		allParams[key] = value
-	}
-	for key, value := range jsonBodyParams {
-		allParams[key] = value
+	if _, exists := allParams["api"]; !exists {
+		allParams["api"] = strings.TrimPrefix(c.Request.URL.Path, "/")
 	}
 
 	// スクリプトの値を取得
@@ -1129,7 +1091,7 @@ func handleAPIRequest(c *gin.Context) {
 	}
 
 	response := APIResponse{Status: int(status), ContentType: "application/json", Headers: map[string]string{}, Body: []byte(result)}
-	if handled := runOutCheckWithSnapshot(snapshot, c, scriptInfo, execDir, allParams, response); handled {
+	if handled := runOutCheckWithSnapshot(snapshot, c, scriptInfo, execDir, allParams, &response); handled {
 		return
 	}
 	if responseAllowsPush(response) {
@@ -1178,6 +1140,10 @@ func handleWebSocket(c *gin.Context) {
 		writeParamCheckResponse(c, newParamCheckError(http.StatusBadRequest, "Invalid request parameters"))
 		return
 	}
+	if _, err := parseExecutionMode(params); err != nil {
+		writeParamCheckResponse(c, newParamCheckError(http.StatusBadRequest, err.Error()))
+		return
+	}
 	params["api"] = apiNameString
 	addWebSocketRequestMetadata(params, c.Request)
 	if apiNameString != "" {
@@ -1198,8 +1164,8 @@ func handleWebSocket(c *gin.Context) {
 		if allowed, handled := runParamCheckWithSnapshot(snapshot, c, apiMap, execDir, params); handled || !allowed {
 			return
 		}
-	} else if isCheckOnlyMode(params) {
-		writeParamCheckResponse(c, ParamCheckResponse{Success: true, Status: http.StatusOK})
+	} else if params["nyan_mode"] == "checkOnly" {
+		writeParamCheckResponse(c, newParamCheckError(http.StatusNotFound, "No check script for this API"))
 		return
 	}
 
@@ -1308,7 +1274,7 @@ func handleWebSocket(c *gin.Context) {
 		}
 
 		response := scriptResultResponse(result)
-		if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, scriptInfo, execDir, receivedData, response, requestContext); handled {
+		if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, scriptInfo, execDir, receivedData, &response, requestContext); handled {
 			if err != nil {
 				logServiceError(slog.LevelError, "websocket_out_check_failed", err, "api", scriptValue)
 				checkResponse = newParamCheckError(http.StatusInternalServerError, "Failed to run outCheck")
@@ -1377,7 +1343,17 @@ func runJavaScriptForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath string
 	if err != nil {
 		return "", err
 	}
-	return value.String(), nil
+	// Preserve existing string responses and encode structured values without
+	// losing their contents to JavaScript's generic string conversion.
+	exported := value.Export()
+	if text, ok := exported.(string); ok {
+		return text, nil
+	}
+	encoded, err := json.Marshal(exported)
+	if err != nil {
+		return "", fmt.Errorf("encode script result: %w", err)
+	}
+	return string(encoded), nil
 }
 
 func runJavaScriptValue(scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (goja.Value, error) {
@@ -1485,6 +1461,9 @@ func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, 
 	}
 	params["api"] = apiName
 
+	if check := executionModeCheck(params, getAPIString(apiMap, "paramCheck", "paramcheck", "check")); check != nil {
+		return "", fmt.Errorf("invalid execution request for API %s: %v", apiName, check.Result)
+	}
 	if handled, checkResponse, err := runParamCheckResponseWithSnapshot(snapshot, apiMap, execDir, params, ginCtx); err != nil {
 		return "", fmt.Errorf("failed to run paramCheck for API %s: %w", apiName, err)
 	} else if handled {
@@ -1503,7 +1482,7 @@ func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, 
 		return "", fmt.Errorf("failed to run API %s: %v", apiName, err)
 	}
 	response := scriptResultResponse(result)
-	if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, apiMap, execDir, params, response, ginCtx); err != nil {
+	if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, apiMap, execDir, params, &response, ginCtx); err != nil {
 		return "", fmt.Errorf("failed to run outCheck for API %s: %w", apiName, err)
 	} else if handled {
 		body, err := json.Marshal(checkResponse)
@@ -1541,6 +1520,9 @@ func responseAllowsPush(response APIResponse) bool {
 	if err := json.Unmarshal(response.Body, &result); err == nil {
 		if success, ok := result["success"].(bool); ok && !success {
 			return false
+		}
+		if status, ok := result["status"].(float64); ok {
+			return status >= http.StatusOK && status < http.StatusBadRequest && math.Trunc(status) == status
 		}
 	}
 	return true
@@ -1855,9 +1837,16 @@ func collectRequestParams(c *gin.Context) (map[string]interface{}, error) {
 
 	contentType := c.ContentType()
 	if strings.HasPrefix(contentType, "application/json") {
-		var jsonBody map[string]interface{}
-		if err := c.ShouldBindJSON(&jsonBody); err != nil && err != io.EOF {
+		body, err := io.ReadAll(c.Request.Body)
+		if err != nil {
 			return nil, err
+		}
+		var jsonBody map[string]interface{}
+		// Empty bodies add no parameters; non-empty bodies must be one JSON document.
+		if len(bytes.TrimSpace(body)) > 0 {
+			if err := json.Unmarshal(body, &jsonBody); err != nil {
+				return nil, err
+			}
 		}
 		for key, value := range jsonBody {
 			params[key] = value
@@ -1884,11 +1873,194 @@ func collectRequestParams(c *gin.Context) (map[string]interface{}, error) {
 	return params, nil
 }
 
-func isCheckOnlyMode(params map[string]interface{}) bool {
-	if params == nil {
-		return false
+// Validate the effective control value before any checker or API body runs.
+func parseExecutionMode(params map[string]interface{}) (string, error) {
+	raw, exists := params["nyan_mode"]
+	if !exists {
+		return "", nil
 	}
-	return strings.EqualFold(strings.TrimSpace(fmt.Sprint(params["nyan_mode"])), "checkOnly")
+	mode, ok := raw.(string)
+	if !ok || (mode != "" && mode != "checkOnly") {
+		return "", fmt.Errorf("Invalid nyan_mode: expected an empty string or checkOnly")
+	}
+	return mode, nil
+}
+
+func executionModeCheck(params map[string]interface{}, checkPath string) *ParamCheckResponse {
+	mode, err := parseExecutionMode(params)
+	if err != nil {
+		response := newParamCheckError(http.StatusBadRequest, err.Error())
+		return &response
+	}
+	if mode == "checkOnly" && strings.TrimSpace(checkPath) == "" {
+		response := newParamCheckError(http.StatusNotFound, "No check script for this API")
+		return &response
+	}
+	return nil
+}
+
+// Preserve duplicates so validation can reject ambiguous mode values.
+func setExecutionModeValues(params map[string]interface{}, values []string) {
+	if len(values) == 1 {
+		params["nyan_mode"] = values[0]
+	} else if len(values) > 1 {
+		params["nyan_mode"] = values
+	}
+}
+
+func normalizedMCPInputSchema(schema map[string]interface{}) map[string]interface{} {
+	normalized := mcpInputSchemaWithExecutionMode(schema)
+	if _, hasRef := schema["$ref"]; !hasRef {
+		return normalized
+	}
+	compiled, err := compileMCPJSONSchema(normalized)
+	if err != nil {
+		return normalized // Leave invalid schemas for the caller's compiler to reject.
+	}
+	// Specialize only references that validate the arguments object itself.
+	// Keep the original definitions intact: a nested property can share them.
+	definitions, _ := schema["$defs"].(map[string]interface{})
+	definitions = cloneParams(definitions)
+	references := make(map[string]string)
+	var extendReference func(map[string]interface{}, *jsonschema.Schema)
+	extendReference = func(current map[string]interface{}, compiled *jsonschema.Schema) {
+		if compiled.Ref == nil {
+			return
+		}
+		// Use the compiler's canonical location, including for local anchors.
+		ref := compiled.Ref.Location
+		if replacement, exists := references[ref]; exists {
+			current["$ref"] = replacement
+			return
+		}
+		location, err := url.Parse(ref)
+		if err != nil || !strings.HasPrefix(location.Fragment, "/") {
+			return
+		}
+		var target interface{} = schema
+		for _, part := range strings.Split(location.Fragment[1:], "/") {
+			part = strings.ReplaceAll(strings.ReplaceAll(part, "~1", "/"), "~0", "~")
+			switch value := target.(type) {
+			case map[string]interface{}:
+				target = value[part]
+			case []interface{}:
+				index, err := strconv.Atoi(part)
+				if err != nil || index < 0 || index >= len(value) {
+					return
+				}
+				target = value[index]
+			default:
+				return
+			}
+			// Moving an embedded resource would change the base of its references.
+			// Keep such resources untouched, as well as nested property schemas.
+			if object, ok := target.(map[string]interface{}); ok {
+				if _, hasID := object["$id"].(string); hasID {
+					return
+				}
+			}
+		}
+		source, ok := target.(map[string]interface{})
+		if !ok {
+			return // Boolean schemas and invalid references remain unchanged.
+		}
+		name := "nyan_input"
+		for index := 1; ; index++ {
+			if _, exists := definitions[name]; !exists {
+				break
+			}
+			name = fmt.Sprintf("nyan_input_%d", index)
+		}
+		replacement := "#/$defs/" + name
+		references[ref] = replacement
+		extended := mcpInputSchemaWithExecutionMode(source)
+		// Keep anchor identities on the original definition, including the
+		// dynamic anchor used by recursive children retained below.
+		delete(extended, "$anchor")
+		delete(extended, "$dynamicAnchor")
+		definitions[name] = extended
+		extendReference(extended, compiled.Ref)
+		if reflect.DeepEqual(source, extended) {
+			// tools/list and tools/call normalize stored schemas again.
+			// Reuse an already extended reference rather than growing $defs.
+			delete(definitions, name)
+			references[ref], _ = current["$ref"].(string)
+			return
+		}
+		// Reuse subschemas at their original locations so copying this object
+		// does not duplicate anchors or embedded resources, or rebase their refs.
+		retainMCPInputSubschemaReferences(extended, location)
+		current["$ref"] = replacement
+	}
+	extendReference(normalized, compiled)
+	if len(definitions) != 0 {
+		normalized["$defs"] = definitions
+	}
+	return normalized
+}
+
+func retainMCPInputSubschemaReferences(schema map[string]interface{}, location *url.URL) {
+	reference := func(parts ...string) interface{} {
+		target := *location
+		for _, part := range parts {
+			target.Fragment += "/" + strings.ReplaceAll(strings.ReplaceAll(part, "~", "~0"), "/", "~1")
+		}
+		// Published schemas must also resolve in clients with a different base URI.
+		return map[string]interface{}{"$ref": (&url.URL{Fragment: target.Fragment}).String()}
+	}
+	delete(schema, "$defs")
+	delete(schema, "definitions")
+	for _, keyword := range []string{"properties", "patternProperties", "dependentSchemas", "dependencies"} {
+		if original, ok := schema[keyword].(map[string]interface{}); ok {
+			children := cloneParams(original)
+			for name, child := range children {
+				if keyword == "properties" && name == "nyan_mode" {
+					continue
+				}
+				if _, isSchema := child.(map[string]interface{}); isSchema {
+					children[name] = reference(keyword, name)
+				}
+			}
+			schema[keyword] = children
+		}
+	}
+	for _, keyword := range []string{"allOf", "anyOf", "oneOf", "prefixItems", "items", "additionalItems", "contains", "unevaluatedItems", "additionalProperties", "unevaluatedProperties", "propertyNames", "not", "if", "then", "else", "contentSchema"} {
+		switch value := schema[keyword].(type) {
+		case map[string]interface{}:
+			schema[keyword] = reference(keyword)
+		case []interface{}:
+			children := append([]interface{}(nil), value...)
+			for index, child := range children {
+				if _, isSchema := child.(map[string]interface{}); isSchema {
+					children[index] = reference(keyword, strconv.Itoa(index))
+				}
+			}
+			schema[keyword] = children
+		}
+	}
+}
+
+func mcpInputSchemaWithExecutionMode(schema map[string]interface{}) map[string]interface{} {
+	normalized := make(map[string]interface{}, len(schema)+1)
+	for key, value := range schema {
+		normalized[key] = value
+	}
+	if len(schema) == 0 {
+		normalized["type"] = "object"
+		normalized["additionalProperties"] = true
+	}
+	if _, exists := normalized["properties"]; !exists {
+		normalized["properties"] = map[string]interface{}{}
+	}
+	if source, ok := normalized["properties"].(map[string]interface{}); ok {
+		properties := make(map[string]interface{}, len(source)+1)
+		for key, value := range source {
+			properties[key] = value
+		}
+		properties["nyan_mode"] = map[string]interface{}{"type": "string", "enum": []interface{}{"", "checkOnly"}, "description": "Run only paramCheck with checkOnly; do not execute the API body, outCheck, or Push. Omit or use an empty string for normal execution."}
+		normalized["properties"] = properties
+	}
+	return normalized
 }
 
 func cloneParams(params map[string]interface{}) map[string]interface{} {
@@ -1922,6 +2094,20 @@ func parseStatusCode(raw interface{}) (int, bool) {
 	}
 }
 
+// parseCheckStatusCode validates without truncating fractional numbers. JSON
+// strings retain their raw status token so decoding matches NyanQL's int field.
+func parseCheckStatusCode(raw interface{}) (int, bool) {
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return 0, false
+	}
+	var status *int
+	if err := json.Unmarshal(encoded, &status); err != nil || status == nil {
+		return 0, false
+	}
+	return *status, true
+}
+
 func parseCheckResponse(value goja.Value, checkName string) (ParamCheckResponse, error) {
 	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
 		return ParamCheckResponse{}, fmt.Errorf("%s must return an object", checkName)
@@ -1942,16 +2128,26 @@ func parseExportedCheckResponse(exported interface{}, checkName string) (ParamCh
 		}
 	}
 
+	if text, ok := exported.(string); ok && respMap != nil {
+		var fields struct {
+			Status json.RawMessage `json:"status"`
+		}
+		if err := json.Unmarshal([]byte(text), &fields); err != nil {
+			return ParamCheckResponse{}, fmt.Errorf("%s string response must be JSON: %w", checkName, err)
+		}
+		respMap["status"] = fields.Status
+	}
+
 	success, ok := respMap["success"].(bool)
 	if !ok {
 		return ParamCheckResponse{}, fmt.Errorf("%s response success must be boolean", checkName)
 	}
 
-	status, ok := parseStatusCode(respMap["status"])
+	status, ok := parseCheckStatusCode(respMap["status"])
 	if !ok {
-		return ParamCheckResponse{}, fmt.Errorf("%s response status must be a number", checkName)
+		return ParamCheckResponse{}, fmt.Errorf("%s response status must be an integer between 200 and 599", checkName)
 	}
-	if status < 100 || status > 599 {
+	if status < 200 || status > 599 {
 		return ParamCheckResponse{}, fmt.Errorf("%s response status is out of range: %d", checkName, status)
 	}
 
@@ -1993,7 +2189,7 @@ func runParamCheckWithSnapshot(snapshot *APIConfigSnapshot, c *gin.Context, apiM
 	}
 	if handled {
 		writeParamCheckResponse(c, checkResponse)
-		return checkResponse.Success && checkResponse.Status == http.StatusOK, true
+		return checkResponse.Success, true
 	}
 	return true, false
 }
@@ -2005,10 +2201,14 @@ func runParamCheckResponseWithSnapshot(snapshot *APIConfigSnapshot, apiMap map[s
 }
 
 func runParamCheckResponseForAPI(snapshot *APIConfigSnapshot, apiName string, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, ginCtx *gin.Context) (bool, ParamCheckResponse, error) {
-	checkOnly := isCheckOnlyMode(allParams)
 	paramCheckPath := getAPIString(apiMap, "paramCheck", "paramcheck", "check")
+	if check := executionModeCheck(allParams, paramCheckPath); check != nil {
+		return true, *check, nil
+	}
+	mode, _ := parseExecutionMode(allParams)
+	checkOnly := mode == "checkOnly"
 	if paramCheckPath == "" {
-		return checkOnly, ParamCheckResponse{Success: true, Status: http.StatusOK, Result: nil}, nil
+		return false, ParamCheckResponse{}, nil
 	}
 
 	fullPath, err := resolvePath(execDir, paramCheckPath)
@@ -2024,11 +2224,11 @@ func runParamCheckResponseForAPI(snapshot *APIConfigSnapshot, apiName string, ap
 		return true, ParamCheckResponse{}, err
 	}
 
-	allowed := checkResponse.Success && checkResponse.Status == http.StatusOK
+	allowed := checkResponse.Success
 	return checkOnly || !allowed, checkResponse, nil
 }
 
-func runOutCheckWithSnapshot(snapshot *APIConfigSnapshot, c *gin.Context, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response APIResponse) bool {
+func runOutCheckWithSnapshot(snapshot *APIConfigSnapshot, c *gin.Context, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response *APIResponse) bool {
 	handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, apiMap, execDir, allParams, response, c)
 	if !handled {
 		return false
@@ -2041,18 +2241,18 @@ func runOutCheckWithSnapshot(snapshot *APIConfigSnapshot, c *gin.Context, apiMap
 	return true
 }
 
-func runOutCheckResponseWithSnapshot(snapshot *APIConfigSnapshot, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response APIResponse, ginCtx *gin.Context) (bool, ParamCheckResponse, error) {
+func runOutCheckResponseWithSnapshot(snapshot *APIConfigSnapshot, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response *APIResponse, ginCtx *gin.Context) (bool, ParamCheckResponse, error) {
 	apiName, _ := allParams["api"].(string)
 	return runOutCheckResponseForAPI(snapshot, apiName, apiMap, execDir, allParams, response, ginCtx)
 }
 
-func runOutCheckResponseForAPI(snapshot *APIConfigSnapshot, apiName string, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response APIResponse, ginCtx *gin.Context) (bool, ParamCheckResponse, error) {
+func runOutCheckResponseForAPI(snapshot *APIConfigSnapshot, apiName string, apiMap map[string]interface{}, execDir string, allParams map[string]interface{}, response *APIResponse, ginCtx *gin.Context) (bool, ParamCheckResponse, error) {
 	outCheckPath := getAPIString(apiMap, "outCheck", "outcheck")
 	if outCheckPath == "" {
 		return false, ParamCheckResponse{}, nil
 	}
 
-	checkParams := outCheckParams(allParams, response)
+	checkParams := outCheckParams(allParams, *response)
 	fullPath, err := resolvePath(execDir, outCheckPath)
 	if err != nil {
 		return true, ParamCheckResponse{}, err
@@ -2065,7 +2265,8 @@ func runOutCheckResponseForAPI(snapshot *APIConfigSnapshot, apiName string, apiM
 	if err != nil {
 		return true, ParamCheckResponse{}, err
 	}
-	if checkResponse.Success && checkResponse.Status == http.StatusOK {
+	if checkResponse.Success {
+		response.Status = checkResponse.Status
 		return false, ParamCheckResponse{}, nil
 	}
 	return true, checkResponse, nil
@@ -2199,7 +2400,15 @@ func servePublicEndpoint(c *gin.Context, endpoint, requestedPath, execDir string
 			return
 		}
 		response := APIResponse{Status: http.StatusOK, ContentType: http.DetectContentType(fileContent), Headers: map[string]string{}, Body: fileContent}
-		if handled := runOutCheckWithSnapshot(snapshot, c, latest, execDir, allParams, response); handled {
+		if handled := runOutCheckWithSnapshot(snapshot, c, latest, execDir, allParams, &response); handled {
+			return
+		}
+		if response.Status != http.StatusOK {
+			body := response.Body
+			if c.Request.Method == http.MethodHead {
+				body = nil
+			}
+			c.Data(response.Status, response.ContentType, body)
 			return
 		}
 		http.ServeContent(c.Writer, c.Request, fileInfo.Name(), fileInfo.ModTime(), bytes.NewReader(fileContent))
@@ -2315,7 +2524,7 @@ func executeAPIEndpoint(c *gin.Context, apiName, execDir string) {
 		return
 	}
 	response.Status = int(status)
-	if handled := runOutCheckWithSnapshot(snapshot, c, scriptInfo, execDir, allParams, response); handled {
+	if handled := runOutCheckWithSnapshot(snapshot, c, scriptInfo, execDir, allParams, &response); handled {
 		return
 	}
 	if responseAllowsPush(response) {
@@ -2772,7 +2981,7 @@ func mcpToolListForTransport(mcp *MCPServerConfig, includeHTTPSecurity bool) []m
 			"name":        tool.Name,
 			"title":       tool.Title,
 			"description": tool.Description,
-			"inputSchema": tool.InputSchema,
+			"inputSchema": normalizedMCPInputSchema(tool.InputSchema),
 		}
 		if tool.OutputSchema != nil {
 			entry["outputSchema"] = tool.OutputSchema
@@ -2832,7 +3041,7 @@ func handleMCPToolCall(c *gin.Context, snapshot *APIConfigSnapshot, mcp *MCPServ
 		})
 		return
 	}
-	payload, toolError := executeMCPToolWithContext(snapshot, tool, params.Arguments, principal, c)
+	payload, toolError := executeMCPToolWithContext(snapshot, tool, params.Arguments, principal, c, request.ID)
 	if toolError != "" {
 		mcpWriteToolError(c, request.ID, toolError)
 		return
@@ -2866,17 +3075,17 @@ func findMCPTool(mcp *MCPServerConfig, name string) *MCPToolConfig {
 	return nil
 }
 
-func executeMCPTool(snapshot *APIConfigSnapshot, tool *MCPToolConfig, rawArguments map[string]interface{}, principal interface{}) (map[string]interface{}, string) {
-	return executeMCPToolWithContext(snapshot, tool, rawArguments, principal, nil)
+func executeMCPTool(snapshot *APIConfigSnapshot, tool *MCPToolConfig, rawArguments map[string]interface{}, principal interface{}, requestIDs ...json.RawMessage) (map[string]interface{}, string) {
+	return executeMCPToolWithContext(snapshot, tool, rawArguments, principal, nil, requestIDs...)
 }
 
-func executeMCPToolWithContext(snapshot *APIConfigSnapshot, tool *MCPToolConfig, rawArguments map[string]interface{}, principal interface{}, ginCtx *gin.Context) (map[string]interface{}, string) {
+func executeMCPToolWithContext(snapshot *APIConfigSnapshot, tool *MCPToolConfig, rawArguments map[string]interface{}, principal interface{}, ginCtx *gin.Context, requestIDs ...json.RawMessage) (map[string]interface{}, string) {
 	requestContext := readOnlyScriptRequestContext(ginCtx)
 	argumentsValue := rawArguments
 	if argumentsValue == nil {
 		argumentsValue = map[string]interface{}{}
 	}
-	if err := validateMCPJSONSchemaValue(tool.InputSchema, argumentsValue); err != nil {
+	if err := validateMCPJSONSchemaValue(normalizedMCPInputSchema(tool.InputSchema), argumentsValue); err != nil {
 		return nil, "Tool arguments do not match inputSchema."
 	}
 	for key := range argumentsValue {
@@ -2916,7 +3125,8 @@ func executeMCPToolWithContext(snapshot *APIConfigSnapshot, tool *MCPToolConfig,
 	if len(body) > maxMCPToolResultBytes {
 		return nil, "Tool result is too large."
 	}
-	if handled, check, err := runOutCheckResponseForAPI(snapshot, tool.API, backing, execDir, arguments, scriptResultResponse(string(body)), requestContext); err != nil {
+	response := scriptResultResponse(string(body))
+	if handled, check, err := runOutCheckResponseForAPI(snapshot, tool.API, backing, execDir, arguments, &response, requestContext); err != nil {
 		return nil, "Tool outCheck failed."
 	} else if handled {
 		return mcpCheckResult(check)
@@ -2926,11 +3136,24 @@ func executeMCPToolWithContext(snapshot *APIConfigSnapshot, tool *MCPToolConfig,
 			return nil, "Tool result does not match outputSchema."
 		}
 	}
-	return map[string]interface{}{
+	isError := false
+	if object, ok := structured.(map[string]interface{}); ok {
+		if success, ok := object["success"].(bool); ok && !success {
+			isError = true
+		}
+	}
+	result := map[string]interface{}{
 		"content":           []map[string]interface{}{{"type": "text", "text": string(body)}},
 		"structuredContent": structured,
-		"isError":           false,
-	}, ""
+		"isError":           isError,
+	}
+	if failure := validateMCPResultBeforePush(result, requestIDs); failure != "" {
+		return nil, failure
+	}
+	if responseAllowsPush(response) {
+		performPushWithContext(snapshot, backing, snapshot.Definitions, arguments, execDir, requestContext)
+	}
+	return result, ""
 }
 
 // Check responses are separate from the API's normal outputSchema.
@@ -2942,7 +3165,7 @@ func mcpCheckResult(check ParamCheckResponse) (map[string]interface{}, string) {
 	return map[string]interface{}{
 		"content":           []map[string]interface{}{{"type": "text", "text": string(body)}},
 		"structuredContent": map[string]interface{}{"success": check.Success, "status": check.Status, "result": check.Result},
-		"isError":           !check.Success || check.Status != http.StatusOK,
+		"isError":           !check.Success,
 	}, ""
 }
 
@@ -3129,7 +3352,7 @@ func handleMCPStdioToolCall(snapshot *APIConfigSnapshot, mcp *MCPServerConfig, r
 		return mcpStdioError(request.ID, -32603, "MCP server is busy")
 	}
 	defer release()
-	payload, toolError := executeMCPTool(snapshot, tool, params.Arguments, principal)
+	payload, toolError := executeMCPTool(snapshot, tool, params.Arguments, principal, request.ID)
 	if toolError != "" {
 		return mcpStdioResult(request.ID, map[string]interface{}{
 			"content": []map[string]interface{}{{"type": "text", "text": toolError}},
@@ -3526,7 +3749,7 @@ func oauthRequestParams(request *http.Request) (map[string]interface{}, error) {
 	}
 	// The control parameter follows Nyan8's body-over-query precedence.
 	if values, ok := request.URL.Query()["nyan_mode"]; ok && len(values) > 0 {
-		params["nyan_mode"] = values[0]
+		setExecutionModeValues(params, values)
 	}
 	cookies := map[string]string{}
 	for _, cookie := range request.Cookies() {
@@ -3565,7 +3788,7 @@ func oauthRequestParams(request *http.Request) (map[string]interface{}, error) {
 	}
 	params["form"] = oauthValuesForJavaScript(values)
 	if modes, ok := values["nyan_mode"]; ok && len(modes) > 0 {
-		params["nyan_mode"] = modes[0]
+		setExecutionModeValues(params, modes)
 	}
 	return params, nil
 }
@@ -3614,7 +3837,19 @@ func invokeOAuthHook(snapshot *APIConfigSnapshot, mcp *MCPServerConfig, runtimeU
 	// /API名と/?api=API名は同じAPIであるため、policyへ渡すpathは
 	// request表記ではなく参照先API名から導出したcanonical pathに固定する。
 	params["path"] = apiPath
-	checkOnly := isCheckOnlyMode(params)
+	if hookName == "oauthValidateAccessToken" {
+		delete(params, "nyan_mode")
+	}
+	mode, modeErr := parseExecutionMode(params)
+	if modeErr != nil {
+		check := newParamCheckError(http.StatusBadRequest, modeErr.Error())
+		return &check, nil
+	}
+	checkOnly := mode == "checkOnly"
+	if checkOnly && getAPIString(apiDefinition, "paramCheck", "paramcheck", "check") == "" {
+		check := newParamCheckError(http.StatusInternalServerError, "No check script for this API")
+		return &check, nil
+	}
 	check := ParamCheckResponse{Success: true, Status: http.StatusOK, Result: nil}
 	if checkPath := getAPIString(apiDefinition, "paramCheck", "paramcheck", "check"); checkPath != "" {
 		check, err = runOAuthCheck(snapshot, mcp, checkPath, params, "paramCheck")
@@ -3622,7 +3857,7 @@ func invokeOAuthHook(snapshot *APIConfigSnapshot, mcp *MCPServerConfig, runtimeU
 			return nil, err
 		}
 	}
-	if checkOnly || !check.Success || check.Status != http.StatusOK {
+	if checkOnly || !check.Success {
 		// A distinct Go type prevents a check result from becoming an authentication decision.
 		return &check, nil
 	}
@@ -3677,11 +3912,12 @@ func invokeOAuthHook(snapshot *APIConfigSnapshot, mcp *MCPServerConfig, runtimeU
 		if err != nil {
 			return nil, err
 		}
-		if !check.Success || check.Status != http.StatusOK {
+		if !check.Success {
 			return &check, nil
 		}
 		if hookName != "oauthValidateAccessToken" {
-			// Send exactly the validated bytes inspected by outCheck.
+			// Keep the validated body and headers, applying the successful check status.
+			response.Status = check.Status
 			return response, nil
 		}
 	}
@@ -3981,31 +4217,8 @@ func argon2idHash(password string) (string, error) {
 }
 
 func argon2idVerify(password, encoded string) bool {
-	parts := strings.Split(encoded, "$")
-	if len(parts) != 6 || parts[1] != "argon2id" || parts[2] != "v=19" {
-		return false
-	}
-	var memory uint32
-	var iterations uint32
-	var parallelism uint8
-	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &memory, &iterations, &parallelism); err != nil {
-		return false
-	}
-	if memory != argon2Memory || iterations != argon2Iterations || parallelism != argon2Parallelism {
-		return false
-	}
-	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
-	if err != nil || len(salt) != argon2SaltLength {
-		return false
-	}
-	expected, err := base64.RawStdEncoding.DecodeString(parts[5])
-	if err != nil || len(expected) != argon2KeyLength || len(password) > 4096 {
-		return false
-	}
-	oauthArgon2Slots <- struct{}{}
-	defer func() { <-oauthArgon2Slots }()
-	actual := argon2.IDKey([]byte(password), salt, iterations, memory, parallelism, uint32(len(expected)))
-	return subtle.ConstantTimeCompare(actual, expected) == 1
+	valid, _ := verifyBoundedArgon2id(password, encoded)
+	return valid
 }
 
 func oauthAdminAuthorized(authorization string) bool {
@@ -4538,6 +4751,12 @@ func performPushWithContext(snapshot *APIConfigSnapshot, scriptInfo map[string]i
 // Keep HTTP and WebSocket Push checks identical while preserving their frame
 // types and the legacy WebSocket-only removal of the "Push: " prefix.
 func performPushForTransport(snapshot *APIConfigSnapshot, scriptInfo map[string]interface{}, scriptListData map[string]interface{}, allParams map[string]interface{}, execDir string, messageType int, stripPrefix bool, ginCtx *gin.Context) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logServiceError(slog.LevelError, "push_execution_panicked", fmt.Errorf("Push execution panic: %v", recovered))
+		}
+	}()
+
 	pushTarget, _ := scriptInfo["push"].(string)
 	if pushTarget == "" {
 		return
@@ -4548,10 +4767,10 @@ func performPushForTransport(snapshot *APIConfigSnapshot, scriptInfo map[string]
 		return
 	}
 
-	// Preserve the triggering API in nyanAllParams.api, but execute all three
-	// scripts with the Push target's definition and the same captured snapshot.
+	// All Push stages see the target API, without changing the caller's parameters.
 	requestContext := readOnlyScriptRequestContext(ginCtx)
 	params := cloneParams(allParams)
+	params["api"] = pushTarget
 	if handled, check, err := runParamCheckResponseForAPI(snapshot, pushTarget, pushConfig, execDir, params, requestContext); err != nil {
 		logServiceError(slog.LevelError, "push_param_check_failed", err, "api", pushTarget)
 		return
@@ -4574,7 +4793,8 @@ func performPushForTransport(snapshot *APIConfigSnapshot, scriptInfo map[string]
 	if stripPrefix {
 		pushResult = strings.TrimPrefix(pushResult, "Push: ")
 	}
-	if handled, check, err := runOutCheckResponseForAPI(snapshot, pushTarget, pushConfig, execDir, params, scriptResultResponse(pushResult), requestContext); err != nil {
+	response := scriptResultResponse(pushResult)
+	if handled, check, err := runOutCheckResponseForAPI(snapshot, pushTarget, pushConfig, execDir, params, &response, requestContext); err != nil {
 		logServiceError(slog.LevelError, "push_out_check_failed", err, "api", pushTarget)
 		return
 	} else if handled {
@@ -5126,6 +5346,11 @@ func setupGojaVMWithSnapshot(vm *goja.Runtime, snapshot *APIConfigSnapshot, ginC
 }
 
 func setupGojaVMForAPI(vm *goja.Runtime, snapshot *APIConfigSnapshot, apiName string, ginCtx *gin.Context) {
+	writerRoot := ""
+	if snapshot != nil {
+		writerRoot = snapshot.RootPath
+	}
+	registerNyanFileWriters(vm, writerRoot)
 	// Capture the root API configuration's directory once, independently of JS parameters.
 	fileBaseDir, fileBaseErr := javaScriptFileBaseDir(snapshot)
 	filePath := func(path string) string {
@@ -5139,9 +5364,17 @@ func setupGojaVMForAPI(vm *goja.Runtime, snapshot *APIConfigSnapshot, apiName st
 	}
 
 	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			panic(vm.NewTypeError("nyanGetAPI requires a URL"))
+		}
 		url := call.Argument(0).String()
-		user := call.Argument(1).String()
-		pass := call.Argument(2).String()
+		var user, pass string
+		if len(call.Arguments) >= 2 {
+			user = call.Argument(1).String()
+		}
+		if len(call.Arguments) >= 3 {
+			pass = call.Argument(2).String()
+		}
 		result, err := getAPI(url, user, pass)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
@@ -5164,13 +5397,14 @@ func setupGojaVMForAPI(vm *goja.Runtime, snapshot *APIConfigSnapshot, apiName st
 	})
 
 	vm.Set("nyanSetItem", func(k, v string) { storage.Store(k, v) })
-	vm.Set("nyanGetItem", func(k string) string {
+	vm.Set("nyanGetItem", func(k string) goja.Value {
 		if v, ok := storage.Load(k); ok {
 			if s, ok := v.(string); ok {
-				return s
+				return vm.ToValue(s)
 			}
+			return vm.ToValue("")
 		}
-		return ""
+		return goja.Null()
 	})
 
 	registerScriptConsole(vm)
@@ -5200,7 +5434,7 @@ func setupGojaVMForAPI(vm *goja.Runtime, snapshot *APIConfigSnapshot, apiName st
 
 	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) == 0 {
-			panic(vm.ToValue("command required"))
+			panic(vm.NewTypeError("nyanHostExec: command required"))
 		}
 		cmd := call.Argument(0).String()
 		out, err := execCommand(cmd)
@@ -5650,20 +5884,18 @@ func handleJSONRPC(c *gin.Context) {
 	// 既存ロジックが「api」パラメータを参照するために設定
 	allParams["api"] = rpcReq.Method
 
-	checkOnly := isCheckOnlyMode(allParams)
+	mode, modeErr := parseExecutionMode(allParams)
 	paramCheckPath := getAPIString(scriptInfo, "paramCheck", "paramcheck", "check")
-	if paramCheckPath == "" && checkOnly {
-		c.JSON(http.StatusOK, JSONRPCResponse{
-			JSONRPC: "2.0",
-			Result: ParamCheckResponse{
-				Success: true,
-				Status:  http.StatusOK,
-				Result:  nil,
-			},
-			ID: rpcReq.ID,
-		})
+	if modeErr != nil || (mode == "checkOnly" && paramCheckPath == "") {
+		message := "No check script for this API"
+		if modeErr != nil {
+			message = modeErr.Error()
+		}
+		c.JSON(http.StatusBadRequest, JSONRPCResponse{JSONRPC: "2.0", ID: rpcReq.ID, Error: &JSONRPCError{Code: -32602, Message: message}})
 		return
 	}
+	checkOnly := mode == "checkOnly"
+
 	if paramCheckPath != "" {
 		fullCheckPath, err := resolvePath(execDir, paramCheckPath)
 		if err != nil {
@@ -5680,9 +5912,9 @@ func handleJSONRPC(c *gin.Context) {
 			respondJSONRPCError(c, rpcReq.ID, -32603, "Check script error", err.Error())
 			return
 		}
-		allowed := checkResponse.Success && checkResponse.Status == http.StatusOK
+		allowed := checkResponse.Success
 		if checkOnly {
-			c.JSON(checkResponse.Status, JSONRPCResponse{
+			c.JSON(jsonRPCResponseStatus(checkResponse.Status), JSONRPCResponse{
 				JSONRPC: "2.0",
 				Result:  checkResponse,
 				ID:      rpcReq.ID,
@@ -5765,12 +5997,12 @@ func handleJSONRPC(c *gin.Context) {
 		Headers:     map[string]string{},
 		Body:        []byte(resultStr),
 	}
-	if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, scriptInfo, execDir, allParams, response, c); handled {
+	if handled, checkResponse, err := runOutCheckResponseWithSnapshot(snapshot, scriptInfo, execDir, allParams, &response, c); handled {
 		if err != nil {
 			respondJSONRPCError(c, rpcReq.ID, -32603, "outCheck script error", err.Error())
 			return
 		}
-		c.JSON(checkResponse.Status, JSONRPCResponse{
+		c.JSON(jsonRPCResponseStatus(checkResponse.Status), JSONRPCResponse{
 			JSONRPC: "2.0",
 			Result:  checkResponse,
 			ID:      rpcReq.ID,
@@ -5797,8 +6029,23 @@ func handleJSONRPC(c *gin.Context) {
 		ID:      rpcReq.ID,
 	}
 
-	// statusCode に従ってレスポンスを返す（通常は200のままでOK）
-	c.JSON(http.StatusOK, rpcResp)
+	// A successful outCheck controls the HTTP status; preserve the legacy default without it.
+	status := http.StatusOK
+	if getAPIString(scriptInfo, "outCheck", "outcheck") != "" {
+		status = response.Status
+	}
+	c.JSON(jsonRPCResponseStatus(status), rpcResp)
+}
+
+// JSON-RPC responses require an envelope even when a check selects a status
+// that cannot carry content. Keep the check's status inside its result.
+func jsonRPCResponseStatus(status int) int {
+	switch status {
+	case http.StatusNoContent, http.StatusResetContent, http.StatusNotModified:
+		return http.StatusOK
+	default:
+		return status
+	}
 }
 
 func respondJSONRPCError(c *gin.Context, id interface{}, code int, message string, data interface{}) {
@@ -6219,7 +6466,7 @@ func resolveAndValidateMCPConfig(mcp *MCPServerConfig, definitions map[string]in
 		if schemaErr != nil {
 			return fmt.Errorf("Tool %s schema cannot be resolved: %w", apiName, schemaErr)
 		}
-		if _, schemaErr := compileMCPJSONSchema(schema.Input); schemaErr != nil {
+		if _, schemaErr := compileMCPJSONSchema(normalizedMCPInputSchema(schema.Input)); schemaErr != nil {
 			return fmt.Errorf("Tool %s has invalid inputSchema: %w", apiName, schemaErr)
 		}
 		if schema.OutputSource != schemaSourceUnknown {
@@ -6241,7 +6488,7 @@ func resolveAndValidateMCPConfig(mcp *MCPServerConfig, definitions map[string]in
 			API:             apiName,
 			Title:           getAPIString(backing, "title"),
 			Description:     getAPIString(backing, "description"),
-			InputSchema:     schema.Input,
+			InputSchema:     normalizedMCPInputSchema(schema.Input),
 			SecuritySchemes: securitySchemes,
 			Annotations:     mcpAnnotationsFromAPI(backing),
 		}
@@ -7972,4 +8219,176 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
 			}
 		}
 	}
+}
+
+// Include both duplicated result fields, escaping, and the actual ID in the size check.
+func validateMCPResultBeforePush(result map[string]interface{}, requestIDs []json.RawMessage) string {
+	var id json.RawMessage
+	if len(requestIDs) > 0 {
+		id = requestIDs[0]
+	}
+	body, err := json.Marshal(map[string]interface{}{"jsonrpc": "2.0", "id": rawMCPID(id), "result": result})
+	if err != nil {
+		return "Tool response could not be serialized."
+	}
+	if len(body) > maxMCPResponseBytes {
+		return "Tool response is too large."
+	}
+	return ""
+}
+
+// New file writers have one contract across the three products. Legacy
+// nyanSaveFile retains its product-specific arguments and return value.
+func registerNyanFileWriters(vm *goja.Runtime, rootAPIPath string) {
+	baseDir := ""
+	if filepath.IsAbs(rootAPIPath) {
+		baseDir = filepath.Dir(rootAPIPath)
+	}
+	for _, name := range []string{"nyanWriteTextFile", "nyanWriteBase64File"} {
+		vm.Set(name, func(call goja.FunctionCall) goja.Value {
+			if len(call.Arguments) < 2 {
+				panic(vm.NewTypeError("%s(path, data) requires 2 string arguments", name))
+			}
+			pathValue, pathOK := call.Argument(0).(goja.String)
+			dataValue, dataOK := call.Argument(1).(goja.String)
+			if !pathOK || strings.TrimSpace(pathValue.String()) == "" {
+				panic(vm.NewTypeError("%s: path must be a non-empty string", name))
+			}
+			if !dataOK {
+				panic(vm.NewTypeError("%s: data must be a string", name))
+			}
+			path, text := pathValue.String(), dataValue.String()
+			data := []byte(text)
+			if name == "nyanWriteBase64File" {
+				var err error
+				data, err = base64.StdEncoding.DecodeString(text)
+				if err != nil {
+					panic(vm.NewTypeError("%s: invalid standard Base64 data", name))
+				}
+			}
+			if !filepath.IsAbs(path) {
+				if baseDir == "" {
+					panic(vm.NewGoError(fmt.Errorf("root API configuration path is unavailable for relative file paths")))
+				}
+				path = filepath.Join(baseDir, path)
+			}
+			if err := writeNyanFileAtomically(path, data); err != nil {
+				panic(vm.NewGoError(fmt.Errorf("%s: %w", name, err)))
+			}
+			return vm.ToValue(true)
+		})
+	}
+}
+
+// Write beside the destination and replace it only after the complete content
+// has been written and synced. The destination is never opened for truncation.
+func writeNyanFileAtomically(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".nyan-write-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = temporary.Close()
+		}
+		_ = os.Remove(temporaryPath)
+	}()
+	if err := temporary.Chmod(0600); err != nil {
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		return err
+	}
+	err = temporary.Close()
+	closed = true
+	if err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
+}
+
+// Verification limits are independent of the settings used to generate new hashes.
+// Accept NyanQL's existing numeric ranges, with a canonical PHC representation.
+type parsedArgon2idHash struct {
+	memory      uint32
+	iterations  uint32
+	parallelism uint8
+	salt        []byte
+	digest      []byte
+}
+
+func parseArgon2idHash(encoded string) (parsedArgon2idHash, error) {
+	var parsed parsedArgon2idHash
+	// Each 64-byte unpadded Base64 field is at most 86 characters.
+	const maxEncodedLength = len("$argon2id$v=19$m=262144,t=10,p=16$") + 86 + 1 + 86
+	if len(encoded) > maxEncodedLength {
+		return parsed, fmt.Errorf("Argon2id hash is too long")
+	}
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" || parts[2] != "v=19" {
+		return parsed, fmt.Errorf("invalid Argon2id hash format or version")
+	}
+	parameters := strings.Split(parts[3], ",")
+	if len(parameters) != 3 {
+		return parsed, fmt.Errorf("invalid Argon2id parameters")
+	}
+	var values [3]uint64
+	for i, name := range []string{"m=", "t=", "p="} {
+		if !strings.HasPrefix(parameters[i], name) {
+			return parsed, fmt.Errorf("invalid Argon2id parameters")
+		}
+		number := strings.TrimPrefix(parameters[i], name)
+		value, err := strconv.ParseUint(number, 10, 32)
+		if err != nil || strconv.FormatUint(value, 10) != number {
+			return parsed, fmt.Errorf("invalid Argon2id parameters")
+		}
+		values[i] = value
+	}
+	if values[0] < 65536 || values[0] > 262144 || values[1] < 3 || values[1] > 10 || values[2] < 1 || values[2] > 16 {
+		return parsed, fmt.Errorf("unsafe Argon2id parameters")
+	}
+	parsed.memory, parsed.iterations, parsed.parallelism = uint32(values[0]), uint32(values[1]), uint8(values[2])
+	decode := func(text string, minimum int) ([]byte, error) {
+		if len(text) < base64.RawStdEncoding.EncodedLen(minimum) || len(text) > base64.RawStdEncoding.EncodedLen(64) {
+			return nil, fmt.Errorf("invalid Argon2id field length")
+		}
+		data, err := base64.RawStdEncoding.Strict().DecodeString(text)
+		if err != nil || len(data) < minimum || len(data) > 64 || base64.RawStdEncoding.EncodeToString(data) != text {
+			return nil, fmt.Errorf("invalid Argon2id Base64 field")
+		}
+		return data, nil
+	}
+	var err error
+	parsed.salt, err = decode(parts[4], 16)
+	if err != nil {
+		return parsed, err
+	}
+	parsed.digest, err = decode(parts[5], 16)
+	if err != nil {
+		return parsed, err
+	}
+	return parsed, nil
+}
+
+func verifyBoundedArgon2id(password, encoded string) (bool, error) {
+	if len(password) > 4096 {
+		return false, fmt.Errorf("password is too long")
+	}
+	parsed, err := parseArgon2idHash(encoded)
+	if err != nil {
+		return false, err
+	}
+	// Validate before waiting for a slot or allocating Argon2's work memory.
+	oauthArgon2Slots <- struct{}{}
+	defer func() { <-oauthArgon2Slots }()
+	actual := argon2.IDKey([]byte(password), parsed.salt, parsed.iterations, parsed.memory, parsed.parallelism, uint32(len(parsed.digest)))
+	return subtle.ConstantTimeCompare(actual, parsed.digest) == 1, nil
 }
