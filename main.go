@@ -2266,7 +2266,6 @@ func runOutCheckResponseForAPI(snapshot *APIConfigSnapshot, apiName string, apiM
 		return true, ParamCheckResponse{}, err
 	}
 	if checkResponse.Success {
-		response.Status = checkResponse.Status
 		return false, ParamCheckResponse{}, nil
 	}
 	return true, checkResponse, nil
@@ -3916,8 +3915,7 @@ func invokeOAuthHook(snapshot *APIConfigSnapshot, mcp *MCPServerConfig, runtimeU
 			return &check, nil
 		}
 		if hookName != "oauthValidateAccessToken" {
-			// Keep the validated body and headers, applying the successful check status.
-			response.Status = check.Status
+			// Keep the API's validated status, body and headers after a passed check.
 			return response, nil
 		}
 	}
@@ -6029,12 +6027,8 @@ func handleJSONRPC(c *gin.Context) {
 		ID:      rpcReq.ID,
 	}
 
-	// A successful outCheck controls the HTTP status; preserve the legacy default without it.
-	status := http.StatusOK
-	if getAPIString(scriptInfo, "outCheck", "outcheck") != "" {
-		status = response.Status
-	}
-	c.JSON(jsonRPCResponseStatus(status), rpcResp)
+	// Successful checks preserve the normal JSON-RPC transport status.
+	c.JSON(http.StatusOK, rpcResp)
 }
 
 // JSON-RPC responses require an envelope even when a check selects a status

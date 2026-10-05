@@ -521,7 +521,7 @@ func TestRootHTTPChecksMatchNamedEndpoint(t *testing.T) {
 		{name: "param false with 200", param: `({success:false,status:200,result:"denied"});`, out: allow, status: 200, order: "param,", result: `{"success":false,"status":200,"result":"denied"}`},
 		{name: "param non-200", param: `({success:true,status:202,result:"pending"});`, out: allow, status: 201, order: "param,main,out,push,", result: `{"status":201,"value":"日本語"}`},
 		{name: "out denied", param: allow, out: denyOut, status: 409, order: "param,main,out,", result: `{"success":false,"status":409,"result":{"reason":"output denied"}}`},
-		{name: "out non-200", param: allow, out: `({success:true,status:202,result:"pending"});`, status: 202, order: "param,main,out,push,", result: `{"status":201,"value":"日本語"}`},
+		{name: "out non-200", param: allow, out: `({success:true,status:202,result:"pending"});`, status: 201, order: "param,main,out,push,", result: `{"status":201,"value":"日本語"}`},
 		{name: "checkOnly", param: allow, out: allow, checkOnly: true, status: 200, order: "param,", result: `{"success":true,"status":200,"result":{"checked":true}}`},
 		{name: "checkOnly denied", param: denyParam, out: allow, checkOnly: true, status: 403, order: "param,", result: `{"success":false,"status":403,"result":{"reason":"input denied"}}`},
 		{name: "checkOnly without param", out: allow, checkOnly: true, status: 404, order: "", result: `{"success":false,"status":404,"result":{"message":"No check script for this API"}}`},
@@ -9758,7 +9758,7 @@ func TestPushSourceResultAcrossTransports(t *testing.T) {
 							t.Fatal(err)
 						}
 						wantStatus := tc.status
-						if transport == "jsonrpc" && (tc.failed || tc.name == "exception") {
+						if transport == "jsonrpc" {
 							wantStatus = 200
 						}
 						if response.StatusCode != wantStatus {
@@ -10951,7 +10951,7 @@ func TestMCPBusinessResultAcrossTransports(t *testing.T) {
 	}
 }
 
-// Shared comparison05 contract: success controls passage, outCheck controls final status.
+// A passed output check preserves the API response; only success controls passage.
 func TestCheckSuccessContract(t *testing.T) {
 	for _, route := range []string{"http", "root", "jsonrpc"} {
 		for _, tc := range []struct {
@@ -10962,12 +10962,17 @@ func TestCheckSuccessContract(t *testing.T) {
 			{"param_created", 201, 201, -1, 201, false, true},
 			{"param_forbidden", 403, 201, -1, 201, false, true},
 			{"param_unavailable", 503, 201, -1, 201, false, true},
-			{"out_overrides_created", 200, 201, 200, 200, false, true},
-			{"out_created", 200, 200, 201, 201, false, true},
-			{"out_forbidden", 200, 200, 403, 403, false, false},
-			{"out_unavailable", 200, 200, 503, 503, false, false},
+			{"out_keeps_created", 200, 201, 200, 201, false, true},
+			{"out_created", 200, 200, 201, 200, false, true},
+			{"out_forbidden", 200, 200, 403, 200, false, true},
+			{"out_unavailable", 200, 200, 503, 200, false, true},
 			{"out_preserves_status", 200, 201, -1, 201, false, true},
-			{"original_error_still_suppresses_push", 200, 403, 200, 200, false, false},
+			{"out_no_content", 200, 201, 204, 201, false, true},
+			{"out_reset_content", 200, 201, 205, 201, false, true},
+			{"out_not_modified", 200, 201, 304, 201, false, true},
+			{"out_keeps_redirect", 200, 302, 503, 302, false, true},
+			{"out_keeps_failure", 200, 503, 200, 503, false, false},
+			{"original_error_still_suppresses_push", 200, 403, 200, 403, false, false},
 			{"no_out_check", 503, 200, 0, 200, false, true},
 			{"check_only_created", 201, 200, 503, 201, true, false},
 			{"check_only_unavailable", 503, 200, 201, 503, true, false},
@@ -11021,8 +11026,12 @@ func TestCheckSuccessContract(t *testing.T) {
 				}
 				rec := httptest.NewRecorder()
 				f.server.Config.Handler.ServeHTTP(rec, req)
-				if rec.Code != tc.want {
-					t.Fatalf("HTTP=%d want=%d body=%s", rec.Code, tc.want, rec.Body.String())
+				wantStatus := tc.want
+				if route == "jsonrpc" && !tc.checkOnly {
+					wantStatus = http.StatusOK
+				}
+				if rec.Code != wantStatus {
+					t.Fatalf("HTTP=%d want=%d body=%s", rec.Code, wantStatus, rec.Body.String())
 				}
 				var body map[string]interface{}
 				if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
@@ -11059,7 +11068,7 @@ func TestCheckSuccessContract(t *testing.T) {
 }
 
 func TestPublicSuccessfulCheckStatus(t *testing.T) {
-	for _, status := range []int{200, 201, 403, 503} {
+	for _, status := range []int{200, 201, 204, 205, 304, 403, 503} {
 		for _, method := range []string{http.MethodGet, http.MethodHead} {
 			t.Run(fmt.Sprintf("%s/%d", method, status), func(t *testing.T) {
 				dir := t.TempDir()
@@ -11078,7 +11087,7 @@ func TestPublicSuccessfulCheckStatus(t *testing.T) {
 				rec := httptest.NewRecorder()
 				req := httptest.NewRequest(method, "/assets/data.bin", nil)
 				f.server.Config.Handler.ServeHTTP(rec, req)
-				if rec.Code != status {
+				if rec.Code != http.StatusOK {
 					t.Fatalf("status=%d body=%q", rec.Code, rec.Body.Bytes())
 				}
 				if method == http.MethodGet && !bytes.Equal(rec.Body.Bytes(), data) {
@@ -11097,7 +11106,7 @@ func TestPublicSuccessfulCheckStatus(t *testing.T) {
 
 func TestOAuthSuccessfulCheckStatus(t *testing.T) {
 	for _, paramStatus := range []int{201, 403, 503} {
-		for _, outStatus := range []int{200, 201, 503} {
+		for _, outStatus := range []int{200, 201, 204, 205, 304, 503} {
 			t.Run(fmt.Sprintf("param_%d/out_%d", paramStatus, outStatus), func(t *testing.T) {
 				param := fmt.Sprintf(`({success:true,status:%d});`, paramStatus)
 				out := fmt.Sprintf(`if(nyanAllParams.nyan_output.status!==201) throw new Error("wrong original status"); ({success:true,status:%d,result:"must not replace body"});`, outStatus)
@@ -11107,7 +11116,7 @@ func TestOAuthSuccessfulCheckStatus(t *testing.T) {
 				req.RemoteAddr = t.Name()
 				rec := httptest.NewRecorder()
 				router.ServeHTTP(rec, req)
-				if rec.Code != outStatus || rec.Body.String() != "original" || rec.Header().Get("Location") != "https://client.example/callback/done" {
+				if rec.Code != http.StatusCreated || rec.Body.String() != "original" || rec.Header().Get("Location") != "https://client.example/callback/done" {
 					t.Fatalf("status=%d headers=%v body=%s", rec.Code, rec.Header(), rec.Body.String())
 				}
 			})
@@ -11457,7 +11466,7 @@ func TestMCPPushCompletion(t *testing.T) {
 			{name: "status_string", body: `{"status":"503"}`},
 			{name: "array", body: `[{"success":false}]`},
 			{name: "out_201", body: `{"value":"original"}`, out: `({success:true,status:201});`},
-			{name: "out_503", body: `{"value":"original"}`, out: `({success:true,status:503});`, noPush: true},
+			{name: "out_503", body: `{"value":"original"}`, out: `({success:true,status:503});`},
 			{name: "source_failure_out_200", body: `{"status":503}`, out: `({success:true,status:200});`, noPush: true},
 			{name: "invalid_json", body: `not JSON`, noPush: true, failure: true},
 			{name: "body_too_large", body: `"` + strings.Repeat("x", maxMCPToolResultBytes) + `"`, noPush: true, failure: true},
@@ -12061,7 +12070,7 @@ func TestStructuredScriptResultsAcrossTransports(t *testing.T) {
 							t.Fatal(err)
 						}
 						wantStatus := status
-						if transport == "jsonrpc" && status >= 400 {
+						if transport == "jsonrpc" {
 							wantStatus = 200
 						}
 						if response.StatusCode != wantStatus {
@@ -12474,7 +12483,7 @@ func TestJSONRPCPreservesEnvelopeForBodylessCheckStatus(t *testing.T) {
 				}
 				defer response.Body.Close()
 				wantStatus := status
-				if status == 204 || status == 205 || status == 304 {
+				if stage == "out_allow" || status == 204 || status == 205 || status == 304 {
 					wantStatus = 200
 				}
 				if response.StatusCode != wantStatus {
@@ -12503,9 +12512,7 @@ func TestJSONRPCPreservesEnvelopeForBodylessCheckStatus(t *testing.T) {
 					if result["value"] != "日本語" || len(result) != 1 {
 						t.Fatalf("body replaced: %v", result)
 					}
-					if status < 400 {
-						wantOrder += "push,"
-					}
+					wantOrder += "push,"
 				}
 				order, _ := storage.Load(marker)
 				if order == nil {
@@ -12740,5 +12747,45 @@ func TestExecutionModeDynamicAnchor(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+func TestPublicPassedOutCheckPreservesTransfer(t *testing.T) {
+	for _, checkStatus := range []int{200, 204, 205, 304, 503} {
+		for _, kind := range []string{"range", "head", "not_modified"} {
+			t.Run(fmt.Sprintf("%s/%d", kind, checkStatus), func(t *testing.T) {
+				dir := t.TempDir()
+				if err := os.WriteFile(filepath.Join(dir, "data.txt"), []byte("abcdef"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				out := fmt.Sprintf(`({success:true,status:%d,result:"must not replace file"});`, checkStatus)
+				outPath := filepath.Join(dir, "out.js")
+				writeHotReloadTestFile(t, outPath, out)
+				fixture := newWebSocketCheckFixture(t, map[string]interface{}{"assets": map[string]interface{}{"type": "public", "path": dir, "outCheck": outPath}})
+				handler := fixture.server.Config.Handler
+				method := http.MethodGet
+				if kind == "head" {
+					method = http.MethodHead
+				}
+				req := httptest.NewRequest(method, "/assets/data.txt", nil)
+				wantStatus, wantBody := http.StatusOK, ""
+				switch kind {
+				case "range":
+					req.Header.Set("Range", "bytes=1-3")
+					wantStatus, wantBody = http.StatusPartialContent, "bcd"
+				case "not_modified":
+					req.Header.Set("If-Modified-Since", time.Now().UTC().Add(time.Hour).Format(http.TimeFormat))
+					wantStatus = http.StatusNotModified
+				}
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, req)
+				if rec.Code != wantStatus || rec.Body.String() != wantBody {
+					t.Fatalf("transfer changed: HTTP=%d body=%q want=%d/%q", rec.Code, rec.Body.String(), wantStatus, wantBody)
+				}
+				if kind == "range" && rec.Header().Get("Content-Range") != "bytes 1-3/6" {
+					t.Fatalf("range header lost: %v", rec.Header())
+				}
+			})
+		}
 	}
 }

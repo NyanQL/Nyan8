@@ -414,13 +414,13 @@ if (nyanAllParams.token === "secret") {
 
 チェックの通過・拒否は `success` で判定します。例えば `{success:true,status:403}` も通過します。`paramCheck` が通過した場合は本体へ進み、その `status` を本体のHTTPステータスとしては使用しません。`checkOnly` は本体を実行せず、チェック結果を返します。
 
-`outCheck` が通過した場合、本体の本文・ヘッダーを保持し、最終HTTPステータスを出力チェックの `status` に変更します。本体が201でも、出力チェックが固定の200を返せば最終応答は200です。本体のステータスを維持する出力チェックは次のように書きます。
+`outCheck` は、本体の応答が想定されたデータになっているかを確認する出荷前検査です。`success:true` なら本体のステータス・本文・ヘッダーを保持し、チェックの `status`・`result` で変更しません。例えば、本体が201でチェックが200でも最終応答は201です。チェックが503でも `success:true` なら通過し、本体の成功・失敗やPush可否を変更しません。
 
 ```javascript
-({success: true, status: nyanAllParams.nyan_output.status, result: null});
+({success: true, status: 200, result: null});
 ```
 
-通常HTTP・public・OAuthのHTTP応答とJSON-RPCで、この出力ステータスを使用します。JSON-RPCの本体結果の格納形式は従来どおりで、`outCheck` がない場合のHTTPステータスは従来の200です。publicの出力チェックが200以外を返す場合は、そのステータスでファイル全体を送り、HEADでは本文を省略します。この場合のContent-Typeは、NyanQLと同じくファイル内容から判定します。200の場合は通常のファイル配信処理（Range等）に進みます。
+チェックの `status` は通過時も200〜599の整数を必須とします。拒否は `success:false` で表し、本体の出力を止めて拒否内容を返します。通常HTTP・public・OAuthでは本体や配信処理のステータスを保持し、publicのRange・HEAD・条件付き要求にも通常どおり対応します。JSON-RPCの通常の本体結果は `outCheck` の有無によらずHTTP 200で返します。
 
 MCP・内部呼び出し・WebSocket・Push先のチェックも `success` で通過を判定します。内部呼び出しの戻り値やWebSocketの本文を書き換えるものではありません。MCPのHTTP転送ステータスもチェックのステータスへ変更しません。OAuthの `verifyAccess` ではチェック通過後も、本体の認証判定が必要です。
 
@@ -431,7 +431,7 @@ JSON文字列で返す場合の `status` は `200` のように整数表記に�
 
 JSON-RPCの通常実行では `paramCheck` による拒否を `error.code: -32602`、`error.data` にチェック結果を入れたレスポンスとしてHTTP 200で返します。`checkOnly` または `outCheck` の拒否による応答では、チェック結果を `result` に入れ、HTTPステータスをチェック結果の `status` にします。
 
-JSON-RPCでは、チェックで指定されたHTTPステータスが **204・205・304** の場合だけ **HTTP 200** に置き換え、`jsonrpc`・`id`・`result` を含む本文を必ず返します。出力チェックの通過時、`checkOnly`、出力チェックの拒否時に共通の規則です。`checkOnly`・拒否時の `result.status` は元の値を保持し、通過時は従来どおり本体結果を返します。この置き換えは転送時だけに適用し、チェックの通過判定やPushの実行条件には影響しません。
+JSON-RPCでは、チェックで指定されたHTTPステータスが **204・205・304** の場合だけ **HTTP 200** に置き換え、`jsonrpc`・`id`・`result` を含む本文を必ず返します。`checkOnly` と出力チェックの拒否時に適用します。`checkOnly`・拒否時の `result.status` は元の値を保持し、通過時は従来どおり本体結果を返します。この置き換えは転送時だけに適用し、チェックの通過判定やPushの実行条件には影響しません。
 
 `nyanCallMe()` では、拒否された場合や `checkOnly` の場合にチェック結果のオブジェクトを呼び出し元へ返します。呼び出し元は `success` と `status` を確認してください。呼び出し元のHTTPレスポンスへ直接書き込むことはありません。
 
@@ -897,7 +897,7 @@ console.log(result); // { success: true, status: 200, data: ...}
 - `paramCheck` で拒否されると本体・`outCheck` は実行せず、チェック結果を返します。`outCheck` で拒否されると本体の結果の代わりにチェック結果を返します。
 - `nyan_mode: "checkOnly"` では本体・`outCheck` を実行せず、`paramCheck` の結果を返します。`paramCheck` 未設定時や不正なモード指定時はJavaScript例外になります。
 - `outCheck` には本体の返却内容を `nyan_output.body` などで渡します。JSONオブジェクトに数値の `status` があれば使用し、それ以外は `200` とします。`contentType` は有効なJSONなら `application/json`、それ以外は `text/plain`、`headers` は空のオブジェクトです。本体が `success: false` を返す場合も検査します。チェック通過時の戻り値は従来どおりです。
-- 呼び出し先APIの `push` を、本体と `outCheck` の通過後、戻り値を返す前に実行します。本体結果と出力チェック適用後の `status` が両方とも200～399で、トップレベルの `success` が真偽値の `false` ではない場合が対象です。`status` 省略やプレーンテキストは200として扱います。チェック拒否・実行エラー・`checkOnly` ではPushしません。
+- 呼び出し先APIの `push` を、本体と `outCheck` の通過後、戻り値を返す前に実行します。本体結果の `status` が200～399で、トップレベルの `success` が真偽値の `false` ではない場合が対象です。`status` 省略やプレーンテキストは200として扱います。チェック拒否・実行エラー・`checkOnly` ではPushしません。
 - Push先も `paramCheck` → 本体 → `outCheck` を実行し、全購読接続へtextフレームで配信します。Push先には内部呼び出し先のAPI名と引数、元のリクエスト情報を渡します。Push先の拒否・実行エラーでも、`nyanCallMe()`の戻り値は置き換えません。
 - 親APIにも `push` があれば、親の処理完了時に別途実行します。子のPushは内部呼び出しの完了時点で実行済みなので、その後の親の拒否・エラーでは取り消しません。
 - 本体やチェックの実行、チェックの戻り値の解析に失敗すると JavaScript 側で例外が投げられます。
@@ -1107,7 +1107,7 @@ API本体の実行失敗などでNyan8が返すエラーは次の形式です。
 
 ### JSON-RPCとMCP
 
-JSON-RPC `/nyan-rpc` は `jsonrpc`、`id` と `result` または `error` を持つ形式で返します。成功時は本体が返したJSONオブジェクトから `status` を除いた内容を `result` に入れます。`outCheck` がなければHTTP 200、通過した `outCheck` があればその `status` を使用します。ただし204・205・304は本文を保持するためHTTP 200に置き換えます。チェック処理による応答は「paramCheck / outCheck」の説明を参照してください。
+JSON-RPC `/nyan-rpc` は `jsonrpc`、`id` と `result` または `error` を持つ形式で返します。成功時は本体が返したJSONオブジェクトから `status` を除いた内容を `result` に入れます。`outCheck` の有無によらず、本体結果のHTTP転送ステータスは200です。通過した出力チェックでステータスを変更しません。チェック処理による応答は「paramCheck / outCheck」の説明を参照してください。
 
 ```json
 {
