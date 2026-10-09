@@ -13559,3 +13559,56 @@ func TestReceiveAdmissionWebSocketSlotReleasedOnBodyRejection(t *testing.T) {
 	}
 	release()
 }
+
+func TestExecutionModeDraftIdentifierReferences(t *testing.T) {
+	for _, tc := range []struct {
+		name, draft, identifier string
+		preserve                bool
+	}{
+		{"draft4_anchor", "http://json-schema.org/draft-04/schema#", `"id":"#Input",`, true},
+		{"draft4_resource", "http://json-schema.org/draft-04/schema#", `"id":"urn:test:input",`, true},
+		{"draft7_anchor", "http://json-schema.org/draft-07/schema#", `"$id":"#Input",`, true},
+		{"modern_id_annotation", "https://json-schema.org/draft/2020-12/schema", `"id":"#Input",`, false},
+		{"draft4_data_id", "http://json-schema.org/draft-04/schema#", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var original map[string]interface{}
+			raw := fmt.Sprintf(`{"$schema":%q,"$ref":"#/definitions/Input","definitions":{"Input":{%s"type":"object","properties":{"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}}}`, tc.draft, tc.identifier)
+			if err := json.Unmarshal([]byte(raw), &original); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := compileMCPJSONSchema(original); err != nil {
+				t.Fatalf("original: %v", err)
+			}
+			before, _ := json.Marshal(original)
+			normalized := normalizedMCPInputSchema(original)
+			compiled, err := compileMCPJSONSchema(normalized)
+			if err != nil {
+				t.Fatalf("normalized: %v", err)
+			}
+			after, _ := json.Marshal(original)
+			if !bytes.Equal(before, after) {
+				t.Fatal("original mutated")
+			}
+			if !reflect.DeepEqual(normalized, normalizedMCPInputSchema(normalized)) {
+				t.Fatal("normalization is not idempotent")
+			}
+			if tc.preserve && normalized["$ref"] != original["$ref"] {
+				t.Fatal("identified resource was copied")
+			}
+			if err := compiled.Validate(map[string]interface{}{"id": 123}); err != nil {
+				t.Fatalf("valid input rejected: %v", err)
+			}
+			if err := compiled.Validate(map[string]interface{}{"id": "wrong"}); err == nil {
+				t.Fatal("invalid id accepted")
+			}
+			if err := compiled.Validate(map[string]interface{}{}); err == nil {
+				t.Fatal("required id ignored")
+			}
+			err = compiled.Validate(map[string]interface{}{"id": 123, "nyan_mode": "checkOnly"})
+			if (err != nil) != tc.preserve {
+				t.Fatalf("mode extension changed: %v", err)
+			}
+		})
+	}
+}

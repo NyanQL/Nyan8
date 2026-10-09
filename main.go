@@ -2145,6 +2145,13 @@ func normalizedMCPInputSchema(schema map[string]interface{}) map[string]interfac
 				if _, hasID := object["$id"].(string); hasID {
 					return
 				}
+				// Draft-04 uses id for resource and anchor identity. Use the
+				// compiler's resolved dialect, not a keyword-name heuristic.
+				if compiled.Ref.DraftVersion == 4 {
+					if _, hasID := object["id"].(string); hasID {
+						return
+					}
+				}
 			}
 		}
 		source, ok := target.(map[string]interface{})
