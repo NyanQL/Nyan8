@@ -67,8 +67,194 @@ type ErrorData struct {
 	Message string `json:"message"`
 }
 
-// Config は設定データを表します。
+// ReceiveLimitsConfig bounds incoming bodies and WebSocket messages, in bytes.
+// Zero keeps a safe default; negative limits are configuration errors.
+type ReceiveLimitsConfig struct {
+	HTTPBodyBytes         int64 `json:"httpBodyBytes"`
+	WebSocketMessageBytes int64 `json:"webSocketMessageBytes"`
+}
+
+const defaultReceiveBytes int64 = 20 << 20
+
+// receiveByteCount accepts legacy byte counts and human-readable binary units.
+type receiveByteCount int64
+
+func (count *receiveByteCount) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	var value int64
+	if len(data) > 0 && data[0] == '"' {
+		var text string
+		if err := json.Unmarshal(data, &text); err != nil {
+			return err
+		}
+		text = strings.ToUpper(strings.TrimSpace(text))
+		end := 0
+		for end < len(text) && text[end] >= '0' && text[end] <= '9' {
+			end++
+		}
+		if end == 0 {
+			return fmt.Errorf("receiveLimits requires a non-negative integer with an optional B, KB, MB or GB unit")
+		}
+		parsed, err := strconv.ParseInt(text[:end], 10, 64)
+		if err != nil {
+			return fmt.Errorf("receiveLimits byte count is out of range")
+		}
+		var multiplier int64
+		switch strings.TrimSpace(text[end:]) {
+		case "", "B":
+			multiplier = 1
+		case "KB", "KIB":
+			multiplier = 1 << 10
+		case "MB", "MIB":
+			multiplier = 1 << 20
+		case "GB", "GIB":
+			multiplier = 1 << 30
+		default:
+			return fmt.Errorf("receiveLimits has an invalid size unit (use B, KB, MB or GB)")
+		}
+		if parsed > math.MaxInt64/multiplier {
+			return fmt.Errorf("receiveLimits byte count is out of range")
+		}
+		value = parsed * multiplier
+	} else if err := json.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("receiveLimits requires an integer byte count or a size string: %w", err)
+	}
+	if value < 0 {
+		return fmt.Errorf("receiveLimits values must be non-negative byte counts")
+	}
+	*count = receiveByteCount(value)
+	return nil
+}
+
+func (limits *ReceiveLimitsConfig) UnmarshalJSON(data []byte) error {
+	var decoded struct {
+		HTTPBodyBytes         receiveByteCount `json:"httpBodyBytes"`
+		WebSocketMessageBytes receiveByteCount `json:"webSocketMessageBytes"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*limits = ReceiveLimitsConfig{HTTPBodyBytes: int64(decoded.HTTPBodyBytes), WebSocketMessageBytes: int64(decoded.WebSocketMessageBytes)}
+	return nil
+}
+
+func (limits ReceiveLimitsConfig) httpBodyBytes() int64 {
+	if limits.HTTPBodyBytes > 0 {
+		return limits.HTTPBodyBytes
+	}
+	return defaultReceiveBytes
+}
+
+func (limits ReceiveLimitsConfig) webSocketMessageBytes() int64 {
+	if limits.WebSocketMessageBytes > 0 {
+		return limits.WebSocketMessageBytes
+	}
+	return defaultReceiveBytes
+}
+
+// Avoid net/http draining a body that the rejected client may never send.
+func closeUnreadRequestBody(w http.ResponseWriter, r *http.Request) {
+	if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
+		r.Close = true
+		if r.ProtoMajor < 2 {
+			w.Header().Set("Connection", "close")
+		}
+	}
+}
+
+// Read only after the route's header-based authentication and admission checks.
+// Never close a partially read server body here: Close can drain unread bytes
+// and delay an error response while the peer has stopped sending.
+func readBoundedRequestBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, error) {
+	var body []byte
+	var err error
+	if r.ContentLength > limit {
+		err = &http.MaxBytesError{Limit: limit}
+	} else if r.Body != nil {
+		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	}
+	if err != nil {
+		// Gin's writer does not expose net/http's private requestTooLarge hook.
+		// Explicitly disable HTTP/1 reuse so the server does not drain the body
+		// before flushing a rejection. HTTP/2 closes only the affected stream.
+		r.Close = true
+		if w != nil && r.ProtoMajor < 2 {
+			w.Header().Set("Connection", "close")
+		}
+	}
+	return body, err
+}
+
+func enforceReceiveBodyLimit(w http.ResponseWriter, r *http.Request) bool {
+	limit := globalConfig.ReceiveLimits.httpBodyBytes()
+	body, err := readBoundedRequestBody(w, r, limit)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body is too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+		}
+		return false
+	}
+	// Keep MaxBytesReader visible to ParseForm, which otherwise adds a 10 MiB cap.
+	r.Body = http.MaxBytesReader(w, io.NopCloser(bytes.NewReader(body)), limit)
+	return true
+}
+
+// HTTPTimeoutsConfig controls HTTP transport deadlines; zero uses defaults.
+type HTTPTimeoutsConfig struct {
+	ReadHeaderTimeout httpTimeoutDuration `json:"readHeaderTimeout"`
+	ReadTimeout       httpTimeoutDuration `json:"readTimeout"`
+	WriteTimeout      httpTimeoutDuration `json:"writeTimeout"`
+	IdleTimeout       httpTimeoutDuration `json:"idleTimeout"`
+}
+
+type httpTimeoutDuration time.Duration
+
+func (duration *httpTimeoutDuration) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		*duration = 0
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(data, &text); err != nil {
+		return fmt.Errorf("httpTimeouts requires a duration string such as 30s or 20m: %w", err)
+	}
+	value, err := time.ParseDuration(strings.TrimSpace(text))
+	if err != nil || value < 0 {
+		return fmt.Errorf("httpTimeouts requires a non-negative duration such as 30s or 20m")
+	}
+	*duration = httpTimeoutDuration(value)
+	return nil
+}
+
+func (duration httpTimeoutDuration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(duration).String())
+}
+
+func (duration httpTimeoutDuration) orDefault(fallback time.Duration) time.Duration {
+	if duration > 0 {
+		return time.Duration(duration)
+	}
+	return fallback
+}
+
+func newConfiguredHTTPServer(address string, handler http.Handler, timeouts HTTPTimeoutsConfig) *http.Server {
+	return &http.Server{
+		Addr:              address,
+		Handler:           handler,
+		ReadHeaderTimeout: timeouts.ReadHeaderTimeout.orDefault(30 * time.Second),
+		ReadTimeout:       timeouts.ReadTimeout.orDefault(20 * time.Minute),
+		WriteTimeout:      timeouts.WriteTimeout.orDefault(30 * time.Minute),
+		IdleTimeout:       timeouts.IdleTimeout.orDefault(5 * time.Minute),
+		MaxHeaderBytes:    1 << 20,
+	}
+}
+
 type Config struct {
+	HTTPTimeouts      HTTPTimeoutsConfig  `json:"httpTimeouts"`
+	ReceiveLimits     ReceiveLimitsConfig `json:"receiveLimits"`
 	Name              string              `json:"name"`
 	Profile           string              `json:"profile"`
 	Version           string              `json:"version"`
@@ -397,8 +583,9 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.SetTrustedProxies(nil) // 信頼するプロキシの設定を解除
-	r.Use(CORSMiddleware())
 	r.Use(RecoveryMiddleware())
+	r.Use(CORSMiddleware())
+	r.Use(receiveLimitMiddleware())
 
 	// 静的なルート（favicon.ico）
 	r.NoRoute(func(c *gin.Context) {
@@ -433,15 +620,8 @@ func main() {
 		fatalServiceError("key_path_invalid", err)
 	}
 
-	server := &http.Server{
-		Addr:              listenAddress,
-		Handler:           h2c.NewHandler(r, &http2.Server{}),
-		ReadTimeout:       30 * time.Second,
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-		MaxHeaderBytes:    1 << 20,
-		ErrorLog:          httpServerErrorLogger(),
-	}
+	server := newConfiguredHTTPServer(listenAddress, receiveLimitH2CHandler(r, config.HTTPTimeouts), config.HTTPTimeouts)
+	server.ErrorLog = httpServerErrorLogger()
 	if config.ProxyProtocol.Enabled {
 		serviceLog(slog.LevelInfo, "proxy_protocol_enabled")
 	}
@@ -1103,13 +1283,16 @@ func handleAPIRequest(c *gin.Context) {
 
 // handleWebSocket はWebSocketリクエストを処理します。
 func handleWebSocket(c *gin.Context) {
-	release, acquired := acquireWebSocketConnection(webSocketMaxConnections())
-	if !acquired {
-		c.Header("Retry-After", "1")
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "WebSocket connection limit reached"})
-		return
+	if !c.GetBool("nyan_websocket_slot_acquired") {
+		release, acquired := acquireWebSocketConnection(webSocketMaxConnections())
+		if !acquired {
+			c.Header("Retry-After", "1")
+			closeUnreadRequestBody(c.Writer, c.Request)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "WebSocket connection limit reached"})
+			return
+		}
+		defer release()
 	}
-	defer release()
 	// Resolve and check the subscription target before upgrading or registering it.
 	execPath, err := filepath.Abs(filepath.Dir(os.Args[0]))
 	if err != nil {
@@ -1169,11 +1352,15 @@ func handleWebSocket(c *gin.Context) {
 		return
 	}
 
+	// Handshake checks are complete. Do not retain the buffered HTTP body
+	// throughout the lifetime of the WebSocket connection.
+	c.Request.Body = http.NoBody
 	rawConn, err := upgrader.Upgrade(c.Writer, c.Request, c.Writer.Header())
 	if err != nil {
 		logServiceError(slog.LevelWarn, "websocket_upgrade_failed", err)
 		return
 	}
+	rawConn.SetReadLimit(globalConfig.ReceiveLimits.webSocketMessageBytes())
 	conn := &serverWebSocket{Conn: rawConn}
 	// An upgraded connection is long-lived; clear the HTTP read deadline.
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
@@ -2759,8 +2946,6 @@ func validMCPRequestHostname(hostname string) bool {
 }
 
 func handleMCPHTTP(c *gin.Context, snapshot *APIConfigSnapshot, mcp *MCPServerConfig) {
-	clearWriteDeadline := setProtectedResponseWriteDeadline(c)
-	defer clearWriteDeadline()
 	c.Header("Cache-Control", "no-store")
 	runtimeURLs, err := deriveMCPRuntimeURLs(c.Request, mcp)
 	if err != nil {
@@ -2783,6 +2968,7 @@ func handleMCPHTTP(c *gin.Context, snapshot *APIConfigSnapshot, mcp *MCPServerCo
 	}
 	if allowed, retryAfter := mcpRateLimitAllows(mcp.Name, mcp.RateLimit, c.Request.RemoteAddr, time.Now()); !allowed {
 		c.Header("Retry-After", strconv.Itoa(max(1, int(math.Ceil(retryAfter.Seconds())))))
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
 		return
 	}
@@ -2795,7 +2981,15 @@ func handleMCPHTTP(c *gin.Context, snapshot *APIConfigSnapshot, mcp *MCPServerCo
 		c.JSON(http.StatusNotAcceptable, gin.H{"error": "Accept must include application/json and text/event-stream"})
 		return
 	}
-	body, err := readLimitedRequestBody(c.Request, maxMCPRequestBytes)
+	release, acquired := acquireMCPExecutionSlot(mcp.Name, mcpMaxConcurrent(mcp))
+	if !acquired {
+		c.Header("Retry-After", "1")
+		closeUnreadRequestBody(c.Writer, c.Request)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MCP server is busy"})
+		return
+	}
+	defer release()
+	body, err := readLimitedRequestBody(c.Request, globalConfig.ReceiveLimits.httpBodyBytes(), c.Writer)
 	if err != nil {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body is too large"})
 		return
@@ -2820,13 +3014,6 @@ func handleMCPHTTP(c *gin.Context, snapshot *APIConfigSnapshot, mcp *MCPServerCo
 		mcpWriteError(c, nil, -32600, "Invalid Request")
 		return
 	}
-	release, acquired := acquireMCPExecutionSlot(mcp.Name, mcpMaxConcurrent(mcp))
-	if !acquired {
-		c.Header("Retry-After", "1")
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MCP server is busy"})
-		return
-	}
-	defer release()
 	if request.JSONRPC != "2.0" || strings.TrimSpace(request.Method) == "" || !validMCPRequestID(request.ID) {
 		mcpWriteError(c, nil, -32600, "Invalid Request")
 		return
@@ -2878,19 +3065,6 @@ func handleMCPHTTP(c *gin.Context, snapshot *APIConfigSnapshot, mcp *MCPServerCo
 	}
 }
 
-func setProtectedResponseWriteDeadline(c *gin.Context) func() {
-	if c == nil || c.Writer == nil {
-		return func() {}
-	}
-	controller := http.NewResponseController(c.Writer)
-	if err := controller.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
-		return func() {}
-	}
-	return func() {
-		_ = controller.SetWriteDeadline(time.Time{})
-	}
-}
-
 func mcpAcceptsJSONAndEventStream(value string) bool {
 	hasJSON := false
 	hasEventStream := false
@@ -2905,18 +3079,15 @@ func mcpAcceptsJSONAndEventStream(value string) bool {
 	return hasJSON && hasEventStream
 }
 
-func readLimitedRequestBody(request *http.Request, limit int64) ([]byte, error) {
-	if request == nil || request.Body == nil {
+func readLimitedRequestBody(request *http.Request, limit int64, writers ...http.ResponseWriter) ([]byte, error) {
+	if request == nil {
 		return nil, nil
 	}
-	data, err := io.ReadAll(io.LimitReader(request.Body, limit+1))
-	if err != nil {
-		return nil, err
+	var writer http.ResponseWriter
+	if len(writers) > 0 {
+		writer = writers[0]
 	}
-	if int64(len(data)) > limit {
-		return nil, fmt.Errorf("body exceeds limit")
-	}
-	return data, nil
+	return readBoundedRequestBody(writer, request, limit)
 }
 
 func validMCPRequestID(id json.RawMessage) bool {
@@ -3580,8 +3751,6 @@ func writeMCPCORSHeaders(c *gin.Context, mcp *MCPServerConfig, requestOrigin str
 }
 
 func handleOAuthHTTP(c *gin.Context, snapshot *APIConfigSnapshot, mcp *MCPServerConfig, apiName, role string) {
-	clearWriteDeadline := setProtectedResponseWriteDeadline(c)
-	defer clearWriteDeadline()
 	c.Header("Cache-Control", "no-store")
 	runtimeURLs, err := deriveMCPRuntimeURLs(c.Request, mcp)
 	if err != nil {
@@ -3614,10 +3783,22 @@ func handleOAuthHTTP(c *gin.Context, snapshot *APIConfigSnapshot, mcp *MCPServer
 	limit := oauthRateLimitForHook(mcp, hookName)
 	if allowed, retryAfter := mcpRateLimitAllows(mcp.Name+":oauth:"+hookName, limit, c.Request.RemoteAddr, time.Now()); !allowed {
 		c.Header("Retry-After", strconv.Itoa(max(1, int(math.Ceil(retryAfter.Seconds())))))
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
 		return
 	}
-	params, err := oauthRequestParams(c.Request)
+	release, acquired := acquireMCPExecutionSlot(mcp.Name+":oauth:"+hookName, oauthMaxConcurrentForHook(mcp, hookName))
+	if !acquired {
+		c.Header("Retry-After", "1")
+		closeUnreadRequestBody(c.Writer, c.Request)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "OAuth endpoint is busy"})
+		return
+	}
+	defer release()
+	if c.Request.Method != http.MethodPost && !enforceReceiveBodyLimit(c.Writer, c.Request) {
+		return
+	}
+	params, err := oauthRequestParams(c.Request, c.Writer)
 	if err != nil {
 		if strings.Contains(err.Error(), "too large") {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body is too large"})
@@ -3626,13 +3807,6 @@ func handleOAuthHTTP(c *gin.Context, snapshot *APIConfigSnapshot, mcp *MCPServer
 		}
 		return
 	}
-	release, acquired := acquireMCPExecutionSlot(mcp.Name+":oauth:"+hookName, oauthMaxConcurrentForHook(mcp, hookName))
-	if !acquired {
-		c.Header("Retry-After", "1")
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "OAuth endpoint is busy"})
-		return
-	}
-	defer release()
 	value, err := invokeOAuthHook(snapshot, mcp, runtimeURLs, hookName, params)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "OAuth hook failed"})
@@ -3733,7 +3907,7 @@ func oauthMaxConcurrentForHook(mcp *MCPServerConfig, hook string) int {
 	}
 }
 
-func oauthRequestParams(request *http.Request) (map[string]interface{}, error) {
+func oauthRequestParams(request *http.Request, writers ...http.ResponseWriter) (map[string]interface{}, error) {
 	params := map[string]interface{}{
 		"method":       request.Method,
 		"request_path": request.URL.Path,
@@ -3758,7 +3932,7 @@ func oauthRequestParams(request *http.Request) (map[string]interface{}, error) {
 	if request.Method != http.MethodPost {
 		return params, nil
 	}
-	body, err := readLimitedRequestBody(request, maxMCPRequestBytes)
+	body, err := readLimitedRequestBody(request, globalConfig.ReceiveLimits.httpBodyBytes(), writers...)
 	if err != nil {
 		return nil, fmt.Errorf("request body is too large")
 	}
@@ -8159,6 +8333,7 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
 	if err != nil {
 		return fmt.Errorf("dial failed: %w", err)
 	}
+	conn.SetReadLimit(globalConfig.ReceiveLimits.webSocketMessageBytes())
 	if !runtime.acceptConnection(conn, cfg.connectURL) {
 		_ = conn.Close()
 		return nil
@@ -8385,4 +8560,52 @@ func verifyBoundedArgon2id(password, encoded string) (bool, error) {
 	defer func() { <-oauthArgon2Slots }()
 	actual := argon2.IDKey([]byte(password), parsed.salt, parsed.iterations, parsed.memory, parsed.parallelism, uint32(len(parsed.digest)))
 	return subtle.ConstantTimeCompare(actual, parsed.digest) == 1, nil
+}
+
+func receiveLimitMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Protected transports own their admission checks and bounded body read.
+		if dispatchMCPOrOAuth(c) {
+			c.Abort()
+			return
+		}
+		if websocket.IsWebSocketUpgrade(c.Request) {
+			release, acquired := acquireWebSocketConnection(webSocketMaxConnections())
+			if !acquired {
+				closeUnreadRequestBody(c.Writer, c.Request)
+				c.Header("Retry-After", "1")
+				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "WebSocket connection limit reached"})
+				return
+			}
+			defer release()
+			c.Set("nyan_websocket_slot_acquired", true)
+		}
+		if !enforceReceiveBodyLimit(c.Writer, c.Request) {
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// h2c buffers Upgrade bodies before Gin admission. Handle body-bearing
+// Upgrade requests as ordinary HTTP/1 requests; empty upgrades and HTTP/2
+// prior knowledge remain supported without pre-admission body buffering.
+func receiveLimitH2CHandler(next http.Handler, timeouts HTTPTimeoutsConfig) http.Handler {
+	handler := h2c.NewHandler(next, &http2.Server{IdleTimeout: timeouts.IdleTimeout.orDefault(5 * time.Minute)})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, value := range r.Header.Values("Upgrade") {
+			for _, token := range strings.Split(value, ",") {
+				if strings.EqualFold(strings.TrimSpace(token), "h2c") {
+					if r.ContentLength != 0 {
+						next.ServeHTTP(w, r)
+						return
+					}
+					handler.ServeHTTP(w, r)
+					return
+				}
+			}
+		}
+		handler.ServeHTTP(w, r)
+	})
 }
