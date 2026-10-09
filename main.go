@@ -158,6 +158,9 @@ func closeUnreadRequestBody(w http.ResponseWriter, r *http.Request) {
 		r.Close = true
 		if r.ProtoMajor < 2 {
 			w.Header().Set("Connection", "close")
+			// Stop net/http's post-response body drain without expiring writes.
+			// ResponseController also unwraps Gin's response writer.
+			_ = http.NewResponseController(w).SetReadDeadline(time.Now())
 		}
 	}
 }
@@ -180,6 +183,9 @@ func readBoundedRequestBody(w http.ResponseWriter, r *http.Request, limit int64)
 		r.Close = true
 		if w != nil && r.ProtoMajor < 2 {
 			w.Header().Set("Connection", "close")
+			// Stop net/http's post-response body drain without expiring writes.
+			// ResponseController also unwraps Gin's response writer.
+			_ = http.NewResponseController(w).SetReadDeadline(time.Now())
 		}
 	}
 	return body, err

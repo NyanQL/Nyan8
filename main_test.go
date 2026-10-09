@@ -13365,11 +13365,18 @@ func TestReceiveAdmissionChunkedStopsAtLimit(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			reader := bufio.NewReader(conn)
+			response, err := http.ReadResponse(reader, nil)
 			if err != nil {
 				t.Fatalf("%s waited for unread body: %v", path, err)
 			}
 			defer response.Body.Close()
+			if _, err := io.ReadAll(response.Body); err != nil {
+				t.Fatalf("413 response body stalled: %v", err)
+			}
+			if _, err := reader.ReadByte(); err != io.EOF {
+				t.Fatalf("connection remains after 413; want EOF, got %v", err)
+			}
 			if response.StatusCode != 413 || response.Header.Get("Access-Control-Allow-Origin") == "" {
 				t.Fatalf("%s response=%v", path, response)
 			}
@@ -13485,29 +13492,41 @@ func TestReceiveAdmissionBusyRespondsWithoutBody(t *testing.T) {
 
 func assertEarlyBusyResponse(t *testing.T, handler http.Handler, path, contentType string) {
 	t.Helper()
-	server := httptest.NewServer(handler)
-	defer server.Close()
-	conn, err := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-	// Deliberately send headers only, without the declared body.
-	_, err = fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: service.example\r\nContent-Type: %s\r\nAccept: application/json, text/event-stream\r\nContent-Length: 32\r\n\r\n", path, contentType)
-	if err != nil {
-		t.Fatal(err)
-	}
-	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
-	if err != nil {
-		t.Fatalf("early rejection waited for body: %v", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != 503 || !response.Close {
-		t.Fatalf("status=%d close=%v", response.StatusCode, response.Close)
-	}
-	if _, err := io.ReadAll(response.Body); err != nil {
-		t.Fatalf("response body stalled: %v", err)
+	assertEarlyRejectionEOF(t, handler, path, contentType, http.StatusServiceUnavailable)
+}
+
+func assertEarlyRejectionEOF(t *testing.T, handler http.Handler, path, contentType string, status int) {
+	t.Helper()
+	for _, framing := range []string{"Content-Length: 32", "Transfer-Encoding: chunked"} {
+		t.Run(framing, func(t *testing.T) {
+			server := httptest.NewServer(handler)
+			defer server.Close()
+			conn, err := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+			_, err = fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: service.example\r\nContent-Type: %s\r\nAccept: application/json, text/event-stream\r\n%s\r\n\r\n", path, contentType, framing)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader := bufio.NewReader(conn)
+			response, err := http.ReadResponse(reader, nil)
+			if err != nil {
+				t.Fatalf("early rejection waited for body: %v", err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != status || !response.Close {
+				t.Fatalf("status=%d close=%v", response.StatusCode, response.Close)
+			}
+			if _, err := io.ReadAll(response.Body); err != nil {
+				t.Fatalf("response body stalled: %v", err)
+			}
+			if _, err := reader.ReadByte(); err != io.EOF {
+				t.Fatalf("connection remains after rejection; want EOF, got %v", err)
+			}
+		})
 	}
 }
 
@@ -13611,4 +13630,14 @@ func TestExecutionModeDraftIdentifierReferences(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReceiveAdmissionRateRejectionClosesConnection(t *testing.T) {
+	handler, name := newReceiveAdmissionHandler(t, true)
+	seed := httptest.NewRequest("POST", "http://service.example/"+name, nil)
+	seed.RemoteAddr = "127.0.0.1:1"
+	seed.Header.Set("Content-Type", "application/json")
+	seed.Header.Set("Accept", "application/json, text/event-stream")
+	handler.ServeHTTP(httptest.NewRecorder(), seed)
+	assertEarlyRejectionEOF(t, handler, "/"+name, "application/json", http.StatusTooManyRequests)
 }
