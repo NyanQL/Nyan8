@@ -1,14 +1,4 @@
 {
-  "httpTimeouts": {
-    "readHeaderTimeout": "30s",
-    "readTimeout": "20m",
-    "writeTimeout": "30m",
-    "idleTimeout": "5m"
-  },
-  "receiveLimits": {
-    "httpBodyBytes": "20MB",
-    "webSocketMessageBytes": "20MB"
-  },
   "name": "にゃんぱち",
   "profile": "にゃんぱちの説明です。",
   "version": "0.0.1",
@@ -18,10 +8,6 @@
   "javascript_include": [
     "./javascript/base.js"
   ],
-  "APIHotReload": {
-    "Enabled": true,
-    "Interval": "1s"
-  },
   "log": {
     "Filename": "./logs/nyan8.log",
     "MaxSize": 5,
@@ -30,6 +16,16 @@
     "Compress": true,
     "EnableLogging": false,
     "Level": "info"
+  },
+  "httpTimeouts": {
+    "readHeaderTimeout": "30s",
+    "readTimeout": "20m",
+    "writeTimeout": "30m",
+    "idleTimeout": "5m"
+  },
+  "receiveLimits": {
+    "httpBodyBytes": "20MB",
+    "webSocketMessageBytes": "20MB"
   },
   "smtp": {
     "host": "",
@@ -42,5 +38,9 @@
     "default_bcc": [
       ""
     ]
+  },
+  "APIHotReload": {
+    "Enabled": true,
+    "Interval": "1s"
   }
 }

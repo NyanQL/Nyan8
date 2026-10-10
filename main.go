@@ -1752,6 +1752,7 @@ func CORSMiddleware() gin.HandlerFunc {
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE")
 
 		if c.Request.Method == "OPTIONS" {
+			closeUnreadRequestBody(c.Writer, c.Request)
 			c.AbortWithStatus(204)
 			return
 		}
@@ -2962,20 +2963,24 @@ func handleMCPHTTP(c *gin.Context, snapshot *APIConfigSnapshot, mcp *MCPServerCo
 	c.Header("Cache-Control", "no-store")
 	runtimeURLs, err := deriveMCPRuntimeURLs(c.Request, mcp)
 	if err != nil {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusMisdirectedRequest, gin.H{"error": "Host is not allowed"})
 		return
 	}
 	if !mcpOriginAllowed(c.GetHeader("Origin"), mcp, runtimeURLs.Origin) {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusForbidden, gin.H{"error": "Origin is not allowed"})
 		return
 	}
 	writeMCPCORSHeaders(c, mcp, runtimeURLs.Origin)
 	if c.Request.Method == http.MethodOptions {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.Status(http.StatusNoContent)
 		return
 	}
 	if c.Request.Method != http.MethodPost {
 		c.Header("Allow", "POST, OPTIONS")
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.Status(http.StatusMethodNotAllowed)
 		return
 	}
@@ -2987,10 +2992,12 @@ func handleMCPHTTP(c *gin.Context, snapshot *APIConfigSnapshot, mcp *MCPServerCo
 	}
 	contentType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
 	if err != nil || contentType != "application/json" {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusUnsupportedMediaType, gin.H{"error": "Content-Type must be application/json"})
 		return
 	}
 	if !mcpAcceptsJSONAndEventStream(c.GetHeader("Accept")) {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusNotAcceptable, gin.H{"error": "Accept must include application/json and text/event-stream"})
 		return
 	}
@@ -3767,29 +3774,35 @@ func handleOAuthHTTP(c *gin.Context, snapshot *APIConfigSnapshot, mcp *MCPServer
 	c.Header("Cache-Control", "no-store")
 	runtimeURLs, err := deriveMCPRuntimeURLs(c.Request, mcp)
 	if err != nil {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusMisdirectedRequest, gin.H{"error": "Host is not allowed"})
 		return
 	}
 	if !mcpOriginAllowed(c.GetHeader("Origin"), mcp, runtimeURLs.Origin) {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusForbidden, gin.H{"error": "Origin is not allowed"})
 		return
 	}
 	writeOAuthCORSHeaders(c, mcp, runtimeURLs.Origin)
 	if c.Request.Method == http.MethodOptions {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.Status(http.StatusNoContent)
 		return
 	}
 	if role == "oauthValidateAccessToken" || apiName == mcp.OAuth.VerifyAccess {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.Status(http.StatusNotFound)
 		return
 	}
 	hookName := role
 	if !oauthMethodAllowed(hookName, c.Request.Method) {
 		c.Header("Allow", oauthAllowedMethods(hookName))
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.Status(http.StatusMethodNotAllowed)
 		return
 	}
 	if err := validateOAuthContentType(hookName, c.Request); err != nil {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusUnsupportedMediaType, gin.H{"error": "unsupported Content-Type"})
 		return
 	}
