@@ -2,10 +2,14 @@
 
 
 **Nyan8（にゃんぱち）** は Go 言語で実装されたサーバーサイド JavaScript 実行環境です。
-JavaScript エンジンに [**Goja**](https://github.com/dop251/goja) を採用し、ECMAScript 5.1 準拠のスクリプトを安全かつ高速に実行できます。
+JavaScript エンジンに [**Goja**](https://github.com/dop251/goja) を採用し、ECMAScript 5.1 準拠のスクリプトを実行できます。通常のJavaScriptは信頼できる管理者が用意する前提です。
 javascriptを書くだけで 手軽にAPIサービスを作れます。
 
 ---
+
+このREADMEは、Version1方針を反映したリポジトリの現行ソースを説明します。配布バイナリを使う場合は、ダウンロードしたリリースと同じタグのREADME・リリースノートを参照してください。現行ソースの機能が過去のバイナリにも含まれるとは限りません。`config.json` の `version` はサービスの表示用設定値で、バイナリの版を判定する値ではありません。
+
+はじめに：[最小起動例](#quickstart)、[公開・運用の前提](#deployment)。
 
 ## 1  特徴
 
@@ -35,6 +39,57 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
    ./Nyan8   # Windows は Nyan8.exe
    ```
 
+### ソースからのビルド
+
+[go.mod](go.mod)に記載されたGoバージョン（現時点では1.26.9）を用意し、リポジトリのルートで `go build -o Nyan8 .` を実行します。Windowsでは `go build -o Nyan8.exe .` です。配布バイナリを使う場合はGoのインストールは不要です。
+
+<a id="quickstart"></a>
+### 最小起動例：固定JSONを返す
+
+実行ファイルのあるディレクトリに新しい `quickstart` フォルダを作り、次の3ファイルを保存します。同梱のapi.jsonや、別途用意するサンプルJSに依存しません。
+
+`quickstart/config.json`：
+
+```json
+{
+  "name": "Nyan8 quickstart",
+  "Port": 8080,
+  "bindAddress": "127.0.0.1",
+  "certPath": "",
+  "keyPath": "",
+  "javascript_include": [],
+  "log": {"EnableLogging": false, "Level": "info"}
+}
+```
+
+`quickstart/api.json`：
+
+```json
+{
+  "hello": {"script": "./hello.js", "description": "固定JSONを返す"}
+}
+```
+
+`quickstart/hello.js`：
+
+```javascript
+({status: 200, result: {message: "Hello, Nyan8!"}});
+```
+
+macOS/Linuxでは次のように起動します。Windowsでは実行ファイルを `.\Nyan8.exe` に読み替えます。
+
+```bash
+./Nyan8 --config ./quickstart/config.json --api ./quickstart/api.json
+```
+
+別のターミナルで確認します。
+
+```bash
+curl http://127.0.0.1:8080/hello
+```
+
+HTTP 200で `{"status":200,"result":{"message":"Hello, Nyan8!"}}` が返ります。終了は起動したターミナルで `Ctrl+C` です。この例はloopbackだけで待ち受け、認証を設定していません。公開前に[公開・運用の前提](#deployment)を確認してください。
+
 ### 2-1  設定ファイルのパス指定
 
 Nyan8 は起動時に `api.json` と `config.json` の読み込みパスを指定できます。
@@ -55,6 +110,8 @@ JavaScriptの `nyanGetFile` / `nyanReadFileB64` / `nyanSendMailAttachment` と `
 ## 3  設定ファイル
 
 ### 3‑1  `config.json`
+
+以下のJSONCは各項目を説明する例です。実際のconfig.jsonはコメントなしのJSONにし、TLSファイル・共通JSを用意するか、HTTPで試す場合はcertPath/keyPathを空文字、javascript_includeを空配列にします。まず動かす場合は[最小起動例](#quickstart)を使ってください。
 
 ```jsonc
 {
@@ -340,6 +397,13 @@ MCPの `tools/call` に対するトークン認証と、OAuthスクリプト内�
 }
 ```
 
+`javascript/ws/receiver_main.js` は、次の内容で利用者が用意してください。以下の動作確認では、[api.json](api.json)が参照する他のJSも必要です。不要な `hello2` やschedule定義は削除するか参照ファイルを準備してから使用してください。
+
+```javascript
+console.log(nyanAllParams.ws_message_text);
+"";
+```
+
 受信したメッセージは `nyanAllParams.ws_message_text` に入り、`script` で指定した JavaScript へ渡されます。戻り値は文字列化され、前後の空白を除去してから上流の WebSocket へテキストメッセージとして送信されます。空文字または空白だけの結果では返信しません。
 
 動作確認には、`api.json` の `add` に `push: "hello"` を指定したサンプル構成を使います。
@@ -403,7 +467,14 @@ schedule は HTTP リクエストから実行されないため、`nyanGetRemote
 
 schedule 定義自体には `paramCheck` / `outCheck` / `push` は適用されません。`nyanCallMe()` で通常APIを呼び出す場合は、呼び出し先の `paramCheck` / `outCheck` が実行されます。呼び出し先APIに `push` があれば、そのAPIのチェックと本体が成功した後にPushも実行します。
 
-動作確認例の [api.json](./api.json) にある `schedule_debug_every_minute` と [javascript/schedule_debug.js](./javascript/schedule_debug.js) は、HTTPサーバーモードで1分ごとに実行されます。`info` ではジョブ名と結果のバイト数を含む完了ログを記録します。スクリプトが `console.log` へ渡す実行時刻などの本文を確認する場合は、`log.Level` を `debug` に設定してください。
+動作確認例の [api.json](./api.json) にある `schedule_debug_every_minute` は、HTTPサーバーモードで1分ごとに実行されます。参照先の `javascript/schedule_debug.js` は、次の内容で利用者が用意してください。
+
+```javascript
+console.log(nyanAllParams.nyan_schedule_time);
+"";
+```
+
+`info` ではジョブ名と結果のバイト数を含む完了ログを記録します。スクリプトが `console.log` へ渡す実行時刻などの本文を確認する場合は、`log.Level` を `debug` に設定してください。
 
 ### paramCheck / outCheck
 
@@ -498,15 +569,7 @@ JSON-RPCでは、チェックで指定されたHTTPステータスが **204・20
 curl "http://localhost:8080/secure_add?token=secret&nyan_mode=checkOnly"
 ```
 
-対応するHTTPエンドポイントで `paramCheck` 未設定の場合は、次のレスポンスを返します。JSON-RPCでは同じオブジェクトが `result` に入ります。
-
-```json
-{
-  "success": true,
-  "status": 200,
-  "result": null
-}
-```
+`paramCheck` 未設定の `checkOnly` は成功しません。通常HTTP・public・WebSocket接続前はHTTP 404、JSON-RPCはHTTP 400・`error.code: -32602`を返します。本体・outCheck・Pushは実行しません。その他の経路は前述の実行モードの説明に従います。
 
 #### outCheck の入力
 
@@ -1178,6 +1241,17 @@ MCPの本体結果を返す際、`structuredContent` に相当するJSONオブ�
 `success: true`、省略、文字列の `"false"`、`null`、数値、入れ子にある `success: false` は、この条件ではエラーにしません。入力・出力チェック、スキーマ検証、実行エラーなどの既存の判定は引き続き適用します。失敗結果をスキーマ検証で許可したい場合は、その結果形式も出力スキーマに含めてください。
 
 `paramCheck` / `outCheck` による拒否時と `checkOnly` 時は、チェック結果を `content` と `structuredContent` に返します。チェック結果の `status` はHTTPステータスを変更しません。拒否時は `isError: true`、成功した `checkOnly` は `isError: false` です。
+
+<a id="deployment"></a>
+## 公開・運用の前提
+
+通常のAPI・共通JavaScriptは、信頼できる管理者が管理してください。スクリプトはサービス実行ユーザーの権限でHostExec、ファイル操作、外部通信を行えます。config、include先のAPI定義、JSと配置ディレクトリの書込権限を限定します。相対パスの基準はファイルアクセスを隔離する境界ではなく、絶対パスや `../` もOS権限の範囲で使えます。APIHotReloadを止めてもJSは実行時に読み込まれます。
+
+最小例の `bindAddress: "127.0.0.1"` は同じ端末からの接続だけを受けます。省略・空文字の場合は全インターフェースで待ち受けます。公開時は到達元・portをOSやネットワークで制限し、必要なAPIだけを定義してください。
+
+通常API・JSON-RPC・public・WebSocketに一括で利用者認証を付ける設定はありません。必要な認証・認可は各APIのparamCheck等で実装します。MCPのOAuth、allowedOrigins、securitySchemesは通常APIの別経路を自動では保護しません。Toolの参照先APIへ直接HTTP/RPCで到達できる構成も考慮してください。WebSocketの接続許可とPushの購読範囲も用途に合わせて確認します。通常CORSは全Originを許可し、CORSやOrigin制限自体は認証ではありません。
+
+外部公開ではcertPath/keyPathに証明書と秘密鍵を指定してHTTPSを使用します。MCP/OAuthの公開URLは実際のリクエストのschemeとHostから生成し、X-Forwarded-Proto等で自動補正しません。proxyでTLSを終端する場合は、Nyan8までの接続もTLSとし公開Hostを保持するなど、issuer/resourceが公開URLと一致する構成を確認してください。PROXY protocolの設定は公開URLのscheme設定ではありません。OAuthの状態・秘密鍵・認証情報をpublicフォルダや配布物へ含めないでください。
 
 ## 7 MCPサーバ対応
 
