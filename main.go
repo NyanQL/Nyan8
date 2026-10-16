@@ -400,7 +400,7 @@ type MailAttachment struct {
 var (
 	// BinaryVersion can be set at build time with:
 	// go build -ldflags "-X main.BinaryVersion=vX.Y.Z"
-	BinaryVersion = "v0.0.20"
+	BinaryVersion = "v1.0.21"
 )
 
 const (
