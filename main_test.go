@@ -13733,3 +13733,771 @@ func TestReceiveAdmissionOAuthEarlyRejectionEOF(t *testing.T) {
 		})
 	}
 }
+
+// BEGIN shared nyanCallMCP conformance tests.
+type nyanMCPFixture struct {
+	mu        sync.Mutex
+	methods   []string
+	calls     int
+	modern    bool
+	sse       bool
+	output    any
+	result    json.RawMessage
+	delay     time.Duration
+	rpc       bool
+	status    int
+	malformed bool
+	paged     bool
+}
+
+func (f *nyanMCPFixture) response(data []byte) []byte {
+	var req struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+		Params map[string]any  `json:"params"`
+	}
+	_ = json.Unmarshal(data, &req)
+	f.mu.Lock()
+	f.methods = append(f.methods, req.Method)
+	if req.Method == "tools/call" {
+		f.calls++
+	}
+	f.mu.Unlock()
+	if len(req.ID) == 0 {
+		return nil
+	}
+	var result any
+	var rpcError any
+	switch req.Method {
+	case "server/discover":
+		if f.modern {
+			result = map[string]any{"resultType": "complete", "supportedVersions": []string{"2026-07-28"}, "capabilities": map[string]any{"tools": map[string]any{}}}
+		} else {
+			rpcError = map[string]any{"code": -32601, "message": "legacy"}
+		}
+	case "initialize":
+		result = map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{"tools": map[string]any{}}, "serverInfo": map[string]any{"name": "fixture", "version": "1"}}
+	case "tools/list":
+		tool := map[string]any{"name": "echo", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"n": map[string]any{"type": "integer"}}, "additionalProperties": false}}
+		if f.output != nil {
+			tool["outputSchema"] = f.output
+		}
+		if f.paged && req.Params["cursor"] == nil {
+			result = map[string]any{"tools": []any{}, "nextCursor": "second"}
+		} else {
+			result = map[string]any{"tools": []any{tool}}
+		}
+	case "tools/call":
+		if f.rpc {
+			rpcError = map[string]any{"code": -32602, "message": "SERVER_SECRET_DO_NOT_LEAK"}
+		} else {
+			result = f.result
+		}
+	default:
+		rpcError = map[string]any{"code": -32601, "message": "unknown"}
+	}
+	response := map[string]any{"jsonrpc": "2.0", "id": req.ID}
+	if rpcError != nil {
+		response["error"] = rpcError
+	} else {
+		response["result"] = result
+	}
+	out, _ := json.Marshal(response)
+	return out
+}
+func (f *nyanMCPFixture) serve(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "DELETE" {
+		w.WriteHeader(204)
+		return
+	}
+	data, _ := io.ReadAll(r.Body)
+	var req struct {
+		Method string `json:"method"`
+	}
+	_ = json.Unmarshal(data, &req)
+	response := f.response(data)
+	if req.Method == "tools/call" {
+		if f.delay > 0 {
+			select {
+			case <-time.After(f.delay):
+			case <-r.Context().Done():
+				return
+			}
+		}
+		if f.status != 0 {
+			w.WriteHeader(f.status)
+			if f.rpc {
+				_, _ = w.Write(response)
+			} else {
+				_, _ = w.Write([]byte("SERVER_SECRET_DO_NOT_LEAK"))
+			}
+			return
+		}
+		if f.malformed {
+			response = []byte("not JSON")
+		}
+	}
+	if len(response) == 0 {
+		w.WriteHeader(202)
+		return
+	}
+	if f.sse && req.Method == "tools/call" {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "event: message\ndata: %s\n\n", response)
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(response)
+	}
+}
+func nyanMCPTestManager(t *testing.T, f *nyanMCPFixture) (*nyanMCPManager, string) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(f.serve))
+	t.Cleanup(server.Close)
+	script := filepath.Join(t.TempDir(), "caller.js")
+	if err := os.WriteFile(script, []byte("0"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := nyanMCPConfig{Connections: map[string]nyanMCPConnectionConfig{"local": {Transport: "streamable_http", URL: server.URL, AllowHTTP: true, AllowedCIDRs: []string{"127.0.0.0/8", "::1/128"}, CredentialMode: "service", AllowedScripts: []string{script}, Tools: map[string]nyanMCPToolPolicy{"echo": {ReadOnly: true}}, ProtocolVersions: []string{"2025-06-18", "2026-07-28"}, AllowQLRead: true}}}
+	data, _ := json.Marshal(cfg)
+	path := filepath.Join(t.TempDir(), "client.json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := loadNyanMCPConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manager, script
+}
+func nyanMCPTestVM(manager *nyanMCPManager, ctx context.Context, script, mode string) *goja.Runtime {
+	vm := goja.New()
+	registerNyanMCP(vm, manager, ctx, script, mode)
+	return vm
+}
+func nyanMCPTestCode(t *testing.T, vm *goja.Runtime, source, code, state string) {
+	t.Helper()
+	value, err := vm.RunString(`(function(){try{` + source + `;return 'NO_ERROR'}catch(e){return [e.name,e.code,e.executionState,e.message,e.rpcCode||0].join('|')}})()`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := value.String()
+	if !strings.HasPrefix(got, "NyanMCPError|"+code+"|"+state+"|") || strings.Contains(got, "SERVER_SECRET") {
+		t.Fatalf("got %q, want %s/%s", got, code, state)
+	}
+}
+func TestNyanMCPResults(t *testing.T) {
+	for _, sse := range []bool{false, true} {
+		for _, structured := range []string{`{"count":0}`, `false`, `0`, `null`, `""`, `[]`, `[1,2]`, `true`, `"ok"`, `1.25`, ``} {
+			t.Run(fmt.Sprintf("sse=%v/%s", sse, structured), func(t *testing.T) {
+				raw := `{"resultType":"complete","content":[{"type":"text","text":"{\"count\":0}","annotations":{"audience":["user"]}},{"type":"image","mimeType":"image/png","data":"aGVsbG8="},{"type":"audio","mimeType":"audio/wav","data":"AA=="},{"type":"resource_link","uri":"https://example.invalid/no-fetch","name":"r"},{"type":"resource","resource":{"uri":"file:///never-read","text":"opaque"}}],"_meta":{"source":"fixture"},"vendorExtension":{"x":1},"isError":false`
+				if structured != "" {
+					raw += `,"structuredContent":` + structured
+				}
+				raw += `}`
+				f := &nyanMCPFixture{modern: true, sse: sse, result: json.RawMessage(raw), paged: true}
+				manager, script := nyanMCPTestManager(t, f)
+				vm := nyanMCPTestVM(manager, context.Background(), script, "operation")
+				value, err := vm.RunString(`JSON.stringify(nyanCallMCP({connection:'local',tool:'echo',arguments:{n:1}}))`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var want, got any
+				_ = json.Unmarshal([]byte(raw), &want)
+				_ = json.Unmarshal([]byte(value.String()), &got)
+				if !reflect.DeepEqual(want, got) {
+					t.Fatalf("result changed: %s", value)
+				}
+				if f.calls != 1 {
+					t.Fatalf("calls=%d", f.calls)
+				}
+			})
+		}
+	}
+}
+func TestNyanMCPLegacyAndErrors(t *testing.T) {
+	cases := []struct {
+		name, raw, code string
+		modern, rpc     bool
+		status          int
+		output          any
+	}{
+		{name: "legacy", raw: `{"content":[],"structuredContent":{"n":0}}`},
+		{name: "legacy-null", raw: `{"content":[],"structuredContent":null}`, code: "UNSUPPORTED_RESULT"},
+		{name: "tool-error", raw: `{"content":[{"type":"text","text":"failure"}],"isError":true}`, output: map[string]any{"type": "object", "required": []string{"x"}}},
+		{name: "rpc", rpc: true, code: "MCP_RPC"},
+		{name: "rpc-http-400", rpc: true, status: 400, code: "MCP_RPC"},
+		{name: "content-invalid", modern: true, raw: `{"content":[{"type":"text"}]}`, code: "UNSUPPORTED_RESULT"},
+		{name: "http-auth", status: 401, code: "AUTH_REQUIRED", raw: `{"content":[]}`},
+		{name: "http", status: 500, code: "TRANSPORT", raw: `{"content":[]}`},
+		{name: "large-number", modern: true, raw: `{"content":[],"structuredContent":9007199254740993}`, code: "NUMBER_RANGE"},
+		{name: "output", modern: true, raw: `{"content":[],"structuredContent":false}`, output: map[string]any{"type": "object"}, code: "OUTPUT_SCHEMA"},
+		{name: "output-null", modern: true, raw: `{"content":[],"structuredContent":null}`, output: map[string]any{"type": "null"}},
+		{name: "output-missing", modern: true, raw: `{"content":[]}`, output: map[string]any{"type": "null"}, code: "OUTPUT_SCHEMA"},
+		{name: "input-required", modern: true, raw: `{"resultType":"input_required","inputRequests":{},"requestState":"opaque"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &nyanMCPFixture{modern: tc.modern, result: json.RawMessage(tc.raw), rpc: tc.rpc, status: tc.status, output: tc.output}
+			manager, script := nyanMCPTestManager(t, f)
+			vm := nyanMCPTestVM(manager, context.Background(), script, "operation")
+			source := `nyanCallMCP({connection:'local',tool:'echo'})`
+			if tc.code != "" {
+				nyanMCPTestCode(t, vm, source, tc.code, "unknown")
+			} else {
+				if _, err := vm.RunString(source); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !tc.modern {
+				if !strings.Contains(strings.Join(f.methods, ","), "initialize,notifications/initialized,tools/list,tools/call") {
+					t.Fatal(f.methods)
+				}
+			}
+			if f.calls != 1 {
+				t.Fatalf("must not retry, calls=%d", f.calls)
+			}
+		})
+	}
+}
+func TestNyanMCPInputAndAuthorization(t *testing.T) {
+	f := &nyanMCPFixture{modern: true, result: json.RawMessage(`{"content":[]}`)}
+	manager, script := nyanMCPTestManager(t, f)
+	vm := nyanMCPTestVM(manager, context.Background(), script, "operation")
+	for _, source := range []string{
+		`nyanCallMCP()`, `nyanCallMCP(null)`, `nyanCallMCP([])`, `nyanCallMCP({connection:'local',tool:'echo'},1)`,
+		`nyanCallMCP({connection:'local',tool:'echo',url:'http://bad'})`,
+		`nyanCallMCP({connection:'local',tool:'echo',arguments:null})`, `nyanCallMCP({connection:'local',tool:'echo',arguments:[]})`,
+		`nyanCallMCP({connection:'local',tool:'echo',arguments:{n:undefined}})`, `nyanCallMCP({connection:'local',tool:'echo',arguments:{n:NaN}})`,
+		`nyanCallMCP({connection:'local',tool:'echo',arguments:{n:Infinity}})`, `nyanCallMCP({connection:'local',tool:'echo',arguments:{n:()=>1}})`,
+		`nyanCallMCP({connection:'local',tool:'echo',arguments:{n:new Date()}})`, `nyanCallMCP({connection:'local',tool:'echo',arguments:{n:9007199254740992}})`,
+		`nyanCallMCP({connection:'local',tool:'echo',options:{timeoutMs:0}})`, `nyanCallMCP({connection:'local',tool:'echo',options:{timeoutMs:120001}})`,
+		`nyanCallMCP({connection:'local',tool:'echo',options:{unknown:1}})`, `nyanCallMCP({connection:'local',tool:'echo',arguments:{toJSON(){throw 'getter ran'}}})`,
+		`nyanCallMCP({get connection(){throw 'getter ran'},tool:'echo'})`,
+		`var cycle={};cycle.self=cycle;nyanCallMCP({connection:'local',tool:'echo',arguments:cycle})`,
+		`nyanCallMCP(new Proxy({},{ownKeys(){throw 'trap ran'}}))`,
+		`nyanCallMCP({connection:'local',tool:'echo',arguments:{nested:new Proxy({},{ownKeys(){throw 'trap ran'}})}})`,
+		`nyanCallMCP({connection:'local',tool:'echo',arguments:{x:[,1]}})`,
+	} {
+		nyanMCPTestCode(t, vm, source, "INVALID_ARGUMENT", "not_sent")
+	}
+	nyanMCPTestCode(t, vm, `nyanCallMCP({connection:'bad',tool:'echo'})`, "CONNECTION_NOT_ALLOWED", "not_sent")
+	nyanMCPTestCode(t, vm, `nyanCallMCP({connection:'local',tool:'bad'})`, "TOOL_NOT_ALLOWED", "not_sent")
+	nyanMCPTestCode(t, vm, `nyanCallMCP({connection:'local',tool:'echo',arguments:{n:'1'}})`, "INPUT_SCHEMA", "not_sent")
+	manager.endpoints["local"].config.AllowedScripts = nil
+	nyanMCPTestCode(t, vm, `nyanCallMCP({connection:'local',tool:'echo'})`, "CALLER_NOT_ALLOWED", "not_sent")
+	if f.calls != 0 {
+		t.Fatal("invalid request sent")
+	}
+}
+func TestNyanMCPLimitsAndCancellation(t *testing.T) {
+	for _, name := range []string{"timeout", "cancel", "size", "protocol", "ql-disabled", "ql-write", "render-write", "busy", "ssrf", "malformed"} {
+		t.Run(name, func(t *testing.T) {
+			f := &nyanMCPFixture{modern: true, result: json.RawMessage(`{"content":[]}`)}
+			manager, script := nyanMCPTestManager(t, f)
+			ep := manager.endpoints["local"]
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			mode := "operation"
+			code, state := "", "not_sent"
+			switch name {
+			case "timeout":
+				f.delay = time.Second
+				ep.config.TimeoutMs = 40
+				code, state = "TIMEOUT", "unknown"
+			case "cancel":
+				cancel()
+				code = "CANCELLED"
+			case "size":
+				ep.config.MaxResultBytes = 512
+				f.result = json.RawMessage(`{"content":[{"type":"text","text":"` + strings.Repeat("x", 1024) + `"}]}`)
+				code, state = "RESULT_TOO_LARGE", "unknown"
+			case "protocol":
+				ep.config.ProtocolVersions = []string{"2025-06-18"}
+				code = "PROTOCOL_VERSION"
+			case "ql-disabled":
+				mode = "ql"
+				ep.config.AllowQLRead = false
+				code = "QL_TRANSACTION"
+			case "ql-write":
+				mode = "ql"
+				ep.config.Tools["echo"] = nyanMCPToolPolicy{}
+				code = "QL_TRANSACTION"
+			case "render-write":
+				mode = "render"
+				ep.config.Tools["echo"] = nyanMCPToolPolicy{}
+				code = "RENDER_WRITE_FORBIDDEN"
+			case "busy":
+				ep.slots = make(chan struct{}, 1)
+				ep.slots <- struct{}{}
+				code = "BUSY"
+			case "ssrf":
+				ep.networks = nil
+				code = "CONNECTION_NOT_ALLOWED"
+			case "malformed":
+				f.malformed = true
+				code, state = "TRANSPORT", "unknown"
+			}
+			vm := nyanMCPTestVM(manager, ctx, script, mode)
+			started := time.Now()
+			nyanMCPTestCode(t, vm, `nyanCallMCP({connection:'local',tool:'echo'})`, code, state)
+			if name == "timeout" && time.Since(started) > time.Second {
+				t.Fatal("cancellation did not release call")
+			}
+		})
+	}
+}
+func TestNyanMCPStdioHelper(t *testing.T) {
+	if os.Getenv("NYAN_MCP_TEST_CHILD") == "" {
+		return
+	}
+	f := &nyanMCPFixture{result: json.RawMessage(`{"content":[{"type":"text","text":"stdio"}],"structuredContent":{"count":0}}`)}
+	scan := bufio.NewScanner(os.Stdin)
+	for scan.Scan() {
+		var request struct {
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal(scan.Bytes(), &request)
+		if request.Method == "tools/call" && os.Getenv("NYAN_MCP_TEST_CHILD") == "delay" {
+			time.Sleep(5 * time.Second)
+		}
+		response := f.response(scan.Bytes())
+		if response != nil {
+			fmt.Println(string(response))
+		}
+	}
+	os.Exit(0)
+}
+func TestNyanMCPStdio(t *testing.T) {
+	f := &nyanMCPFixture{}
+	manager, script := nyanMCPTestManager(t, f)
+	ep := manager.endpoints["local"]
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(t.TempDir(), "child")
+	if err := os.WriteFile(secret, []byte("1"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ep.config.Transport = "stdio"
+	ep.config.Executable = exe
+	ep.config.Args = []string{"-test.run=^TestNyanMCPStdioHelper$"}
+	ep.config.Directory = t.TempDir()
+	ep.config.EnvironmentFiles = map[string]string{"NYAN_MCP_TEST_CHILD": secret}
+	vm := nyanMCPTestVM(manager, context.Background(), script, "operation")
+	value, err := vm.RunString(`nyanCallMCP({connection:'local',tool:'echo'}).content[0].text`)
+	if err != nil || value.String() != "stdio" {
+		t.Fatalf("value=%v err=%v", value, err)
+	}
+}
+func TestNyanMCPSecurityHelpers(t *testing.T) {
+	ep := &nyanMCPEndpoint{}
+	for _, address := range []string{"127.0.0.1", "::1", "169.254.169.254", "100.100.100.200", "10.0.0.1", "192.168.1.2", "fc00::1", "0.0.0.0", "224.0.0.1", "100.64.0.1"} {
+		if ep.permitsIP(net.ParseIP(address)) {
+			t.Fatal(address)
+		}
+	}
+	if !ep.permitsIP(net.ParseIP("8.8.8.8")) {
+		t.Fatal("public IP rejected")
+	}
+	if nyanMCPSchema(map[string]any{"$ref": "file:///etc/passwd"}, map[string]any{}) == nil {
+		t.Fatal("external schema accepted")
+	}
+	secret := filepath.Join(t.TempDir(), "secret")
+	_ = os.WriteFile(secret, []byte("secret"), 0644)
+	if _, err := nyanMCPSecret(secret); err == nil {
+		t.Fatal("world readable credential accepted")
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	_ = os.WriteFile(path, []byte(`{"connections":{},"unknown":true}`), 0600)
+	if _, err := loadNyanMCPConfig(path); err == nil {
+		t.Fatal("unknown config field accepted")
+	}
+}
+
+// END shared nyanCallMCP conformance tests.
+
+func TestNyanMCPConcurrentCancellationAndShutdown(t *testing.T) {
+	f := &nyanMCPFixture{modern: true, result: json.RawMessage(`{"content":[],"structuredContent":0}`), delay: 100 * time.Millisecond}
+	manager, script := nyanMCPTestManager(t, f)
+	var wg sync.WaitGroup
+	errorsCh := make(chan error, 4)
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			raw, err := manager.call(context.Background(), script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+			if err != nil {
+				errorsCh <- err
+			} else if !bytes.Contains(raw, []byte(`"structuredContent":0`)) {
+				errorsCh <- fmt.Errorf("wrong response")
+			}
+		}()
+	}
+	wg.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		t.Error(err)
+	}
+	// Cancellation during an already-sent call must remain unknown, release its
+	// slot, and not turn into a second tools/call.
+	f.delay = time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan *nyanMCPError, 1)
+	go func() {
+		_, err := manager.call(ctx, script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+		done <- err
+	}()
+	deadline := time.After(time.Second)
+	for {
+		f.mu.Lock()
+		calls := f.calls
+		f.mu.Unlock()
+		if calls == 5 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("call never started")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil || err.Code != "CANCELLED" || err.ExecutionState != "unknown" {
+			t.Fatalf("%+v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancel did not unblock")
+	}
+	if len(manager.slots) != 0 || len(manager.endpoints["local"].slots) != 0 {
+		t.Fatal("slot leaked")
+	}
+	manager.cancel()
+	_, err := manager.call(context.Background(), script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+	if err == nil || err.Code != "CANCELLED" {
+		t.Fatalf("shutdown: %+v", err)
+	}
+}
+func TestNyanMCPGuardDoesNotExecuteUserCode(t *testing.T) {
+	manager := newNyanMCPManager()
+	vm := nyanMCPTestVM(manager, context.Background(), "", "operation")
+	_, err := vm.RunString(`var ran=0; var evil={get connection(){ran++;return 'local'},tool:'echo'}; JSON.stringify=()=>{ran++;return '{}'}; Object.prototype.hasOwnProperty=()=>true; Number.isInteger=()=>true; Array.prototype.indexOf=()=>{ran++;return -1};`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nyanMCPTestCode(t, vm, `nyanCallMCP(evil)`, "INVALID_ARGUMENT", "not_sent")
+	if vm.Get("ran").ToInteger() != 0 {
+		t.Fatal("implicit user code executed")
+	}
+}
+func TestNyanMCPScheduleStopCancelsContext(t *testing.T) {
+	job := newScheduleRuntime(scheduleJobConfig{})
+	ctx, done := job.beginMCPExecution()
+	defer done()
+	job.update(nil)
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("job removal did not cancel")
+	}
+}
+
+func TestNyanMCPNyan8Integration(t *testing.T) {
+	initTestLogger()
+	f := &nyanMCPFixture{modern: true, result: json.RawMessage(`{"content":[],"structuredContent":false}`)}
+	manager, script := nyanMCPTestManager(t, f)
+	old := nyanMCPClient
+	nyanMCPClient = manager
+	t.Cleanup(func() { nyanMCPClient = old })
+	writeHotReloadTestFile(t, script, `JSON.stringify(nyanCallMCP({connection:'local',tool:'echo'}))`)
+	value, err := runJavaScriptForAPI(nil, "caller", script, nil, nil)
+	if err != nil || !strings.Contains(value, `"structuredContent":false`) {
+		t.Fatalf("value=%s err=%v", value, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(ctx)
+	_, err = runJavaScriptForAPI(nil, "caller", script, nil, &gin.Context{Request: request})
+	if err == nil || !strings.Contains(err.Error(), "CANCELLED") {
+		t.Fatal(err)
+	}
+}
+
+func TestNyanMCPHTTPPolicyAndCredentialRotation(t *testing.T) {
+	f := &nyanMCPFixture{modern: true, result: json.RawMessage(`{"content":[]}`)}
+	manager, script := nyanMCPTestManager(t, f)
+	var mu sync.Mutex
+	var auths, versions []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auths = append(auths, r.Header.Get("Authorization"))
+		versions = append(versions, r.Header.Get("MCP-Protocol-Version"))
+		mu.Unlock()
+		if r.Header.Get("Cookie") != "" {
+			t.Error("inbound cookie forwarded")
+		}
+		f.serve(w, r)
+	}))
+	defer server.Close()
+	ep := manager.endpoints["local"]
+	ep.config.URL = server.URL
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	ep.config.BearerTokenFile = tokenFile
+	for _, token := range []string{"test-token-A", "test-token-B"} {
+		if err := os.WriteFile(tokenFile, []byte(token), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := manager.call(context.Background(), script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(auths) != 6 {
+		t.Fatalf("requests=%d", len(auths))
+	}
+	for i, auth := range auths {
+		want := "Bearer test-token-A"
+		if i >= 3 {
+			want = "Bearer test-token-B"
+		}
+		if auth != want || versions[i] != "2026-07-28" {
+			t.Fatalf("auth/negotiated version mismatch at %d", i)
+		}
+	}
+}
+func TestNyanMCPRedirectAndTLS(t *testing.T) {
+	for _, kind := range []string{"redirect", "tls"} {
+		t.Run(kind, func(t *testing.T) {
+			f := &nyanMCPFixture{modern: true, result: json.RawMessage(`{"content":[]}`)}
+			manager, script := nyanMCPTestManager(t, f)
+			var server *httptest.Server
+			if kind == "redirect" {
+				server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					http.Redirect(w, r, manager.endpoints["local"].config.URL+"/other", http.StatusFound)
+				}))
+			} else {
+				server = httptest.NewTLSServer(http.HandlerFunc(f.serve))
+			}
+			defer server.Close()
+			manager.endpoints["local"].config.URL = server.URL
+			_, err := manager.call(context.Background(), script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+			if err == nil || err.Code != "TRANSPORT" || err.ExecutionState != "not_sent" {
+				t.Fatalf("%+v", err)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.calls != 0 {
+				t.Fatal("unauthorized redirect/TLS call")
+			}
+		})
+	}
+}
+func TestNyanMCPSSEIgnoresOtherEventTypes(t *testing.T) {
+	f := &nyanMCPFixture{modern: true, result: json.RawMessage(`{"content":[],"structuredContent":false}`)}
+	manager, script := nyanMCPTestManager(t, f)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, _ := io.ReadAll(r.Body)
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal(data, &req)
+		response := f.response(data)
+		if req.Method != "tools/call" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(response)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "event: message\ndata: %s\n\nevent: ignored\ndata: %s\n\n", response, strings.ReplaceAll(string(response), "false", "true"))
+	}))
+	defer server.Close()
+	manager.endpoints["local"].config.URL = server.URL
+	raw, err := manager.call(context.Background(), script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+	if err != nil || !bytes.Contains(raw, []byte(`"structuredContent":false`)) {
+		t.Fatalf("raw=%s err=%v", raw, err)
+	}
+}
+
+func TestNyanMCPGuardWithPrototypePollution(t *testing.T) {
+	vm := nyanMCPTestVM(newNyanMCPManager(), context.Background(), "", "operation")
+	_, err := vm.RunString(`var ran=0; var evil={get connection(){ran++;return 'local'},tool:'echo'};Object.defineProperty(Object.prototype,'value',{get:function(){ran++;return 'local'}});Array.prototype[Symbol.iterator]=function(){ran++;throw 0};`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = vm.RunString(`try{nyanCallMCP(evil)}catch(e){}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vm.Get("ran").ToInteger() != 0 {
+		t.Fatal("prototype callback executed")
+	}
+}
+
+func TestNyanMCPStdioTimeoutReapsChild(t *testing.T) {
+	manager, script := nyanMCPTestManager(t, &nyanMCPFixture{})
+	ep := manager.endpoints["local"]
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "mode")
+	if err := os.WriteFile(file, []byte("delay"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ep.config.Transport = "stdio"
+	ep.config.Executable = exe
+	ep.config.Args = []string{"-test.run=^TestNyanMCPStdioHelper$"}
+	ep.config.Directory = t.TempDir()
+	ep.config.EnvironmentFiles = map[string]string{"NYAN_MCP_TEST_CHILD": file}
+	ep.config.TimeoutMs = 500
+	started := time.Now()
+	_, failure := manager.call(context.Background(), script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+	if failure == nil || failure.Code != "TIMEOUT" || failure.ExecutionState != "unknown" {
+		t.Fatalf("%+v", failure)
+	}
+	if time.Since(started) > 2*time.Second || len(manager.slots) != 0 {
+		t.Fatal("child cleanup exceeded deadline or leaked slot")
+	}
+}
+
+func TestNyanMCPBackgroundContextPreservesAbsentRequest(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	source := nyanMCPGinWithContext(nil, ctx)
+	nested := readOnlyScriptRequestContext(source)
+	if source.Request != nil || nested.Request != nil {
+		t.Fatal("background execution invented an HTTP request")
+	}
+	cancel()
+	if nyanMCPGinParent(nested).Err() != context.Canceled {
+		t.Fatal("nested cancellation lost")
+	}
+}
+
+func TestNyanMCPHTTPCloseRespectsCallContext(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		duringCall bool
+	}{
+		{name: "timeout-before-close", duringCall: true},
+		{name: "timeout-during-close"},
+		{name: "parent-deadline-during-close"},
+		{name: "parent-cancel-during-close"},
+		{name: "shutdown-during-close"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &nyanMCPFixture{result: json.RawMessage(`{"content":[]}`)}
+			if tc.duringCall {
+				f.delay = time.Minute
+			}
+			manager, script := nyanMCPTestManager(t, f)
+			defer manager.cancel()
+			ep := manager.endpoints["local"]
+			ep.config.TimeoutMs = 5000
+			ep.config.MaxTimeoutMs = 5000
+			if strings.HasPrefix(tc.name, "timeout-") {
+				ep.config.TimeoutMs = 250
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.name == "parent-deadline-during-close" {
+				var deadlineCancel context.CancelFunc
+				ctx, deadlineCancel = context.WithTimeout(ctx, 250*time.Millisecond)
+				defer deadlineCancel()
+			}
+			callStarted := make(chan struct{})
+			closeStarted := make(chan struct{})
+			closeCancelled := make(chan struct{})
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					close(closeStarted)
+					// Send headers and then stall the body, exercising the entire
+					// HTTP exchange rather than only the response-header timeout.
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte("{"))
+					w.(http.Flusher).Flush()
+					select {
+					case <-r.Context().Done():
+						close(closeCancelled)
+					case <-release:
+					}
+					return
+				}
+				data, _ := io.ReadAll(r.Body)
+				r.Body = io.NopCloser(bytes.NewReader(data))
+				var req struct {
+					Method string `json:"method"`
+				}
+				_ = json.Unmarshal(data, &req)
+				if req.Method == "initialize" {
+					w.Header().Set("Mcp-Session-Id", "close-context-test")
+				}
+				if req.Method == "tools/call" {
+					close(callStarted)
+				}
+				f.serve(w, r)
+			}))
+			defer server.Close()
+			defer close(release)
+			ep.config.URL = server.URL
+			type callResult struct {
+				raw     []byte
+				failure *nyanMCPError
+			}
+			done := make(chan callResult, 1)
+			go func() {
+				raw, failure := manager.call(ctx, script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+				done <- callResult{raw: raw, failure: failure}
+			}()
+			started := closeStarted
+			if tc.duringCall {
+				started = callStarted
+			}
+			select {
+			case <-started:
+			case result := <-done:
+				t.Fatalf("call returned before reaching test stage: %+v", result.failure)
+			case <-time.After(2 * time.Second):
+				t.Fatal("call did not reach test stage")
+			}
+			switch tc.name {
+			case "parent-cancel-during-close":
+				cancel()
+			case "shutdown-during-close":
+				manager.cancel()
+			}
+			select {
+			case result := <-done:
+				if tc.duringCall {
+					if result.failure == nil || result.failure.Code != "TIMEOUT" || result.failure.ExecutionState != "unknown" {
+						t.Fatalf("failure=%+v", result.failure)
+					}
+				} else if result.failure != nil || string(result.raw) != string(f.result) {
+					t.Fatalf("cleanup changed completed result: raw=%s failure=%+v", result.raw, result.failure)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("session cleanup ignored call cancellation or deadline")
+			}
+			if !tc.duringCall {
+				select {
+				case <-closeCancelled:
+				case <-time.After(time.Second):
+					t.Fatal("DELETE request remained active after cleanup")
+				}
+			}
+			if len(manager.slots) != 0 || len(ep.slots) != 0 {
+				t.Fatal("cleanup leaked a concurrency slot")
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.calls != 1 {
+				t.Fatalf("tools/call count=%d, want 1", f.calls)
+			}
+		})
+	}
+}

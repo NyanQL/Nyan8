@@ -1797,3 +1797,8 @@ stdioモードでは次の規則が適用されます。
 ---
 ## 8 ライセンス
 [MIT License](LICENSE.md)
+
+
+## 外部MCPクライアント: nyanCallMCP
+
+設定済みの外部MCPツールをサーバー側JavaScriptから呼び出せます。既定は無効です。設定・権限・戻り値・制限は [nyanCallMCP利用ガイド](NYANCALLMCP.md) と [設定・JS例](examples/nyanCallMCP/) を参照してください。
