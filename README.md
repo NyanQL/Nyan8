@@ -1867,8 +1867,6 @@ const data = result.structuredContent;
 }
 ```
 
-このリポジトリの `examples/nyanCallMCP/` にHTTP/stdio別の`mcpClient`設定例と参照用JSがあります。例の`mcpClient`項目を既存の`config.json`へ統合し、パス・tool名・接続先を環境に合わせて編集してください。例のJSONファイル自体を別途読み込む仕組みはありません。
-
 以前の`NYAN_MCP_CONFIG`環境変数は使用しません。既存の専用設定を移行する場合は、その`connections`を`config.json`の`mcpClient.connections`へ移してください。
 
 | フィールド | 意味 |
