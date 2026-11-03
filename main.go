@@ -1597,7 +1597,10 @@ func runJavaScriptForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath string
 	}
 	// Preserve existing string responses and encode structured values without
 	// losing their contents to JavaScript's generic string conversion.
-	exported := value.Export()
+	exported, err := exportJavaScriptValue(value)
+	if err != nil {
+		return "", fmt.Errorf("export script result: %w", err)
+	}
 	if text, ok := exported.(string); ok {
 		return text, nil
 	}
@@ -1606,6 +1609,27 @@ func runJavaScriptForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath string
 		return "", fmt.Errorf("encode script result: %w", err)
 	}
 	return string(encoded), nil
+}
+
+// Export can execute getters after RunString has returned. Convert only Goja
+// execution failures into errors; unrelated Go panics must not be hidden.
+func exportJavaScriptValue(value goja.Value) (exported interface{}, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			switch failure := recovered.(type) {
+			case *goja.Exception:
+				err = failure
+			case *goja.InterruptedError:
+				err = failure
+			case *goja.StackOverflowError:
+				err = failure
+			default:
+				panic(recovered)
+			}
+			exported = nil
+		}
+	}()
+	return value.Export(), nil
 }
 
 func runJavaScriptValue(scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (goja.Value, error) {
@@ -2370,7 +2394,11 @@ func parseCheckResponse(value goja.Value, checkName string) (ParamCheckResponse,
 		return ParamCheckResponse{}, fmt.Errorf("%s must return an object", checkName)
 	}
 
-	return parseExportedCheckResponse(value.Export(), checkName)
+	exported, err := exportJavaScriptValue(value)
+	if err != nil {
+		return ParamCheckResponse{}, fmt.Errorf("export %s result: %w", checkName, err)
+	}
+	return parseExportedCheckResponse(exported, checkName)
 }
 
 func parseExportedCheckResponse(exported interface{}, checkName string) (ParamCheckResponse, error) {
@@ -3419,7 +3447,10 @@ func mcpStructuredResult(value goja.Value) (interface{}, []byte, error) {
 	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
 		return nil, nil, fmt.Errorf("empty result")
 	}
-	exported := value.Export()
+	exported, err := exportJavaScriptValue(value)
+	if err != nil {
+		return nil, nil, err
+	}
 	if text, ok := exported.(string); ok {
 		body := []byte(text)
 		var structured interface{}
@@ -4221,19 +4252,25 @@ func runOAuthHookJavaScript(snapshot *APIConfigSnapshot, mcp *MCPServerConfig, s
 		return nil, fmt.Errorf("OAuth hook input could not be prepared")
 	}
 	finished := make(chan struct{})
+	defer close(finished)
+	timer := time.NewTimer(15 * time.Second)
+	defer timer.Stop()
 	go func() {
 		select {
-		case <-time.After(15 * time.Second):
+		case <-timer.C:
 			vm.Interrupt("OAuth hook timed out")
 		case <-finished:
 		}
 	}()
 	value, runErr := vm.RunString(string(code))
-	close(finished)
 	if runErr != nil || value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
 		return nil, fmt.Errorf("OAuth hook execution failed")
 	}
-	return value.Export(), nil
+	exported, err := exportJavaScriptValue(value)
+	if err != nil {
+		return nil, fmt.Errorf("OAuth hook execution failed")
+	}
+	return exported, nil
 }
 
 func writeOAuthHookResponse(c *gin.Context, value interface{}) error {
@@ -7245,6 +7282,7 @@ type apiGraphLoader struct {
 	definitions map[string]interface{}
 	sources     map[string]string
 	fileStates  map[string]APIFileState
+	identities  map[string]APIFileState
 }
 
 func expandAPIFileGraph(rootPath string, rootData []byte) (map[string]interface{}, error) {
@@ -7270,6 +7308,7 @@ func expandAPIFileGraphWithMetadata(rootPath string, rootData []byte) (map[strin
 		definitions: make(map[string]interface{}),
 		sources:     make(map[string]string),
 		fileStates:  make(map[string]APIFileState),
+		identities:  make(map[string]APIFileState),
 	}
 	if err := loader.loadFile(normalizedRoot, rootIdentity, rootData, "", nil); err != nil {
 		return nil, nil, loader.fileStates, err
@@ -7282,7 +7321,9 @@ func (loader *apiGraphLoader) loadFile(filePath, identity string, data []byte, m
 		return includeCycleError(stack, filePath)
 	}
 	stack = append(stack, apiIncludeFrame{path: filePath, identity: identity})
-	loader.fileStates[filePath] = APIFileState{Path: filePath, Identity: identity, Exists: true, Hash: sha256.Sum256(data)}
+	if err := loader.recordFileState(APIFileState{Path: filePath, Identity: identity, Exists: true, Hash: sha256.Sum256(data)}); err != nil {
+		return err
+	}
 	rawDefinitions, err := decodeRawAPIDefinitions(data)
 	if err != nil {
 		return fmt.Errorf("API file %s: %w", filePath, err)
@@ -7320,7 +7361,9 @@ func (loader *apiGraphLoader) loadFile(filePath, identity string, data []byte, m
 			return fmt.Errorf("include %q in %s: %w", name, filePath, err)
 		}
 		includeIdentity, includeState, includeData, err := inspectAPIFile(includePath)
-		loader.fileStates[includePath] = includeState
+		if stateErr := loader.recordFileState(includeState); stateErr != nil {
+			return stateErr
+		}
 		if err != nil {
 			return fmt.Errorf("include %q in %s: %w", name, filePath, err)
 		}
@@ -7329,6 +7372,31 @@ func (loader *apiGraphLoader) loadFile(filePath, identity string, data []byte, m
 		}
 		if err := loader.loadFile(includePath, includeIdentity, includeData, joinAPIName(mountPrefix, name), stack); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// Every mount of a file must use the same generation. Keep the first observed
+// state on conflict, and mark it for retry even if the file is restored before
+// the next poll. Logical paths stay separate so symlink changes remain visible.
+func (loader *apiGraphLoader) recordFileState(state APIFileState) error {
+	previous, seen := loader.fileStates[state.Path]
+	changed := seen && previous != state
+	if !changed && state.Error == "" && state.Identity != "" {
+		if first, exists := loader.identities[state.Identity]; exists && first.Hash != state.Hash {
+			previous, changed = first, true
+		}
+	}
+	if changed {
+		previous.Error = "changed_during_load"
+		loader.fileStates[previous.Path] = previous
+		return fmt.Errorf("API file %s changed while the configuration was being loaded", state.Path)
+	}
+	loader.fileStates[state.Path] = state
+	if state.Error == "" && state.Identity != "" {
+		if _, exists := loader.identities[state.Identity]; !exists {
+			loader.identities[state.Identity] = state
 		}
 	}
 	return nil

@@ -15285,3 +15285,305 @@ func TestNyanMCPHTTPContentType(t *testing.T) {
 		}
 	}
 }
+
+func TestJavaScriptResultGetterExceptions(t *testing.T) {
+	previous := globalConfig
+	globalConfig = Config{}
+	t.Cleanup(func() { globalConfig = previous })
+	for _, source := range []string{
+		`({get value(){throw new Error("getter failed");}})`,
+		`({nested:[{get value(){throw "nested getter failed";}}]})`,
+		`({get value(){throw null;}})`,
+	} {
+		t.Run(source, func(t *testing.T) {
+			script := filepath.Join(t.TempDir(), "result.js")
+			writeHotReloadTestFile(t, script, source)
+			if _, err := runJavaScriptWithSnapshot(nil, script, nil, nil); err == nil {
+				t.Fatal("normal result getter exception was not returned")
+			}
+			for _, convert := range []string{"MCP", "paramCheck", "outCheck"} {
+				vm := goja.New()
+				value, err := vm.RunString(source)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if convert == "MCP" {
+					_, _, err = mcpStructuredResult(value)
+				} else {
+					_, err = parseCheckResponse(value, convert)
+				}
+				var exception *goja.Exception
+				if !errors.As(err, &exception) {
+					t.Fatalf("%s: want Goja exception, got %v", convert, err)
+				}
+			}
+			mcp := &MCPServerConfig{OAuth: MCPOAuthConfig{StateDirectory: t.TempDir()}}
+			if result, err := runOAuthHookJavaScript(nil, mcp, script, nil); err == nil || result != nil {
+				t.Fatalf("OAuth result=%#v err=%v", result, err)
+			}
+		})
+	}
+	// Valid getters remain supported, including nested values.
+	script := filepath.Join(t.TempDir(), "valid.js")
+	writeHotReloadTestFile(t, script, `({get nested(){return [{get value(){return "ok";}}];}})`)
+	if result, err := runJavaScriptWithSnapshot(nil, script, nil, nil); err != nil || result != `{"nested":[{"value":"ok"}]}` {
+		t.Fatalf("valid getter result=%s err=%v", result, err)
+	}
+}
+
+func TestExportJavaScriptValueExecutionFailures(t *testing.T) {
+	for _, mode := range []string{"interrupt", "stack_overflow", "host_panic"} {
+		t.Run(mode, func(t *testing.T) {
+			vm := goja.New()
+			vm.SetMaxCallStackSize(32)
+			if err := vm.Set("hostPanic", func() { panic("host failure") }); err != nil {
+				t.Fatal(err)
+			}
+			source := `({get value(){while(true){};}})`
+			if mode == "stack_overflow" {
+				source = `({get value(){return this.value;}})`
+			}
+			if mode == "host_panic" {
+				source = `({get value(){hostPanic();}})`
+			}
+			value, err := vm.RunString(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == "interrupt" {
+				vm.Interrupt("stop")
+			}
+			if mode == "host_panic" {
+				defer func() {
+					if recovered := recover(); recovered != "host failure" {
+						t.Fatalf("host panic was masked: %v", recovered)
+					}
+				}()
+				_, _ = exportJavaScriptValue(value)
+				return
+			}
+			exported, err := exportJavaScriptValue(value)
+			if err == nil || exported != nil {
+				t.Fatalf("result=%#v err=%v", exported, err)
+			}
+			if mode == "interrupt" {
+				var interrupted *goja.InterruptedError
+				if !errors.As(err, &interrupted) {
+					t.Fatalf("wrong error: %T", err)
+				}
+			} else {
+				var overflow *goja.StackOverflowError
+				if !errors.As(err, &overflow) {
+					t.Fatalf("wrong error: %T", err)
+				}
+			}
+		})
+	}
+}
+
+func TestWSClientContinuesAfterResultGetterException(t *testing.T) {
+	if os.Getenv("NYAN8_TEST_WS_GETTER_CHILD") != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestWSClientContinuesAfterResultGetterException$", "-test.count=1", "-test.timeout=10s")
+		cmd.Env = append(os.Environ(), "NYAN8_TEST_WS_GETTER_CHILD=1")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("WS child failed: %v\n%s", err, output)
+		}
+		return
+	}
+	initTestLogger()
+	publishAPISnapshot(nil)
+	script := filepath.Join(t.TempDir(), "getter.js")
+	writeHotReloadTestFile(t, script, `(function(){if(nyanAllParams.ws_message_text==="bad") return {get value(){throw new Error("getter failed");}}; return "alive";})()`)
+	received := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			received <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for _, message := range []string{"bad", "good"} {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+				received <- err
+				return
+			}
+		}
+		_, data, err := conn.ReadMessage()
+		if err == nil && string(data) != "alive" {
+			err = fmt.Errorf("unexpected reply: %s", data)
+		}
+		received <- err
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+	runtime := newWSClientRuntime(wsClientConfig{name: "getter", scriptPath: script, connectURL: "ws" + strings.TrimPrefix(server.URL, "http")})
+	go runtime.run()
+	defer func() {
+		runtime.update(nil)
+		select {
+		case <-runtime.done:
+		case <-time.After(3 * time.Second):
+			t.Error("WS runtime did not stop")
+		}
+	}()
+	select {
+	case err := <-received:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("next message was not processed")
+	}
+}
+
+func TestMCPStdioContinuesAfterResultGetterException(t *testing.T) {
+	initTestLogger()
+	for _, stage := range []string{"script", "paramCheck", "outCheck"} {
+		t.Run(stage, func(t *testing.T) {
+			loaded, server := newMCPStdioTestConfig(t)
+			api := loaded.Snapshot.Definitions["sample"].(map[string]interface{})
+			writeHotReloadTestFile(t, getAPIString(api, stage), `({get value(){throw new Error("private getter failure");}})`)
+			input := strings.Join([]string{
+				mcpPhase12InitializeBody(mcpProtocol20251125),
+				`{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`,
+				`{"jsonrpc":"2.0","id":"call","method":"tools/call","params":{"name":"sample","arguments":{}}}`,
+				`{"jsonrpc":"2.0","id":"ping","method":"ping","params":{}}`,
+			}, "\n") + "\n"
+			var output bytes.Buffer
+			if err := serveMCPStdio(strings.NewReader(input), &output, loaded.Snapshot, server); err != nil {
+				t.Fatal(err)
+			}
+			responses := make(map[string]map[string]interface{})
+			for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
+				var response map[string]interface{}
+				if err := json.Unmarshal([]byte(line), &response); err != nil {
+					t.Fatal(err)
+				}
+				responses[fmt.Sprint(response["id"])] = response
+			}
+			result, ok := responses["call"]["result"].(map[string]interface{})
+			if !ok || result["isError"] != true {
+				t.Fatalf("tool error missing: %s", output.String())
+			}
+			if _, ok := responses["ping"]["result"]; !ok {
+				t.Fatalf("later ping missing: %s", output.String())
+			}
+			if strings.Contains(output.String(), "private getter failure") {
+				t.Fatal("getter failure details leaked")
+			}
+		})
+	}
+}
+
+func TestOAuthHookGetterDeadline(t *testing.T) {
+	if os.Getenv("NYAN8_TEST_OAUTH_GETTER_CHILD") != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestOAuthHookGetterDeadline$", "-test.count=1", "-test.timeout=22s")
+		cmd.Env = append(os.Environ(), "NYAN8_TEST_OAUTH_GETTER_CHILD=1")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("OAuth deadline child failed: %v\n%s", err, output)
+		}
+		return
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "getter.js")
+	writeHotReloadTestFile(t, script, `({get value(){while(true){};}})`)
+	mcp := &MCPServerConfig{OAuth: MCPOAuthConfig{StateDirectory: filepath.Join(dir, "state")}}
+	start := time.Now()
+	result, err := runOAuthHookJavaScript(nil, mcp, script, nil)
+	elapsed := time.Since(start)
+	if err == nil || result != nil || elapsed < 14*time.Second || elapsed > 20*time.Second {
+		t.Fatalf("getter timeout: elapsed=%s result=%#v err=%v", elapsed, result, err)
+	}
+	writeHotReloadTestFile(t, script, `({authenticated:false})`)
+	if result, err := runOAuthHookJavaScript(nil, mcp, script, nil); err != nil || result == nil {
+		t.Fatalf("later OAuth hook failed: %#v %v", result, err)
+	}
+}
+
+func TestRepeatedIncludeRejectsMixedGenerations(t *testing.T) {
+	initTestLogger()
+	previous, manager := currentAPISnapshot(), backgroundRuntimes
+	defer func() { publishAPISnapshot(previous); backgroundRuntimes = manager }()
+	backgroundRuntimes = nil
+	for _, alias := range []bool{false, true} {
+		for _, restore := range []bool{false, true} {
+			t.Run(fmt.Sprintf("alias=%t/restore=%t", alias, restore), func(t *testing.T) {
+				dir := t.TempDir()
+				root := filepath.Join(dir, "api.json")
+				child := filepath.Join(dir, "child.json")
+				second := child
+				if alias {
+					second = filepath.Join(dir, "alias.json")
+					if err := os.Symlink(child, second); err != nil {
+						t.Fatal(err)
+					}
+				}
+				writeHotReloadTestFile(t, root, `{"active":{"description":"last good"}}`)
+				initial, err := readAPIConfigFile(root, dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				publishAPISnapshot(initial.Snapshot)
+				old := []byte(`{"item":{"description":"old"}}`)
+				writeHotReloadTestFile(t, child, string(old))
+				rootData := []byte(fmt.Sprintf(`{"a":{"type":"include","path":%q},"z":{"type":"include","path":%q}}`, child, second))
+				writeHotReloadTestFile(t, root, string(rootData))
+				loader := &apiGraphLoader{definitions: make(map[string]interface{}), sources: make(map[string]string), fileStates: make(map[string]APIFileState), identities: make(map[string]APIFileState)}
+				_, rootState, _, err := inspectAPIFile(root)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := loader.recordFileState(rootState); err != nil {
+					t.Fatal(err)
+				}
+				identity, err := canonicalExistingAPIFilePath(child)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Read the first mount, then change the file before reading the
+				// second mount at the same state-recording boundary used by the
+				// include traversal. No sleeps or timing race are needed.
+				if err := loader.loadFile(child, identity, old, "a", nil); err != nil {
+					t.Fatal(err)
+				}
+				writeHotReloadTestFile(t, child, `{"item":{"description":"new"}}`)
+				_, secondState, _, err := inspectAPIFile(second)
+				if err != nil {
+					t.Fatal(err)
+				}
+				loadErr := loader.recordFileState(secondState)
+				if loadErr == nil || !strings.Contains(loadErr.Error(), "changed while") {
+					t.Fatalf("mixed candidate accepted: %v", loadErr)
+				}
+				if restore {
+					writeHotReloadTestFile(t, child, string(old))
+				}
+				states, reloaded, err := finishAPIConfigReload(nil, loader.fileStates, loadErr)
+				if err == nil || reloaded || currentAPISnapshot() != initial.Snapshot {
+					t.Fatal("failed candidate replaced last good snapshot")
+				}
+				states, reloaded, err = reloadAPIConfigGraphIfChanged(root, dir, states)
+				if err != nil || !reloaded {
+					t.Fatalf("stable candidate not retried: %v %v", reloaded, err)
+				}
+				want := "new"
+				if restore {
+					want = "old"
+				}
+				for _, name := range []string{"a/item", "z/item"} {
+					if currentAPIFiles()[name].(map[string]interface{})["description"] != want {
+						t.Fatalf("wrong generation at %s", name)
+					}
+				}
+				if _, reloaded, err := reloadAPIConfigGraphIfChanged(root, dir, states); err != nil || reloaded {
+					t.Fatalf("unchanged candidate retried: %v %v", reloaded, err)
+				}
+			})
+		}
+	}
+}

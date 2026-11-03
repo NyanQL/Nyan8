@@ -209,6 +209,8 @@ HTTPサーバーモードでは、ルートの `api.json` と、そこから `in
 
 読込中に設定ファイルが変わった場合も、直前の正常な定義を維持し、次の確認時に再読込します。ルートとinclude先は指定されたパスを監視するため、symlinkの参照先を差し替える更新にも対応します。同じファイルを複数のsymlinkで参照している場合も、それぞれの差し替えを検知します。
 
+同じinclude先を複数の名前でマウントする場合、読込途中で内容や参照先が変わった候補は採用しません。新旧の定義が混在した状態で公開せず、次の確認時に安定した設定を読み直します。
+
 通常APIは `/API名` と、API名が `api/` で始まらない場合の `/api/API名` に登録されます。`x` と `api/x` のように同じURLへ登録される通常APIの組み合わせは、include展開後の検証で設定エラーになります。初回起動では起動を中止し、ホットリロードでは直前の正常な定義を維持します。
 
 `Interval` は `500ms`、`1s`、`1m`、`24h` などのGo duration形式です。空の場合は `1s` になります。0以下または解析できない値は起動エラーです。ホットリロードを無効にする場合は `Enabled` を `false` にします。`APIHotReload` 全体を省略した場合は有効、1秒間隔です。
@@ -706,6 +708,8 @@ API本体の最終評価値は、文字列ならそのまま使用し、オブ�
 従来は通常経路でオブジェクトが `[object Object]` になっていましたが、現在はネストした値も保持します。HTTP、`nyanCallMe()`、JSON-RPC、WebSocket、Pushの通常スクリプト変換に適用します。MCPの専用変換処理と、チェック結果の形式検証は維持します。`outCheck` の本文にもJSON化した結果が渡されます。
 
 文字列は空文字列や空白も保持します。配列・数値・真偽値はJSON化し、`null` と `undefined` はどちらもJSONの `null` になります。循環参照、関数を含むオブジェクト、NaN・InfinityなどGoのJSONエンコードが扱えない値は実行エラーです。JavaScriptの `JSON.stringify()` と細部まで同じ変換という意味ではありません。
+
+戻り値のgetter内で発生したJavaScript例外も、その処理の実行エラーとして扱います。入力・出力チェックやMCP Toolの戻り値でも同様です。
 
 JSON化できても、各経路の応答形式の要件は変わりません。通常HTTPでは従来どおり `status` のあるオブジェクトが必要です。全経路でトップレベルの配列や `null` を受理するという変更ではありません。JSONのキー順・表記を制御する必要がある場合は、スクリプト側でJSON文字列を返してください。
 
@@ -1454,7 +1458,7 @@ Go側はAuthorization Server MetadataとProtected Resource Metadata、OAuth endp
 
 呼び出しごとに新しいJavaScript実行環境で対象のファイルを実行し、最後に評価したJavaScriptオブジェクトを戻り値として受け取ります。戻り値全体を `JSON.stringify()` で文字列にしないでください。JavaScript実行には15秒のタイムアウトを設定しています。
 
-`paramCheck` / `outCheck` / `checkOnly` を適用します。チェックと本体はそれぞれ新しいOAuth専用のJavaScript実行環境で動作し、各実行に15秒のタイムアウトを設定します。`javascript_include` は読み込まれません。通常APIの `nyanGetFile`、`nyanCallMe`、`nyanHostExec`、`nyanSendMail` などや `console.log` は登録されません。利用できるのはJavaScriptの標準機能と、後述するOAuth用ヘルパーです。
+`paramCheck` / `outCheck` / `checkOnly` を適用します。チェックと本体はそれぞれ新しいOAuth専用のJavaScript実行環境で動作し、戻り値の変換中に動くgetterも含めて各実行に15秒のタイムアウトを設定します。`javascript_include` は読み込まれません。通常APIの `nyanGetFile`、`nyanCallMe`、`nyanHostExec`、`nyanSendMail` などや `console.log` は登録されません。利用できるのはJavaScriptの標準機能と、後述するOAuth用ヘルパーです。
 
 同じスクリプトを複数のOAuth APIで使う場合は、`nyanAllParams.oauth_hook` で処理を分けます。
 
