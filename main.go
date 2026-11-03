@@ -8737,7 +8737,7 @@ func (cfg *nyanMCPConfig) UnmarshalJSON(data []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if len(data) > 1<<20 || dec.Decode(&value) != nil || dec.Decode(new(any)) != io.EOF || value.Connections == nil || len(value.Connections) > 64 {
-		return errors.New("invalid config.json mcpClient; see NYANCALLMCP.md")
+		return errors.New("invalid config.json mcpClient; see README.md")
 	}
 	*cfg = nyanMCPConfig(value)
 	return nil
@@ -8818,7 +8818,7 @@ func loadNyanMCPConfig(cfg *nyanMCPConfig) (*nyanMCPManager, error) {
 	}
 	fail := func() (*nyanMCPManager, error) {
 		manager.cancel()
-		return nil, errors.New("invalid config.json mcpClient; see NYANCALLMCP.md")
+		return nil, errors.New("invalid config.json mcpClient; see README.md")
 	}
 	if cfg.Connections == nil || len(cfg.Connections) > 64 {
 		return fail()
