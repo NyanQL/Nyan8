@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -238,6 +239,376 @@ func TestAdjustConfigPathsResolvesFromConfigDir(t *testing.T) {
 	}
 	if config.OAuthStateRoot != filepath.Join(configBaseDir, "state/oauth") {
 		t.Fatalf("OAuthStateRoot = %q, want config-relative path", config.OAuthStateRoot)
+	}
+}
+
+func TestJavaScriptIncludeCacheConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name, config     string
+		enabled, invalid bool
+	}{
+		{name: "omitted", config: `{}`},
+		{name: "disabled", config: `{"javascript_include_cache":false}`},
+		{name: "enabled", config: `{"javascript_include_cache":true}`, enabled: true},
+		{name: "string", config: `{"javascript_include_cache":"true"}`, invalid: true},
+		{name: "number", config: `{"javascript_include_cache":1}`, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			writeHotReloadTestFile(t, path, tc.config)
+			cfg, err := loadConfig(path)
+			if (err != nil) != tc.invalid {
+				t.Fatalf("loadConfig error=%v, invalid=%v", err, tc.invalid)
+			}
+			if err == nil && cfg.JavaScriptIncludeCache != tc.enabled {
+				t.Fatalf("cache=%v, want %v", cfg.JavaScriptIncludeCache, tc.enabled)
+			}
+		})
+	}
+}
+
+func TestJavaScriptIncludeCacheHTTP(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cache=%v", enabled), func(t *testing.T) {
+			previousSnapshot, previousConfig, previousPaths, previousLogger := currentAPISnapshot(), globalConfig, servicePaths, logger
+			t.Cleanup(func() {
+				publishAPISnapshot(previousSnapshot)
+				globalConfig, servicePaths, logger = previousConfig, previousPaths, previousLogger
+			})
+			initTestLogger()
+			gin.SetMode(gin.TestMode)
+			dir := t.TempDir()
+			include := filepath.Join(dir, "first.js")
+			writeHotReloadTestFile(t, include, `var sharedCount = 0; const prefix = "original"; // no trailing newline`)
+			writeHotReloadTestFile(t, filepath.Join(dir, "second.js"), `const sharedValue = prefix + "!";`)
+			script := filepath.Join(dir, "main.js")
+			paramCheck, outCheck := filepath.Join(dir, "param.js"), filepath.Join(dir, "out.js")
+			const check = `if (sharedValue !== nyanAllParams.want || ++sharedCount !== 1) throw new Error("include or VM isolation mismatch"); ({success:true,status:200,result:null});`
+			writeHotReloadTestFile(t, paramCheck, check)
+			writeHotReloadTestFile(t, outCheck, check)
+			writeBody := func(version string) {
+				writeHotReloadTestFile(t, script, fmt.Sprintf(`({status:200,result:{value:sharedValue,count:++sharedCount,version:%q}});`, version))
+			}
+			writeBody("one")
+			configPath := filepath.Join(dir, "config.json")
+			writeHotReloadTestFile(t, configPath, fmt.Sprintf(`{"javascript_include":["first.js","second.js"],"javascript_include_cache":%v}`, enabled))
+			cfg, err := loadConfig(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			adjustConfigPaths(dir, &cfg)
+			globalConfig = cfg
+			// A different executable directory verifies config-relative includes.
+			exeDir := t.TempDir()
+			if err := globalConfig.prepareJavaScriptIncludes(exeDir); err != nil {
+				t.Fatal(err)
+			}
+			apiPath := filepath.Join(dir, "api.json")
+			writeHotReloadTestFile(t, apiPath, `{"cached":{"script":"main.js","paramCheck":"param.js","outCheck":"out.js"}}`)
+			servicePaths.API.Path = apiPath
+			loaded, err := readAPIConfigFile(apiPath, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			publishAPISnapshot(loaded.Snapshot)
+			router := gin.New()
+			if err := registerDynamicEndpoints(router, dir); err != nil {
+				t.Fatal(err)
+			}
+			request := func(want string, status int) *httptest.ResponseRecorder {
+				t.Helper()
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/cached?want="+url.QueryEscape(want+"!"), nil))
+				if rec.Code != status {
+					t.Fatalf("status=%d, want %d; body=%s", rec.Code, status, rec.Body.String())
+				}
+				return rec
+			}
+			assertBody := func(want, version string) {
+				t.Helper()
+				rec := request(want, http.StatusOK)
+				var got struct {
+					Result map[string]interface{} `json:"result"`
+				}
+				if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+					t.Fatal(err)
+				}
+				expected := map[string]interface{}{"value": want + "!", "count": float64(1), "version": version}
+				if !reflect.DeepEqual(got.Result, expected) {
+					t.Fatalf("result=%#v, want %#v", got.Result, expected)
+				}
+			}
+			// Changing before the first request distinguishes startup caching from lazy caching.
+			writeHotReloadTestFile(t, include, `var sharedCount = 0; const prefix = "changed";`)
+			want := "changed"
+			if enabled {
+				want = "original"
+			}
+			assertBody(want, "one")
+			writeBody("two")
+			assertBody(want, "two")
+			writeHotReloadTestFile(t, paramCheck, `({success:false,status:403,result:null});`)
+			request(want, http.StatusForbidden)
+			writeHotReloadTestFile(t, paramCheck, check)
+			writeHotReloadTestFile(t, outCheck, `({success:false,status:409,result:null});`)
+			request(want, http.StatusConflict)
+			writeHotReloadTestFile(t, outCheck, check)
+			// API snapshot replacement must not replace the startup source cache.
+			loaded, err = readAPIConfigFile(apiPath, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			publishAPISnapshot(loaded.Snapshot)
+			if err := os.Remove(include); err != nil {
+				t.Fatal(err)
+			}
+			if enabled {
+				assertBody(want, "two")
+			} else {
+				request(want, http.StatusInternalServerError)
+			}
+			writeHotReloadTestFile(t, include, `var sharedCount = 0; const prefix = "restarted";`)
+			if err := globalConfig.prepareJavaScriptIncludes(exeDir); err != nil {
+				t.Fatal(err)
+			}
+			assertBody("restarted", "two")
+		})
+	}
+}
+
+func TestJavaScriptIncludeCachePreparation(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{JavaScriptIncludeCache: true}
+	if _, err := cfg.javaScriptIncludes(dir); err == nil {
+		t.Fatal("uninitialized cache was accepted")
+	}
+	if err := cfg.prepareJavaScriptIncludes(dir); err != nil {
+		t.Fatal(err)
+	}
+	if source, err := cfg.javaScriptIncludes(dir); err != nil || source != "" {
+		t.Fatalf("empty includes: source=%q error=%v", source, err)
+	}
+	writeHotReloadTestFile(t, filepath.Join(dir, "first.js"), `const first = 1;`)
+	cfg.JavaScriptInclude = []string{"first.js", "missing.js"}
+	if err := cfg.prepareJavaScriptIncludes(dir); err == nil || !strings.Contains(err.Error(), "missing.js") {
+		t.Fatalf("missing include error=%v", err)
+	}
+	if _, err := cfg.javaScriptIncludes(dir); err == nil {
+		t.Fatal("failed preparation left a partial or stale cache")
+	}
+	cfg.JavaScriptIncludeCache = false
+	if err := cfg.prepareJavaScriptIncludes(dir); err != nil {
+		t.Fatalf("disabled cache must defer reads until execution: %v", err)
+	}
+	if _, err := cfg.javaScriptIncludes(dir); err == nil {
+		t.Fatal("disabled cache did not read the missing include")
+	}
+}
+
+func TestJavaScriptIncludeCacheConcurrentExecution(t *testing.T) {
+	previous := globalConfig
+	t.Cleanup(func() { globalConfig = previous })
+	dir := t.TempDir()
+	include, script := filepath.Join(dir, "include.js"), filepath.Join(dir, "main.js")
+	writeHotReloadTestFile(t, include, `globalThis.count = (globalThis.count || 0) + 1;`)
+	writeHotReloadTestFile(t, script, `count === 1;`)
+	globalConfig = Config{JavaScriptInclude: []string{include}, JavaScriptIncludeCache: true}
+	if err := globalConfig.prepareJavaScriptIncludes(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(include); err != nil {
+		t.Fatal(err)
+	}
+	const workers = 16
+	results := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			value, err := runJavaScriptValueForAPI(nil, "cached", script, nil, nil)
+			if err == nil && !value.ToBoolean() {
+				err = errors.New("JavaScript global state leaked between executions")
+			}
+			results <- err
+		}()
+	}
+	for i := 0; i < workers; i++ {
+		if err := <-results; err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+func TestJavaScriptIncludeCacheStartup(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cache=%v", enabled), func(t *testing.T) {
+			dir := t.TempDir()
+			configPath, apiPath := filepath.Join(dir, "config.json"), filepath.Join(dir, "api.json")
+			writeHotReloadTestFile(t, configPath, fmt.Sprintf(`{"javascript_include":["missing.js"],"javascript_include_cache":%v}`, enabled))
+			writeHotReloadTestFile(t, apiPath, `{}`)
+			cmd := loggingTestCommand(t, configPath, apiPath)
+			cmd.Args = append(cmd.Args, "--mcp-server", "missing")
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			if err := cmd.Run(); err == nil {
+				t.Fatal("expected startup failure")
+			}
+			want := "mcp_stdio_start_failed"
+			if enabled {
+				want = "javascript_include_load_failed"
+			}
+			if !strings.Contains(stderr.String(), want) || stdout.Len() != 0 {
+				t.Fatalf("expected %s on stderr only; stdout=%q stderr=%q", want, stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+func TestMCPClientConfig(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "caller.js")
+	writeHotReloadTestFile(t, script, "0")
+	scriptJSON, err := json.Marshal(script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := fmt.Sprintf(`{"transport":"streamable_http","url":"https://mcp.example.invalid/mcp","credentialMode":"service","allowedScripts":[%s],"tools":{"echo":{"readOnly":true}},"protocolVersions":["2025-06-18"]}`, scriptJSON)
+	section := func(extra string) string {
+		return `{"connections":{"local":` + strings.TrimSuffix(connection, "}") + extra + `}}}`
+	}
+	for _, tc := range []struct {
+		name          string
+		section       string
+		decodeError   bool
+		configError   bool
+		connections   int
+		maxResultSize int
+	}{
+		{name: "omitted"},
+		{name: "null", section: `null`},
+		{name: "empty connections", section: `{"connections":{}}`},
+		{name: "defaults", section: section(""), connections: 1, maxResultSize: 8 << 20},
+		{name: "custom result limit", section: section(`,"maxResultBytes":1048576`), connections: 1, maxResultSize: 1 << 20},
+		{name: "minimum result limit", section: section(`,"maxResultBytes":256`), connections: 1, maxResultSize: 256},
+		{name: "result limit too small", section: section(`,"maxResultBytes":255`), configError: true},
+		{name: "result limit too large", section: section(`,"maxResultBytes":8388609`), configError: true},
+		{name: "negative input limit", section: section(`,"maxInputBytes":-1`), configError: true},
+		{name: "unknown section field", section: `{"connections":{},"unknown":true}`, decodeError: true},
+		{name: "unknown connection field", section: section(`,"unknown":true`), decodeError: true},
+		{name: "unknown tool policy", section: strings.Replace(section(""), `"readOnly":true`, `"readOnly":true,"unknown":true`, 1), decodeError: true},
+		{name: "missing connections", section: `{}`, decodeError: true},
+		{name: "null connections", section: `{"connections":null}`, decodeError: true},
+		{name: "wrong section type", section: `"client.json"`, decodeError: true},
+		{name: "wrong limit type", section: section(`,"maxResultBytes":"1MB"`), decodeError: true},
+		{name: "section size limit", section: `{"connections":{}` + strings.Repeat(" ", (1<<20)-18) + `}`, decodeError: false},
+		{name: "oversized section", section: `{"connections":{}` + strings.Repeat(" ", 1<<20) + `}`, decodeError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configJSON := `{}`
+			if tc.section != "" {
+				configJSON = `{"mcpClient":` + tc.section + `}`
+			}
+			path := filepath.Join(dir, "config.json")
+			writeHotReloadTestFile(t, path, configJSON)
+			cfg, err := loadConfig(path)
+			if (err != nil) != tc.decodeError {
+				t.Fatalf("loadConfig error=%v, want error=%v", err, tc.decodeError)
+			}
+			if err != nil {
+				return
+			}
+			manager, err := loadNyanMCPConfig(cfg.MCPClient)
+			if (err != nil) != tc.configError {
+				t.Fatalf("loadNyanMCPConfig error=%v, want error=%v", err, tc.configError)
+			}
+			if err != nil {
+				if !strings.Contains(err.Error(), "config.json mcpClient") {
+					t.Fatalf("error does not identify the config section: %v", err)
+				}
+				return
+			}
+			t.Cleanup(manager.cancel)
+			if len(manager.endpoints) != tc.connections {
+				t.Fatalf("connections=%d, want %d", len(manager.endpoints), tc.connections)
+			}
+			if tc.connections > 0 && manager.endpoints["local"].config.MaxResultBytes != tc.maxResultSize {
+				t.Fatalf("maxResultBytes=%d, want %d", manager.endpoints["local"].config.MaxResultBytes, tc.maxResultSize)
+			}
+		})
+	}
+}
+
+func TestMCPClientConfigStartup(t *testing.T) {
+	f := &nyanMCPFixture{result: json.RawMessage(`{"content":[],"structuredContent":{"source":"config.json"}}`)}
+	server := httptest.NewServer(http.HandlerFunc(f.serve))
+	defer server.Close()
+	dir := t.TempDir()
+	script := filepath.Join(dir, "caller.js")
+	writeHotReloadTestFile(t, script, `nyanCallMCP({connection:"local",tool:"echo"}).structuredContent;`)
+	apiPath := filepath.Join(dir, "api.json")
+	writeHotReloadTestFile(t, apiPath, `{"caller":{"script":"./caller.js"},"local_mcp":{"type":"mcp","transport":"stdio","tools":["caller"]}}`)
+	connection := nyanMCPConnectionConfig{Transport: "streamable_http", URL: server.URL, AllowHTTP: true, AllowedCIDRs: []string{"127.0.0.0/8", "::1/128"}, CredentialMode: "service", AllowedScripts: []string{script}, Tools: map[string]nyanMCPToolPolicy{"echo": {ReadOnly: true}}, ProtocolVersions: []string{"2025-06-18"}, MaxResultBytes: 1 << 20}
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		invalid bool
+	}{
+		{name: "config only", enabled: true},
+		{name: "omitted stays disabled"},
+		{name: "invalid connection stops startup", enabled: true, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := map[string]any{"log": map[string]any{"EnableLogging": false}}
+			c := connection
+			if tc.invalid {
+				c.MaxResultBytes = 8<<20 + 1
+			}
+			if tc.enabled {
+				config["mcpClient"] = nyanMCPConfig{Connections: map[string]nyanMCPConnectionConfig{"local": c}}
+			}
+			data, err := json.Marshal(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			configPath := filepath.Join(dir, "config.json")
+			writeHotReloadTestFile(t, configPath, string(data))
+			cmd := loggingTestCommand(t, configPath, apiPath)
+			cmd.Args = append(cmd.Args, "--mcp-server", "local_mcp")
+			// An obsolete environment setting must neither override config.json
+			// nor cause the application to read a separate configuration file.
+			cmd.Env = append(cmd.Env, "NYAN_MCP_CONFIG="+filepath.Join(dir, "does-not-exist.json"))
+			cmd.Stdin = strings.NewReader(mcpPhase12InitializeBody(mcpProtocol20251125) + "\n" + `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}` + "\n" + `{"jsonrpc":"2.0","id":"call","method":"tools/call","params":{"name":"caller","arguments":{}}}` + "\n")
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			err = cmd.Run()
+			if tc.invalid {
+				if err == nil || stdout.Len() != 0 || !strings.Contains(stderr.String(), `"msg":"mcp_client_config_failed"`) {
+					t.Fatalf("invalid configuration did not stop startup: err=%v stdout=%s stderr=%s", err, &stdout, &stderr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("startup failed: %v; stderr=%s", err, &stderr)
+			}
+			var response struct {
+				Result struct {
+					IsError           bool           `json:"isError"`
+					StructuredContent map[string]any `json:"structuredContent"`
+				} `json:"result"`
+			}
+			lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+			if len(lines) != 2 {
+				t.Fatalf("unexpected protocol output: %s; stderr=%s", &stdout, &stderr)
+			}
+			if err := json.Unmarshal([]byte(lines[1]), &response); err != nil {
+				t.Fatal(err)
+			}
+			if tc.enabled {
+				if response.Result.IsError || response.Result.StructuredContent["source"] != "config.json" {
+					t.Fatalf("config.json connection was not used: %s; stderr=%s", &stdout, &stderr)
+				}
+			} else if !response.Result.IsError {
+				t.Fatalf("MCP call unexpectedly succeeded without config: %s", &stdout)
+			}
+		})
 	}
 }
 
@@ -1568,7 +1939,7 @@ func TestParseStaticJavaScriptValueRejectsDynamicAndNonJSONValues(t *testing.T) 
 		{name: "getter", source: `{get id() { return 1; }}`, want: `property kind "get" is not supported`},
 		{name: "template literal", source: "`object`", want: `template literals are not supported`},
 		{name: "array hole", source: `[1,,2]`, want: `$[1]: array holes are not supported`},
-		{name: "bigint", source: `1n`, want: `parse static JavaScript value`},
+		{name: "bigint", source: `1n`, want: `numeric value *big.Int is not JSON-compatible`},
 		{name: "infinity", source: `1e400`, want: `non-finite numbers are not JSON-compatible`},
 		{name: "duplicate property", source: `{id: 1, id: 2}`, want: `duplicate property "id"`},
 		{name: "numeric property", source: `{1: "value"}`, want: `property names must be strings`},
@@ -2663,11 +3034,7 @@ func TestReloadAPIConfigGraphWatchesInvalidCandidateUntilCorrected(t *testing.T)
 	if err == nil || reloaded {
 		t.Fatalf("invalid candidate reload=%t err=%v", reloaded, err)
 	}
-	canonicalChild, err := canonicalExistingAPIFilePath(childPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	invalid, exists := observed[canonicalChild]
+	invalid, exists := observed[childPath]
 	if !exists || !invalid.Exists || invalid.Hash == ([sha256.Size]byte{}) {
 		t.Fatalf("invalid candidate state=%#v exists=%t", invalid, exists)
 	}
@@ -4733,6 +5100,8 @@ func TestMCPStdioCommandProcessEndToEnd(t *testing.T) {
 	configJSON := `{
   "name":"Nyan8 stdio process test",
   "version":"test",
+  "javascript_include":["./common.js"],
+  "javascript_include_cache":true,
   "Port":-1,
   "bindAddress":"invalid bind address",
   "log":{"EnableLogging":false,"Level":"debug"},
@@ -4742,9 +5111,10 @@ func TestMCPStdioCommandProcessEndToEnd(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	writeHotReloadTestFile(t, filepath.Join(dir, "common.js"), `const commonValue = "cached-at-startup";`)
 	if err := os.WriteFile(filepath.Join(dir, "echo.js"), []byte(`(function () {
   console.log("stdio-process-log");
-  return {ok:true,transport:nyanAllParams.mcp_principal.transport};
+  return {ok:true,transport:nyanAllParams.mcp_principal.transport,common:commonValue};
 })()`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -4815,6 +5185,9 @@ func TestMCPStdioCommandProcessEndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), `"transport":"stdio"`) {
 		t.Fatalf("stdio principal was not passed to Tool: %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), `"common":"cached-at-startup"`) {
+		t.Fatalf("stdio Tool did not use the initialized include cache: %q", stdout.String())
 	}
 }
 
@@ -13731,5 +14104,1486 @@ func TestReceiveAdmissionOAuthEarlyRejectionEOF(t *testing.T) {
 			})
 			assertUnreadBodyRejectionEOF(t, handler, tc.method, "/oauth", tc.headers, tc.status)
 		})
+	}
+}
+
+// BEGIN shared nyanCallMCP conformance tests.
+type nyanMCPFixture struct {
+	mu        sync.Mutex
+	methods   []string
+	calls     int
+	modern    bool
+	sse       bool
+	output    any
+	result    json.RawMessage
+	delay     time.Duration
+	rpc       bool
+	status    int
+	malformed bool
+	paged     bool
+}
+
+func (f *nyanMCPFixture) response(data []byte) []byte {
+	var req struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+		Params map[string]any  `json:"params"`
+	}
+	_ = json.Unmarshal(data, &req)
+	f.mu.Lock()
+	f.methods = append(f.methods, req.Method)
+	if req.Method == "tools/call" {
+		f.calls++
+	}
+	f.mu.Unlock()
+	if len(req.ID) == 0 {
+		return nil
+	}
+	var result any
+	var rpcError any
+	switch req.Method {
+	case "server/discover":
+		if f.modern {
+			result = map[string]any{"resultType": "complete", "supportedVersions": []string{"2026-07-28"}, "capabilities": map[string]any{"tools": map[string]any{}}}
+		} else {
+			rpcError = map[string]any{"code": -32601, "message": "legacy"}
+		}
+	case "initialize":
+		result = map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{"tools": map[string]any{}}, "serverInfo": map[string]any{"name": "fixture", "version": "1"}}
+	case "tools/list":
+		tool := map[string]any{"name": "echo", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"n": map[string]any{"type": "integer"}}, "additionalProperties": false}}
+		if f.output != nil {
+			tool["outputSchema"] = f.output
+		}
+		if f.paged && req.Params["cursor"] == nil {
+			result = map[string]any{"tools": []any{}, "nextCursor": "second"}
+		} else {
+			result = map[string]any{"tools": []any{tool}}
+		}
+	case "tools/call":
+		if f.rpc {
+			rpcError = map[string]any{"code": -32602, "message": "SERVER_SECRET_DO_NOT_LEAK"}
+		} else {
+			result = f.result
+		}
+	default:
+		rpcError = map[string]any{"code": -32601, "message": "unknown"}
+	}
+	response := map[string]any{"jsonrpc": "2.0", "id": req.ID}
+	if rpcError != nil {
+		response["error"] = rpcError
+	} else {
+		response["result"] = result
+	}
+	out, _ := json.Marshal(response)
+	return out
+}
+func (f *nyanMCPFixture) serve(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "DELETE" {
+		w.WriteHeader(204)
+		return
+	}
+	data, _ := io.ReadAll(r.Body)
+	var req struct {
+		Method string `json:"method"`
+	}
+	_ = json.Unmarshal(data, &req)
+	response := f.response(data)
+	if req.Method == "tools/call" {
+		if f.delay > 0 {
+			select {
+			case <-time.After(f.delay):
+			case <-r.Context().Done():
+				return
+			}
+		}
+		if f.status != 0 {
+			w.WriteHeader(f.status)
+			if f.rpc {
+				_, _ = w.Write(response)
+			} else {
+				_, _ = w.Write([]byte("SERVER_SECRET_DO_NOT_LEAK"))
+			}
+			return
+		}
+		if f.malformed {
+			response = []byte("not JSON")
+		}
+	}
+	if len(response) == 0 {
+		w.WriteHeader(202)
+		return
+	}
+	if f.sse && req.Method == "tools/call" {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "event: message\ndata: %s\n\n", response)
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(response)
+	}
+}
+func nyanMCPTestManager(t *testing.T, f *nyanMCPFixture) (*nyanMCPManager, string) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(f.serve))
+	t.Cleanup(server.Close)
+	script := filepath.Join(t.TempDir(), "caller.js")
+	if err := os.WriteFile(script, []byte("0"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := nyanMCPConfig{Connections: map[string]nyanMCPConnectionConfig{"local": {Transport: "streamable_http", URL: server.URL, AllowHTTP: true, AllowedCIDRs: []string{"127.0.0.0/8", "::1/128"}, CredentialMode: "service", AllowedScripts: []string{script}, Tools: map[string]nyanMCPToolPolicy{"echo": {ReadOnly: true}}, ProtocolVersions: []string{"2025-06-18", "2026-07-28"}, AllowQLRead: true}}}
+	data, _ := json.Marshal(Config{MCPClient: &cfg, WebSocket: WebSocketConfig{MaxConnections: 128}})
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := loadNyanMCPConfig(config.MCPClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(manager.cancel)
+	return manager, script
+}
+func nyanMCPTestVM(manager *nyanMCPManager, ctx context.Context, script, mode string) *goja.Runtime {
+	vm := goja.New()
+	registerNyanMCP(vm, manager, ctx, script, mode)
+	return vm
+}
+func nyanMCPTestCode(t *testing.T, vm *goja.Runtime, source, code, state string) {
+	t.Helper()
+	value, err := vm.RunString(`(function(){try{` + source + `;return 'NO_ERROR'}catch(e){return [e.name,e.code,e.executionState,e.message,e.rpcCode||0].join('|')}})()`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := value.String()
+	if !strings.HasPrefix(got, "NyanMCPError|"+code+"|"+state+"|") || strings.Contains(got, "SERVER_SECRET") {
+		t.Fatalf("got %q, want %s/%s", got, code, state)
+	}
+}
+func TestNyanMCPResults(t *testing.T) {
+	for _, sse := range []bool{false, true} {
+		for _, structured := range []string{`{"count":0}`, `false`, `0`, `null`, `""`, `[]`, `[1,2]`, `true`, `"ok"`, `1.25`, ``} {
+			t.Run(fmt.Sprintf("sse=%v/%s", sse, structured), func(t *testing.T) {
+				raw := `{"resultType":"complete","content":[{"type":"text","text":"{\"count\":0}","annotations":{"audience":["user"]}},{"type":"image","mimeType":"image/png","data":"aGVsbG8="},{"type":"audio","mimeType":"audio/wav","data":"AA=="},{"type":"resource_link","uri":"https://example.invalid/no-fetch","name":"r"},{"type":"resource","resource":{"uri":"file:///never-read","text":"opaque"}}],"_meta":{"source":"fixture"},"vendorExtension":{"x":1},"isError":false`
+				if structured != "" {
+					raw += `,"structuredContent":` + structured
+				}
+				raw += `}`
+				f := &nyanMCPFixture{modern: true, sse: sse, result: json.RawMessage(raw), paged: true}
+				manager, script := nyanMCPTestManager(t, f)
+				vm := nyanMCPTestVM(manager, context.Background(), script, "operation")
+				value, err := vm.RunString(`JSON.stringify(nyanCallMCP({connection:'local',tool:'echo',arguments:{n:1}}))`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var want, got any
+				_ = json.Unmarshal([]byte(raw), &want)
+				_ = json.Unmarshal([]byte(value.String()), &got)
+				if !reflect.DeepEqual(want, got) {
+					t.Fatalf("result changed: %s", value)
+				}
+				if f.calls != 1 {
+					t.Fatalf("calls=%d", f.calls)
+				}
+			})
+		}
+	}
+}
+func TestNyanMCPLegacyAndErrors(t *testing.T) {
+	cases := []struct {
+		name, raw, code string
+		modern, rpc     bool
+		status          int
+		output          any
+	}{
+		{name: "legacy", raw: `{"content":[],"structuredContent":{"n":0}}`},
+		{name: "legacy-null", raw: `{"content":[],"structuredContent":null}`, code: "UNSUPPORTED_RESULT"},
+		{name: "tool-error", raw: `{"content":[{"type":"text","text":"failure"}],"isError":true}`, output: map[string]any{"type": "object", "required": []string{"x"}}},
+		{name: "rpc", rpc: true, code: "MCP_RPC"},
+		{name: "rpc-http-400", rpc: true, status: 400, code: "MCP_RPC"},
+		{name: "content-invalid", modern: true, raw: `{"content":[{"type":"text"}]}`, code: "UNSUPPORTED_RESULT"},
+		{name: "http-auth", status: 401, code: "AUTH_REQUIRED", raw: `{"content":[]}`},
+		{name: "http", status: 500, code: "TRANSPORT", raw: `{"content":[]}`},
+		{name: "large-number", modern: true, raw: `{"content":[],"structuredContent":9007199254740993}`, code: "NUMBER_RANGE"},
+		{name: "output", modern: true, raw: `{"content":[],"structuredContent":false}`, output: map[string]any{"type": "object"}, code: "OUTPUT_SCHEMA"},
+		{name: "output-null", modern: true, raw: `{"content":[],"structuredContent":null}`, output: map[string]any{"type": "null"}},
+		{name: "output-missing", modern: true, raw: `{"content":[]}`, output: map[string]any{"type": "null"}, code: "OUTPUT_SCHEMA"},
+		{name: "input-required", modern: true, raw: `{"resultType":"input_required","inputRequests":{},"requestState":"opaque"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &nyanMCPFixture{modern: tc.modern, result: json.RawMessage(tc.raw), rpc: tc.rpc, status: tc.status, output: tc.output}
+			manager, script := nyanMCPTestManager(t, f)
+			vm := nyanMCPTestVM(manager, context.Background(), script, "operation")
+			source := `nyanCallMCP({connection:'local',tool:'echo'})`
+			if tc.code != "" {
+				nyanMCPTestCode(t, vm, source, tc.code, "unknown")
+			} else {
+				if _, err := vm.RunString(source); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !tc.modern {
+				if !strings.Contains(strings.Join(f.methods, ","), "initialize,notifications/initialized,tools/list,tools/call") {
+					t.Fatal(f.methods)
+				}
+			}
+			if f.calls != 1 {
+				t.Fatalf("must not retry, calls=%d", f.calls)
+			}
+		})
+	}
+}
+func TestNyanMCPInputAndAuthorization(t *testing.T) {
+	f := &nyanMCPFixture{modern: true, result: json.RawMessage(`{"content":[]}`)}
+	manager, script := nyanMCPTestManager(t, f)
+	vm := nyanMCPTestVM(manager, context.Background(), script, "operation")
+	for _, source := range []string{
+		`nyanCallMCP()`, `nyanCallMCP(null)`, `nyanCallMCP([])`, `nyanCallMCP({connection:'local',tool:'echo'},1)`,
+		`nyanCallMCP({connection:'local',tool:'echo',url:'http://bad'})`,
+		`nyanCallMCP({connection:'local',tool:'echo',arguments:null})`, `nyanCallMCP({connection:'local',tool:'echo',arguments:[]})`,
+		`nyanCallMCP({connection:'local',tool:'echo',arguments:{n:undefined}})`, `nyanCallMCP({connection:'local',tool:'echo',arguments:{n:NaN}})`,
+		`nyanCallMCP({connection:'local',tool:'echo',arguments:{n:Infinity}})`, `nyanCallMCP({connection:'local',tool:'echo',arguments:{n:()=>1}})`,
+		`nyanCallMCP({connection:'local',tool:'echo',arguments:{n:new Date()}})`, `nyanCallMCP({connection:'local',tool:'echo',arguments:{n:9007199254740992}})`,
+		`nyanCallMCP({connection:'local',tool:'echo',options:{timeoutMs:0}})`, `nyanCallMCP({connection:'local',tool:'echo',options:{timeoutMs:120001}})`,
+		`nyanCallMCP({connection:'local',tool:'echo',options:{unknown:1}})`, `nyanCallMCP({connection:'local',tool:'echo',arguments:{toJSON(){throw 'getter ran'}}})`,
+		`nyanCallMCP({get connection(){throw 'getter ran'},tool:'echo'})`,
+		`var cycle={};cycle.self=cycle;nyanCallMCP({connection:'local',tool:'echo',arguments:cycle})`,
+		`nyanCallMCP(new Proxy({},{ownKeys(){throw 'trap ran'}}))`,
+		`nyanCallMCP({connection:'local',tool:'echo',arguments:{nested:new Proxy({},{ownKeys(){throw 'trap ran'}})}})`,
+		`nyanCallMCP({connection:'local',tool:'echo',arguments:{x:[,1]}})`,
+	} {
+		nyanMCPTestCode(t, vm, source, "INVALID_ARGUMENT", "not_sent")
+	}
+	nyanMCPTestCode(t, vm, `nyanCallMCP({connection:'bad',tool:'echo'})`, "CONNECTION_NOT_ALLOWED", "not_sent")
+	nyanMCPTestCode(t, vm, `nyanCallMCP({connection:'local',tool:'bad'})`, "TOOL_NOT_ALLOWED", "not_sent")
+	nyanMCPTestCode(t, vm, `nyanCallMCP({connection:'local',tool:'echo',arguments:{n:'1'}})`, "INPUT_SCHEMA", "not_sent")
+	manager.endpoints["local"].config.AllowedScripts = nil
+	nyanMCPTestCode(t, vm, `nyanCallMCP({connection:'local',tool:'echo'})`, "CALLER_NOT_ALLOWED", "not_sent")
+	if f.calls != 0 {
+		t.Fatal("invalid request sent")
+	}
+}
+func TestNyanMCPLimitsAndCancellation(t *testing.T) {
+	for _, name := range []string{"timeout", "cancel", "size", "protocol", "ql-disabled", "ql-write", "render-write", "busy", "ssrf", "malformed"} {
+		t.Run(name, func(t *testing.T) {
+			f := &nyanMCPFixture{modern: true, result: json.RawMessage(`{"content":[]}`)}
+			manager, script := nyanMCPTestManager(t, f)
+			ep := manager.endpoints["local"]
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			mode := "operation"
+			code, state := "", "not_sent"
+			switch name {
+			case "timeout":
+				f.delay = time.Second
+				ep.config.TimeoutMs = 40
+				code, state = "TIMEOUT", "unknown"
+			case "cancel":
+				cancel()
+				code = "CANCELLED"
+			case "size":
+				ep.config.MaxResultBytes = 512
+				f.result = json.RawMessage(`{"content":[{"type":"text","text":"` + strings.Repeat("x", 1024) + `"}]}`)
+				code, state = "RESULT_TOO_LARGE", "unknown"
+			case "protocol":
+				ep.config.ProtocolVersions = []string{"2025-06-18"}
+				code = "PROTOCOL_VERSION"
+			case "ql-disabled":
+				mode = "ql"
+				ep.config.AllowQLRead = false
+				code = "QL_TRANSACTION"
+			case "ql-write":
+				mode = "ql"
+				ep.config.Tools["echo"] = nyanMCPToolPolicy{}
+				code = "QL_TRANSACTION"
+			case "render-write":
+				mode = "render"
+				ep.config.Tools["echo"] = nyanMCPToolPolicy{}
+				code = "RENDER_WRITE_FORBIDDEN"
+			case "busy":
+				ep.slots = make(chan struct{}, 1)
+				ep.slots <- struct{}{}
+				code = "BUSY"
+			case "ssrf":
+				ep.networks = nil
+				code = "CONNECTION_NOT_ALLOWED"
+			case "malformed":
+				f.malformed = true
+				code, state = "TRANSPORT", "unknown"
+			}
+			vm := nyanMCPTestVM(manager, ctx, script, mode)
+			started := time.Now()
+			nyanMCPTestCode(t, vm, `nyanCallMCP({connection:'local',tool:'echo'})`, code, state)
+			if name == "timeout" && time.Since(started) > time.Second {
+				t.Fatal("cancellation did not release call")
+			}
+		})
+	}
+}
+func TestNyanMCPStdioHelper(t *testing.T) {
+	if os.Getenv("NYAN_MCP_TEST_CHILD") == "" {
+		return
+	}
+	f := &nyanMCPFixture{result: json.RawMessage(`{"content":[{"type":"text","text":"stdio"}],"structuredContent":{"count":0}}`)}
+	scan := bufio.NewScanner(os.Stdin)
+	for scan.Scan() {
+		var request struct {
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal(scan.Bytes(), &request)
+		if request.Method == "tools/call" && os.Getenv("NYAN_MCP_TEST_CHILD") == "delay" {
+			time.Sleep(5 * time.Second)
+		}
+		response := f.response(scan.Bytes())
+		if response != nil {
+			fmt.Println(string(response))
+		}
+	}
+	os.Exit(0)
+}
+func TestNyanMCPStdio(t *testing.T) {
+	f := &nyanMCPFixture{}
+	manager, script := nyanMCPTestManager(t, f)
+	ep := manager.endpoints["local"]
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(t.TempDir(), "child")
+	if err := os.WriteFile(secret, []byte("1"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ep.config.Transport = "stdio"
+	ep.config.Executable = exe
+	ep.config.Args = []string{"-test.run=^TestNyanMCPStdioHelper$"}
+	ep.config.Directory = t.TempDir()
+	ep.config.EnvironmentFiles = map[string]string{"NYAN_MCP_TEST_CHILD": secret}
+	vm := nyanMCPTestVM(manager, context.Background(), script, "operation")
+	value, err := vm.RunString(`nyanCallMCP({connection:'local',tool:'echo'}).content[0].text`)
+	if err != nil || value.String() != "stdio" {
+		t.Fatalf("value=%v err=%v", value, err)
+	}
+}
+func TestNyanMCPSecurityHelpers(t *testing.T) {
+	ep := &nyanMCPEndpoint{}
+	for _, address := range []string{"127.0.0.1", "::1", "169.254.169.254", "100.100.100.200", "10.0.0.1", "192.168.1.2", "fc00::1", "0.0.0.0", "224.0.0.1", "100.64.0.1"} {
+		if ep.permitsIP(net.ParseIP(address)) {
+			t.Fatal(address)
+		}
+	}
+	if !ep.permitsIP(net.ParseIP("8.8.8.8")) {
+		t.Fatal("public IP rejected")
+	}
+	if nyanMCPSchema(map[string]any{"$ref": "file:///etc/passwd"}, map[string]any{}) == nil {
+		t.Fatal("external schema accepted")
+	}
+	secret := filepath.Join(t.TempDir(), "secret")
+	_ = os.WriteFile(secret, []byte("secret"), 0644)
+	if _, err := nyanMCPSecret(secret); err == nil {
+		t.Fatal("world readable credential accepted")
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	_ = os.WriteFile(path, []byte(`{"mcpClient":{"connections":{},"unknown":true}}`), 0600)
+	if _, err := loadConfig(path); err == nil {
+		t.Fatal("unknown config field accepted")
+	}
+}
+
+// END shared nyanCallMCP conformance tests.
+
+func TestNyanMCPConcurrentCancellationAndShutdown(t *testing.T) {
+	f := &nyanMCPFixture{modern: true, result: json.RawMessage(`{"content":[],"structuredContent":0}`), delay: 100 * time.Millisecond}
+	manager, script := nyanMCPTestManager(t, f)
+	var wg sync.WaitGroup
+	errorsCh := make(chan error, 4)
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			raw, err := manager.call(context.Background(), script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+			if err != nil {
+				errorsCh <- err
+			} else if !bytes.Contains(raw, []byte(`"structuredContent":0`)) {
+				errorsCh <- fmt.Errorf("wrong response")
+			}
+		}()
+	}
+	wg.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		t.Error(err)
+	}
+	// Cancellation during an already-sent call must remain unknown, release its
+	// slot, and not turn into a second tools/call.
+	f.delay = time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan *nyanMCPError, 1)
+	go func() {
+		_, err := manager.call(ctx, script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+		done <- err
+	}()
+	deadline := time.After(time.Second)
+	for {
+		f.mu.Lock()
+		calls := f.calls
+		f.mu.Unlock()
+		if calls == 5 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("call never started")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil || err.Code != "CANCELLED" || err.ExecutionState != "unknown" {
+			t.Fatalf("%+v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancel did not unblock")
+	}
+	if len(manager.slots) != 0 || len(manager.endpoints["local"].slots) != 0 {
+		t.Fatal("slot leaked")
+	}
+	manager.cancel()
+	_, err := manager.call(context.Background(), script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+	if err == nil || err.Code != "CANCELLED" {
+		t.Fatalf("shutdown: %+v", err)
+	}
+}
+func TestNyanMCPGuardDoesNotExecuteUserCode(t *testing.T) {
+	manager := newNyanMCPManager()
+	vm := nyanMCPTestVM(manager, context.Background(), "", "operation")
+	_, err := vm.RunString(`var ran=0; var evil={get connection(){ran++;return 'local'},tool:'echo'}; JSON.stringify=()=>{ran++;return '{}'}; Object.prototype.hasOwnProperty=()=>true; Number.isInteger=()=>true; Array.prototype.indexOf=()=>{ran++;return -1};`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nyanMCPTestCode(t, vm, `nyanCallMCP(evil)`, "INVALID_ARGUMENT", "not_sent")
+	if vm.Get("ran").ToInteger() != 0 {
+		t.Fatal("implicit user code executed")
+	}
+}
+func TestNyanMCPScheduleStopCancelsContext(t *testing.T) {
+	job := newScheduleRuntime(scheduleJobConfig{})
+	ctx, done := job.beginMCPExecution()
+	defer done()
+	job.update(nil)
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("job removal did not cancel")
+	}
+}
+
+func TestNyanMCPNyan8Integration(t *testing.T) {
+	initTestLogger()
+	f := &nyanMCPFixture{modern: true, result: json.RawMessage(`{"content":[],"structuredContent":false}`)}
+	manager, script := nyanMCPTestManager(t, f)
+	old := nyanMCPClient
+	nyanMCPClient = manager
+	t.Cleanup(func() { nyanMCPClient = old })
+	writeHotReloadTestFile(t, script, `JSON.stringify(nyanCallMCP({connection:'local',tool:'echo'}))`)
+	value, err := runJavaScriptForAPI(nil, "caller", script, nil, nil)
+	if err != nil || !strings.Contains(value, `"structuredContent":false`) {
+		t.Fatalf("value=%s err=%v", value, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(ctx)
+	_, err = runJavaScriptForAPI(nil, "caller", script, nil, &gin.Context{Request: request})
+	if err == nil || !strings.Contains(err.Error(), "CANCELLED") {
+		t.Fatal(err)
+	}
+}
+
+func TestNyanMCPHTTPPolicyAndCredentialRotation(t *testing.T) {
+	f := &nyanMCPFixture{modern: true, result: json.RawMessage(`{"content":[]}`)}
+	manager, script := nyanMCPTestManager(t, f)
+	var mu sync.Mutex
+	var auths, versions []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auths = append(auths, r.Header.Get("Authorization"))
+		versions = append(versions, r.Header.Get("MCP-Protocol-Version"))
+		mu.Unlock()
+		if r.Header.Get("Cookie") != "" {
+			t.Error("inbound cookie forwarded")
+		}
+		f.serve(w, r)
+	}))
+	defer server.Close()
+	ep := manager.endpoints["local"]
+	ep.config.URL = server.URL
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	ep.config.BearerTokenFile = tokenFile
+	for _, token := range []string{"test-token-A", "test-token-B"} {
+		if err := os.WriteFile(tokenFile, []byte(token), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := manager.call(context.Background(), script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(auths) != 6 {
+		t.Fatalf("requests=%d", len(auths))
+	}
+	for i, auth := range auths {
+		want := "Bearer test-token-A"
+		if i >= 3 {
+			want = "Bearer test-token-B"
+		}
+		if auth != want || versions[i] != "2026-07-28" {
+			t.Fatalf("auth/negotiated version mismatch at %d", i)
+		}
+	}
+}
+func TestNyanMCPRedirectAndTLS(t *testing.T) {
+	for _, kind := range []string{"redirect", "tls"} {
+		t.Run(kind, func(t *testing.T) {
+			f := &nyanMCPFixture{modern: true, result: json.RawMessage(`{"content":[]}`)}
+			manager, script := nyanMCPTestManager(t, f)
+			var server *httptest.Server
+			if kind == "redirect" {
+				server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					http.Redirect(w, r, manager.endpoints["local"].config.URL+"/other", http.StatusFound)
+				}))
+			} else {
+				server = httptest.NewTLSServer(http.HandlerFunc(f.serve))
+			}
+			defer server.Close()
+			manager.endpoints["local"].config.URL = server.URL
+			_, err := manager.call(context.Background(), script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+			if err == nil || err.Code != "TRANSPORT" || err.ExecutionState != "not_sent" {
+				t.Fatalf("%+v", err)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.calls != 0 {
+				t.Fatal("unauthorized redirect/TLS call")
+			}
+		})
+	}
+}
+func TestNyanMCPSSEIgnoresOtherEventTypes(t *testing.T) {
+	f := &nyanMCPFixture{modern: true, result: json.RawMessage(`{"content":[],"structuredContent":false}`)}
+	manager, script := nyanMCPTestManager(t, f)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, _ := io.ReadAll(r.Body)
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal(data, &req)
+		response := f.response(data)
+		if req.Method != "tools/call" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(response)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "event: message\ndata: %s\n\nevent: ignored\ndata: %s\n\n", response, strings.ReplaceAll(string(response), "false", "true"))
+	}))
+	defer server.Close()
+	manager.endpoints["local"].config.URL = server.URL
+	raw, err := manager.call(context.Background(), script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+	if err != nil || !bytes.Contains(raw, []byte(`"structuredContent":false`)) {
+		t.Fatalf("raw=%s err=%v", raw, err)
+	}
+}
+
+func TestNyanMCPGuardWithPrototypePollution(t *testing.T) {
+	vm := nyanMCPTestVM(newNyanMCPManager(), context.Background(), "", "operation")
+	_, err := vm.RunString(`var ran=0; var evil={get connection(){ran++;return 'local'},tool:'echo'};Object.defineProperty(Object.prototype,'value',{get:function(){ran++;return 'local'}});Array.prototype[Symbol.iterator]=function(){ran++;throw 0};`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = vm.RunString(`try{nyanCallMCP(evil)}catch(e){}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vm.Get("ran").ToInteger() != 0 {
+		t.Fatal("prototype callback executed")
+	}
+}
+
+func TestNyanMCPStdioTimeoutReapsChild(t *testing.T) {
+	manager, script := nyanMCPTestManager(t, &nyanMCPFixture{})
+	ep := manager.endpoints["local"]
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "mode")
+	if err := os.WriteFile(file, []byte("delay"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ep.config.Transport = "stdio"
+	ep.config.Executable = exe
+	ep.config.Args = []string{"-test.run=^TestNyanMCPStdioHelper$"}
+	ep.config.Directory = t.TempDir()
+	ep.config.EnvironmentFiles = map[string]string{"NYAN_MCP_TEST_CHILD": file}
+	ep.config.TimeoutMs = 500
+	started := time.Now()
+	_, failure := manager.call(context.Background(), script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+	if failure == nil || failure.Code != "TIMEOUT" || failure.ExecutionState != "unknown" {
+		t.Fatalf("%+v", failure)
+	}
+	if time.Since(started) > 2*time.Second || len(manager.slots) != 0 {
+		t.Fatal("child cleanup exceeded deadline or leaked slot")
+	}
+}
+
+func TestNyanMCPBackgroundContextPreservesAbsentRequest(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	source := nyanMCPGinWithContext(nil, ctx)
+	nested := readOnlyScriptRequestContext(source)
+	if source.Request != nil || nested.Request != nil {
+		t.Fatal("background execution invented an HTTP request")
+	}
+	cancel()
+	if nyanMCPGinParent(nested).Err() != context.Canceled {
+		t.Fatal("nested cancellation lost")
+	}
+}
+
+func TestNyanMCPHTTPCloseRespectsCallContext(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		duringCall bool
+	}{
+		{name: "timeout-before-close", duringCall: true},
+		{name: "timeout-during-close"},
+		{name: "parent-deadline-during-close"},
+		{name: "parent-cancel-during-close"},
+		{name: "shutdown-during-close"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &nyanMCPFixture{result: json.RawMessage(`{"content":[]}`)}
+			if tc.duringCall {
+				f.delay = time.Minute
+			}
+			manager, script := nyanMCPTestManager(t, f)
+			defer manager.cancel()
+			ep := manager.endpoints["local"]
+			ep.config.TimeoutMs = 5000
+			ep.config.MaxTimeoutMs = 5000
+			if strings.HasPrefix(tc.name, "timeout-") {
+				ep.config.TimeoutMs = 250
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.name == "parent-deadline-during-close" {
+				var deadlineCancel context.CancelFunc
+				ctx, deadlineCancel = context.WithTimeout(ctx, 250*time.Millisecond)
+				defer deadlineCancel()
+			}
+			callStarted := make(chan struct{})
+			closeStarted := make(chan struct{})
+			closeCancelled := make(chan struct{})
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					close(closeStarted)
+					// Send headers and then stall the body, exercising the entire
+					// HTTP exchange rather than only the response-header timeout.
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte("{"))
+					w.(http.Flusher).Flush()
+					select {
+					case <-r.Context().Done():
+						close(closeCancelled)
+					case <-release:
+					}
+					return
+				}
+				data, _ := io.ReadAll(r.Body)
+				r.Body = io.NopCloser(bytes.NewReader(data))
+				var req struct {
+					Method string `json:"method"`
+				}
+				_ = json.Unmarshal(data, &req)
+				if req.Method == "initialize" {
+					w.Header().Set("Mcp-Session-Id", "close-context-test")
+				}
+				if req.Method == "tools/call" {
+					close(callStarted)
+				}
+				f.serve(w, r)
+			}))
+			defer server.Close()
+			defer close(release)
+			ep.config.URL = server.URL
+			type callResult struct {
+				raw     []byte
+				failure *nyanMCPError
+			}
+			done := make(chan callResult, 1)
+			go func() {
+				raw, failure := manager.call(ctx, script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+				done <- callResult{raw: raw, failure: failure}
+			}()
+			started := closeStarted
+			if tc.duringCall {
+				started = callStarted
+			}
+			select {
+			case <-started:
+			case result := <-done:
+				t.Fatalf("call returned before reaching test stage: %+v", result.failure)
+			case <-time.After(2 * time.Second):
+				t.Fatal("call did not reach test stage")
+			}
+			switch tc.name {
+			case "parent-cancel-during-close":
+				cancel()
+			case "shutdown-during-close":
+				manager.cancel()
+			}
+			select {
+			case result := <-done:
+				if tc.duringCall {
+					if result.failure == nil || result.failure.Code != "TIMEOUT" || result.failure.ExecutionState != "unknown" {
+						t.Fatalf("failure=%+v", result.failure)
+					}
+				} else if result.failure != nil || string(result.raw) != string(f.result) {
+					t.Fatalf("cleanup changed completed result: raw=%s failure=%+v", result.raw, result.failure)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("session cleanup ignored call cancellation or deadline")
+			}
+			if !tc.duringCall {
+				select {
+				case <-closeCancelled:
+				case <-time.After(time.Second):
+					t.Fatal("DELETE request remained active after cleanup")
+				}
+			}
+			if len(manager.slots) != 0 || len(ep.slots) != 0 {
+				t.Fatal("cleanup leaked a concurrency slot")
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.calls != 1 {
+				t.Fatalf("tools/call count=%d, want 1", f.calls)
+			}
+		})
+	}
+}
+
+func TestSMTPSDataRefusalReturnsError(t *testing.T) {
+	// Fallback roots are process-global and can only be installed once. Keep
+	// the local test certificate and the SMTP configuration in a subprocess.
+	if os.Getenv("NYAN8_TEST_SMTPS_CHILD") != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSMTPSDataRefusalReturnsError$", "-test.count=1", "-test.timeout=15s")
+		cmd.Env = append(os.Environ(), "NYAN8_TEST_SMTPS_CHILD=1")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("SMTPS subprocess: %v\n%s", err, output)
+		}
+		return
+	}
+	initTestLogger()
+	t.Setenv("GODEBUG", "x509usefallbackroots=1")
+	certServer := httptest.NewTLSServer(http.NotFoundHandler())
+	roots := x509.NewCertPool()
+	roots.AddCert(certServer.Certificate())
+	tlsConfig := certServer.TLS.Clone()
+	certServer.Close()
+	x509.SetFallbackRoots(roots)
+	for _, tc := range []struct {
+		name, dataReply, bodyReply, want string
+		legacy                           bool
+	}{
+		{name: "DATA permanent refusal", dataReply: "554 delivery rejected", want: "554"},
+		{name: "DATA temporary refusal legacy", dataReply: "451 try later", want: "451", legacy: true},
+		{name: "body refusal", dataReply: "354 send message", bodyReply: "554 rejected after body", want: "554"},
+		{name: "success", dataReply: "354 send message", bodyReply: "250 queued", want: "true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tcp, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			listener := tls.NewListener(tcp, tlsConfig)
+			defer listener.Close()
+			done := make(chan error, 1)
+			go func() {
+				conn, err := listener.Accept()
+				if err != nil {
+					done <- err
+					return
+				}
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+				reader := bufio.NewReader(conn)
+				reply := "220 localhost ESMTP"
+				for {
+					if _, err := io.WriteString(conn, reply+"\r\n"); err != nil {
+						done <- err
+						return
+					}
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						done <- err
+						return
+					}
+					switch {
+					case strings.HasPrefix(line, "EHLO"):
+						reply = "250-localhost\r\n250 AUTH PLAIN"
+					case strings.HasPrefix(line, "AUTH"):
+						reply = "235 accepted"
+					case strings.HasPrefix(line, "DATA"):
+						if strings.HasPrefix(tc.dataReply, "354") {
+							if _, err := io.WriteString(conn, tc.dataReply+"\r\n"); err != nil {
+								done <- err
+								return
+							}
+							if _, err := textproto.NewReader(reader).ReadDotBytes(); err != nil {
+								done <- err
+								return
+							}
+							reply = tc.bodyReply
+						} else {
+							reply = tc.dataReply
+						}
+					case strings.HasPrefix(line, "QUIT"):
+						_, err := io.WriteString(conn, "221 bye\r\n")
+						done <- err
+						return
+					default:
+						reply = "250 ok"
+					}
+				}
+			}()
+			globalConfig.SMTP = SMTPConfig{Host: "127.0.0.1", Port: tcp.Addr().(*net.TCPAddr).Port, Username: "test", Password: "test", FromEmail: "sender@example.test", TLS: true}
+			call := `nyanSendMail({to:"recipient@example.test",subject:"test",body:"body"})`
+			if tc.legacy {
+				call = `nyanSendMail("recipient@example.test", "test", "body")`
+			}
+			script := filepath.Join(t.TempDir(), "mail.js")
+			writeHotReloadTestFile(t, script, `var result=""; try { result=String(`+call+`); } catch(e) { result=String(e); } result;`)
+			value, err := runJavaScriptWithSnapshot(nil, script, nil, nil)
+			if err != nil || !strings.Contains(value, tc.want) {
+				t.Fatalf("result=%q err=%v want=%q", value, err, tc.want)
+			}
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRequestJSONPrototypePreserved(t *testing.T) {
+	initTestLogger()
+	script := filepath.Join(t.TempDir(), "echo.js")
+	writeHotReloadTestFile(t, script, `
+function verify(value) {
+  if (value === null || typeof value !== "object") return;
+  if (!Array.isArray(value) && Object.getPrototypeOf(value) !== Object.prototype) throw new Error("changed prototype");
+  if (value.unexpected !== undefined) throw new Error("inherited request data");
+  Object.keys(value).forEach(function(key) { if (key !== "__proto__") verify(value[key]); });
+}
+verify(nyanAllParams);
+JSON.stringify(nyanAllParams);`)
+	for _, body := range []string{
+		`{"__proto__":{"unexpected":"injected"},"nested":{"__proto__":{"unexpected":"nested"}},"items":[{"__proto__":{"unexpected":true}}]}`,
+		`{"__proto__":null,"nested":{"__proto__":"text"},"items":[{"__proto__":1}],"text":"日本語\n\"\\\u2028\u2029"}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/?api=echo", strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = request
+			params, err := collectRequestParams(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := runJavaScriptWithSnapshot(nil, script, params, c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var actual interface{}
+			if err := json.Unmarshal([]byte(result), &actual); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(actual, params) {
+				t.Fatalf("JSON keys or values changed: got=%#v want=%#v", actual, params)
+			}
+		})
+	}
+}
+
+func TestOAuthHookConfigArraysAreIsolated(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	writeHotReloadTestFile(t, filepath.Join(dir, "oauth-hook.js"), `
+if (nyanAllParams.scopes[0] !== "nyan8:read" || nyanAllParams.redirect_uri_allowed_prefixes[0] !== "https://chatgpt.com/connector/oauth/") throw new Error("previous hook changed settings");
+nyanAllParams.scopes[0] = "changed";
+nyanAllParams.redirect_uri_allowed_prefixes[0] = "https://changed.example/";
+({authenticated:false});`)
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcp := loaded.Snapshot.MCPServers["custom-mcp"]
+	wantScopes := append([]string(nil), mcp.OAuth.Scopes...)
+	wantPrefixes := append([]string(nil), mcp.RedirectURIAllowedPrefixes...)
+	for i := 0; i < 2; i++ {
+		if _, err := invokeOAuthHook(loaded.Snapshot, mcp, mcpRuntimeURLs{}, "oauthValidateAccessToken", nil); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(mcp.OAuth.Scopes, wantScopes) || !reflect.DeepEqual(mcp.RedirectURIAllowedPrefixes, wantPrefixes) {
+			t.Fatal("hook changed shared configuration")
+		}
+	}
+	for _, role := range []string{"authorizationServerMetadata", "protectedResourceMetadata"} {
+		value, err := invokeOAuthHook(loaded.Snapshot, mcp, mcpRuntimeURLs{}, role, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := value.(map[string]interface{})["body"].(map[string]interface{})
+		if !reflect.DeepEqual(body["scopes_supported"], wantScopes) {
+			t.Fatalf("metadata scopes changed: %#v", body)
+		}
+	}
+	writeHotReloadTestFile(t, filepath.Join(dir, "oauth-hook.js"), `
+for (var i=0; i<100; i++) {
+  nyanAllParams.scopes[0] = nyanAllParams.scopes[0].trim();
+  nyanAllParams.redirect_uri_allowed_prefixes[0] = nyanAllParams.redirect_uri_allowed_prefixes[0].trim();
+}
+({authenticated:false});`)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := invokeOAuthHook(loaded.Snapshot, mcp, mcpRuntimeURLs{}, "oauthValidateAccessToken", nil); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestReloadAPIConfigGraphRetriesChangedCandidate(t *testing.T) {
+	initTestLogger()
+	previous, manager := currentAPISnapshot(), backgroundRuntimes
+	defer func() { publishAPISnapshot(previous); backgroundRuntimes = manager }()
+	backgroundRuntimes = nil
+	for _, invalidCandidate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("invalid=%t", invalidCandidate), func(t *testing.T) {
+			dir := t.TempDir()
+			root := filepath.Join(dir, "api.json")
+			child := filepath.Join(dir, "child.json")
+			writeHotReloadTestFile(t, root, `{"active":{"description":"initial"}}`)
+			initial, err := readAPIConfigFile(root, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			publishAPISnapshot(initial.Snapshot)
+			writeHotReloadTestFile(t, root, `{"sub":{"type":"include","path":"./child.json"}}`)
+			candidate := `{"candidate":{"description":"in progress"}}`
+			if invalidCandidate {
+				candidate = `{"broken":`
+			}
+			writeHotReloadTestFile(t, child, candidate)
+			loaded, discovered, loadErr := readAPIConfigFileAttempt(root, dir)
+			if (loadErr != nil) != invalidCandidate {
+				t.Fatalf("load error=%v", loadErr)
+			}
+			// Force the edit between reading and committing the candidate without
+			// depending on file size, CPU speed, or a sleep in another goroutine.
+			writeHotReloadTestFile(t, child, `{"final":{"description":"stable"}}`)
+			states, reloaded, err := finishAPIConfigReload(loaded, discovered, loadErr)
+			if err == nil || reloaded {
+				t.Fatalf("changed candidate published: reloaded=%v err=%v", reloaded, err)
+			}
+			if currentAPISnapshot() != initial.Snapshot {
+				t.Fatal("last good snapshot was replaced")
+			}
+			states, reloaded, err = reloadAPIConfigGraphIfChanged(root, dir, states)
+			if err != nil || !reloaded {
+				t.Fatalf("stable candidate not retried: reloaded=%v err=%v", reloaded, err)
+			}
+			if _, ok := currentAPIFiles()["sub/final"]; !ok {
+				t.Fatal("stable candidate missing")
+			}
+			if _, reloaded, err := reloadAPIConfigGraphIfChanged(root, dir, states); err != nil || reloaded {
+				t.Fatalf("unchanged configuration reloaded: %v %v", reloaded, err)
+			}
+		})
+	}
+}
+
+func TestReloadAPIConfigGraphRetargetedSymlink(t *testing.T) {
+	initTestLogger()
+	previous, manager := currentAPISnapshot(), backgroundRuntimes
+	defer func() { publishAPISnapshot(previous); backgroundRuntimes = manager }()
+	backgroundRuntimes = nil
+	for _, mode := range []string{"root", "include", "shared_target"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			root := filepath.Join(dir, "api.json")
+			old := filepath.Join(dir, "old.json")
+			next := filepath.Join(dir, "next.json")
+			link, prefix := root, ""
+			writeHotReloadTestFile(t, old, `{"old":{"description":"initial"}}`)
+			writeHotReloadTestFile(t, next, `{"new":{"description":"updated"}}`)
+			if mode != "root" {
+				link, prefix = filepath.Join(dir, "child.json"), "sub/"
+				rootData := `{"sub":{"type":"include","path":"./child.json"}}`
+				if mode == "shared_target" {
+					rootData = `{"sub":{"type":"include","path":"./child.json"},"other":{"type":"include","path":"./other.json"}}`
+					if err := os.Symlink(old, filepath.Join(dir, "other.json")); err != nil {
+						t.Fatal(err)
+					}
+				}
+				writeHotReloadTestFile(t, root, rootData)
+			}
+			if err := os.Symlink(old, link); err != nil {
+				t.Fatal(err)
+			}
+			initial, err := readAPIConfigFile(root, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			publishAPISnapshot(initial.Snapshot)
+			if mode == "shared_target" && len(initial.Snapshot.FileStates) != 3 {
+				t.Fatal("aliases of the same target were merged")
+			}
+			tempLink := filepath.Join(dir, "temporary-link")
+			if err := os.Symlink(next, tempLink); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(tempLink, link); err != nil {
+				t.Fatal(err)
+			}
+			states, reloaded, err := reloadAPIConfigGraphIfChanged(root, dir, initial.Snapshot.FileStates)
+			if err != nil || !reloaded {
+				t.Fatalf("retargeted symlink not reloaded: %v %v", reloaded, err)
+			}
+			if _, ok := currentAPIFiles()[prefix+"new"]; !ok {
+				t.Fatal("new target not published")
+			}
+			if _, ok := currentAPIFiles()[prefix+"old"]; ok {
+				t.Fatal("old target still active")
+			}
+			if mode == "shared_target" {
+				if _, ok := currentAPIFiles()["other/old"]; !ok {
+					t.Fatal("retargeting one alias changed another")
+				}
+			}
+			writeHotReloadTestFile(t, next, `{"latest":{"description":"edit new target"}}`)
+			states, reloaded, err = reloadAPIConfigGraphIfChanged(root, dir, states)
+			if err != nil || !reloaded {
+				t.Fatalf("new target edit not reloaded: %v %v", reloaded, err)
+			}
+			if _, ok := currentAPIFiles()[prefix+"latest"]; !ok {
+				t.Fatal("new target edit missing")
+			}
+			if _, reloaded, err := reloadAPIConfigGraphIfChanged(root, dir, states); err != nil || reloaded {
+				t.Fatalf("unchanged symlink reloaded: %v %v", reloaded, err)
+			}
+		})
+	}
+}
+
+func TestVerifyAPIFileStatesDetectsSameContentSymlinkRetarget(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "api.json")
+	old := filepath.Join(dir, "old.json")
+	next := filepath.Join(dir, "next.json")
+	writeHotReloadTestFile(t, old, `{"item":{}}`)
+	writeHotReloadTestFile(t, next, `{"item":{}}`)
+	if err := os.Symlink(old, root); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readAPIConfigFile(root, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tempLink := filepath.Join(dir, "temporary-link")
+	if err := os.Symlink(next, tempLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tempLink, root); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyAPIFileStates(loaded.Snapshot.FileStates); err == nil {
+		t.Fatal("symlink identity change was missed")
+	}
+	if apiFileStatesFingerprint(loaded.Snapshot.FileStates) == apiFileStatesFingerprint(observeAPIFileStates(loaded.Snapshot.FileStates)) {
+		t.Fatal("fingerprint missed symlink identity change")
+	}
+}
+
+func TestNyanMCPHTTPContentType(t *testing.T) {
+	for _, modern := range []bool{true, false} {
+		for _, tc := range []struct {
+			contentType string
+			sse         bool
+		}{
+			{contentType: "Text/Event-Stream", sse: true},
+			{contentType: "text/event-stream", sse: true},
+			{contentType: "TEXT/EVENT-STREAM; charset=utf-8", sse: true},
+			{contentType: `application/json; profile="text/event-stream"`},
+			{contentType: "Application/JSON; charset=utf-8"},
+		} {
+			t.Run(fmt.Sprintf("modern=%t/%s", modern, tc.contentType), func(t *testing.T) {
+				f := &nyanMCPFixture{modern: modern, result: json.RawMessage(`{"content":[],"structuredContent":{"ok":true}}`)}
+				manager, script := nyanMCPTestManager(t, f)
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodDelete {
+						w.WriteHeader(http.StatusNoContent)
+						return
+					}
+					data, _ := io.ReadAll(r.Body)
+					var req struct {
+						Method string `json:"method"`
+					}
+					_ = json.Unmarshal(data, &req)
+					response := f.response(data)
+					if len(response) == 0 {
+						w.WriteHeader(http.StatusAccepted)
+						return
+					}
+					if req.Method != "tools/call" {
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = w.Write(response)
+						return
+					}
+					w.Header().Set("Content-Type", tc.contentType)
+					if tc.sse {
+						_, _ = fmt.Fprintf(w, "event: message\ndata: %s\n\n", response)
+					} else {
+						_, _ = w.Write(response)
+					}
+				}))
+				defer server.Close()
+				manager.endpoints["local"].config.URL = server.URL
+				raw, err := manager.call(context.Background(), script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+				if err != nil || !bytes.Contains(raw, []byte(`"structuredContent":{"ok":true}`)) {
+					t.Fatalf("raw=%s err=%+v", raw, err)
+				}
+				f.mu.Lock()
+				calls := f.calls
+				f.mu.Unlock()
+				if calls != 1 {
+					t.Fatalf("tools/call sent %d times", calls)
+				}
+			})
+		}
+	}
+}
+
+func TestJavaScriptResultGetterExceptions(t *testing.T) {
+	previous := globalConfig
+	globalConfig = Config{}
+	t.Cleanup(func() { globalConfig = previous })
+	for _, source := range []string{
+		`({get value(){throw new Error("getter failed");}})`,
+		`({nested:[{get value(){throw "nested getter failed";}}]})`,
+		`({get value(){throw null;}})`,
+	} {
+		t.Run(source, func(t *testing.T) {
+			script := filepath.Join(t.TempDir(), "result.js")
+			writeHotReloadTestFile(t, script, source)
+			if _, err := runJavaScriptWithSnapshot(nil, script, nil, nil); err == nil {
+				t.Fatal("normal result getter exception was not returned")
+			}
+			for _, convert := range []string{"MCP", "paramCheck", "outCheck"} {
+				vm := goja.New()
+				value, err := vm.RunString(source)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if convert == "MCP" {
+					_, _, err = mcpStructuredResult(value)
+				} else {
+					_, err = parseCheckResponse(value, convert)
+				}
+				var exception *goja.Exception
+				if !errors.As(err, &exception) {
+					t.Fatalf("%s: want Goja exception, got %v", convert, err)
+				}
+			}
+			mcp := &MCPServerConfig{OAuth: MCPOAuthConfig{StateDirectory: t.TempDir()}}
+			if result, err := runOAuthHookJavaScript(nil, mcp, script, nil); err == nil || result != nil {
+				t.Fatalf("OAuth result=%#v err=%v", result, err)
+			}
+		})
+	}
+	// Valid getters remain supported, including nested values.
+	script := filepath.Join(t.TempDir(), "valid.js")
+	writeHotReloadTestFile(t, script, `({get nested(){return [{get value(){return "ok";}}];}})`)
+	if result, err := runJavaScriptWithSnapshot(nil, script, nil, nil); err != nil || result != `{"nested":[{"value":"ok"}]}` {
+		t.Fatalf("valid getter result=%s err=%v", result, err)
+	}
+}
+
+func TestExportJavaScriptValueExecutionFailures(t *testing.T) {
+	for _, mode := range []string{"interrupt", "stack_overflow", "host_panic"} {
+		t.Run(mode, func(t *testing.T) {
+			vm := goja.New()
+			vm.SetMaxCallStackSize(32)
+			if err := vm.Set("hostPanic", func() { panic("host failure") }); err != nil {
+				t.Fatal(err)
+			}
+			source := `({get value(){while(true){};}})`
+			if mode == "stack_overflow" {
+				source = `({get value(){return this.value;}})`
+			}
+			if mode == "host_panic" {
+				source = `({get value(){hostPanic();}})`
+			}
+			value, err := vm.RunString(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == "interrupt" {
+				vm.Interrupt("stop")
+			}
+			if mode == "host_panic" {
+				defer func() {
+					if recovered := recover(); recovered != "host failure" {
+						t.Fatalf("host panic was masked: %v", recovered)
+					}
+				}()
+				_, _ = exportJavaScriptValue(value)
+				return
+			}
+			exported, err := exportJavaScriptValue(value)
+			if err == nil || exported != nil {
+				t.Fatalf("result=%#v err=%v", exported, err)
+			}
+			if mode == "interrupt" {
+				var interrupted *goja.InterruptedError
+				if !errors.As(err, &interrupted) {
+					t.Fatalf("wrong error: %T", err)
+				}
+			} else {
+				var overflow *goja.StackOverflowError
+				if !errors.As(err, &overflow) {
+					t.Fatalf("wrong error: %T", err)
+				}
+			}
+		})
+	}
+}
+
+func TestWSClientContinuesAfterResultGetterException(t *testing.T) {
+	if os.Getenv("NYAN8_TEST_WS_GETTER_CHILD") != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestWSClientContinuesAfterResultGetterException$", "-test.count=1", "-test.timeout=10s")
+		cmd.Env = append(os.Environ(), "NYAN8_TEST_WS_GETTER_CHILD=1")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("WS child failed: %v\n%s", err, output)
+		}
+		return
+	}
+	initTestLogger()
+	publishAPISnapshot(nil)
+	script := filepath.Join(t.TempDir(), "getter.js")
+	writeHotReloadTestFile(t, script, `(function(){if(nyanAllParams.ws_message_text==="bad") return {get value(){throw new Error("getter failed");}}; return "alive";})()`)
+	received := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			received <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for _, message := range []string{"bad", "good"} {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+				received <- err
+				return
+			}
+		}
+		_, data, err := conn.ReadMessage()
+		if err == nil && string(data) != "alive" {
+			err = fmt.Errorf("unexpected reply: %s", data)
+		}
+		received <- err
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+	runtime := newWSClientRuntime(wsClientConfig{name: "getter", scriptPath: script, connectURL: "ws" + strings.TrimPrefix(server.URL, "http")})
+	go runtime.run()
+	defer func() {
+		runtime.update(nil)
+		select {
+		case <-runtime.done:
+		case <-time.After(3 * time.Second):
+			t.Error("WS runtime did not stop")
+		}
+	}()
+	select {
+	case err := <-received:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("next message was not processed")
+	}
+}
+
+func TestMCPStdioContinuesAfterResultGetterException(t *testing.T) {
+	initTestLogger()
+	for _, stage := range []string{"script", "paramCheck", "outCheck"} {
+		t.Run(stage, func(t *testing.T) {
+			loaded, server := newMCPStdioTestConfig(t)
+			api := loaded.Snapshot.Definitions["sample"].(map[string]interface{})
+			writeHotReloadTestFile(t, getAPIString(api, stage), `({get value(){throw new Error("private getter failure");}})`)
+			input := strings.Join([]string{
+				mcpPhase12InitializeBody(mcpProtocol20251125),
+				`{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`,
+				`{"jsonrpc":"2.0","id":"call","method":"tools/call","params":{"name":"sample","arguments":{}}}`,
+				`{"jsonrpc":"2.0","id":"ping","method":"ping","params":{}}`,
+			}, "\n") + "\n"
+			var output bytes.Buffer
+			if err := serveMCPStdio(strings.NewReader(input), &output, loaded.Snapshot, server); err != nil {
+				t.Fatal(err)
+			}
+			responses := make(map[string]map[string]interface{})
+			for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
+				var response map[string]interface{}
+				if err := json.Unmarshal([]byte(line), &response); err != nil {
+					t.Fatal(err)
+				}
+				responses[fmt.Sprint(response["id"])] = response
+			}
+			result, ok := responses["call"]["result"].(map[string]interface{})
+			if !ok || result["isError"] != true {
+				t.Fatalf("tool error missing: %s", output.String())
+			}
+			if _, ok := responses["ping"]["result"]; !ok {
+				t.Fatalf("later ping missing: %s", output.String())
+			}
+			if strings.Contains(output.String(), "private getter failure") {
+				t.Fatal("getter failure details leaked")
+			}
+		})
+	}
+}
+
+func TestOAuthHookGetterDeadline(t *testing.T) {
+	if os.Getenv("NYAN8_TEST_OAUTH_GETTER_CHILD") != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestOAuthHookGetterDeadline$", "-test.count=1", "-test.timeout=22s")
+		cmd.Env = append(os.Environ(), "NYAN8_TEST_OAUTH_GETTER_CHILD=1")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("OAuth deadline child failed: %v\n%s", err, output)
+		}
+		return
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "getter.js")
+	writeHotReloadTestFile(t, script, `({get value(){while(true){};}})`)
+	mcp := &MCPServerConfig{OAuth: MCPOAuthConfig{StateDirectory: filepath.Join(dir, "state")}}
+	start := time.Now()
+	result, err := runOAuthHookJavaScript(nil, mcp, script, nil)
+	elapsed := time.Since(start)
+	if err == nil || result != nil || elapsed < 14*time.Second || elapsed > 20*time.Second {
+		t.Fatalf("getter timeout: elapsed=%s result=%#v err=%v", elapsed, result, err)
+	}
+	writeHotReloadTestFile(t, script, `({authenticated:false})`)
+	if result, err := runOAuthHookJavaScript(nil, mcp, script, nil); err != nil || result == nil {
+		t.Fatalf("later OAuth hook failed: %#v %v", result, err)
+	}
+}
+
+func TestRepeatedIncludeRejectsMixedGenerations(t *testing.T) {
+	initTestLogger()
+	previous, manager := currentAPISnapshot(), backgroundRuntimes
+	defer func() { publishAPISnapshot(previous); backgroundRuntimes = manager }()
+	backgroundRuntimes = nil
+	for _, alias := range []bool{false, true} {
+		for _, restore := range []bool{false, true} {
+			t.Run(fmt.Sprintf("alias=%t/restore=%t", alias, restore), func(t *testing.T) {
+				dir := t.TempDir()
+				root := filepath.Join(dir, "api.json")
+				child := filepath.Join(dir, "child.json")
+				second := child
+				if alias {
+					second = filepath.Join(dir, "alias.json")
+					if err := os.Symlink(child, second); err != nil {
+						t.Fatal(err)
+					}
+				}
+				writeHotReloadTestFile(t, root, `{"active":{"description":"last good"}}`)
+				initial, err := readAPIConfigFile(root, dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				publishAPISnapshot(initial.Snapshot)
+				old := []byte(`{"item":{"description":"old"}}`)
+				writeHotReloadTestFile(t, child, string(old))
+				rootData := []byte(fmt.Sprintf(`{"a":{"type":"include","path":%q},"z":{"type":"include","path":%q}}`, child, second))
+				writeHotReloadTestFile(t, root, string(rootData))
+				loader := &apiGraphLoader{definitions: make(map[string]interface{}), sources: make(map[string]string), fileStates: make(map[string]APIFileState), identities: make(map[string]APIFileState)}
+				_, rootState, _, err := inspectAPIFile(root)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := loader.recordFileState(rootState); err != nil {
+					t.Fatal(err)
+				}
+				identity, err := canonicalExistingAPIFilePath(child)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Read the first mount, then change the file before reading the
+				// second mount at the same state-recording boundary used by the
+				// include traversal. No sleeps or timing race are needed.
+				if err := loader.loadFile(child, identity, old, "a", nil); err != nil {
+					t.Fatal(err)
+				}
+				writeHotReloadTestFile(t, child, `{"item":{"description":"new"}}`)
+				_, secondState, _, err := inspectAPIFile(second)
+				if err != nil {
+					t.Fatal(err)
+				}
+				loadErr := loader.recordFileState(secondState)
+				if loadErr == nil || !strings.Contains(loadErr.Error(), "changed while") {
+					t.Fatalf("mixed candidate accepted: %v", loadErr)
+				}
+				if restore {
+					writeHotReloadTestFile(t, child, string(old))
+				}
+				states, reloaded, err := finishAPIConfigReload(nil, loader.fileStates, loadErr)
+				if err == nil || reloaded || currentAPISnapshot() != initial.Snapshot {
+					t.Fatal("failed candidate replaced last good snapshot")
+				}
+				states, reloaded, err = reloadAPIConfigGraphIfChanged(root, dir, states)
+				if err != nil || !reloaded {
+					t.Fatalf("stable candidate not retried: %v %v", reloaded, err)
+				}
+				want := "new"
+				if restore {
+					want = "old"
+				}
+				for _, name := range []string{"a/item", "z/item"} {
+					if currentAPIFiles()[name].(map[string]interface{})["description"] != want {
+						t.Fatalf("wrong generation at %s", name)
+					}
+				}
+				if _, reloaded, err := reloadAPIConfigGraphIfChanged(root, dir, states); err != nil || reloaded {
+					t.Fatalf("unchanged candidate retried: %v %v", reloaded, err)
+				}
+			})
+		}
 	}
 }
