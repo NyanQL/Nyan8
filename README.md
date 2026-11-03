@@ -126,6 +126,9 @@ JavaScriptの `nyanGetFile` / `nyanReadFileB64` / `nyanSendMailAttachment` と `
     "libs/common.js"
   ],
   "javascript_include_cache": false, // trueで共通JSのソースを起動時にキャッシュ
+  "mcpClient": {
+    "connections": {}               // 外部MCP接続。空ならnyanCallMCPは無効
+  },
   "APIHotReload": {
     "Enabled": true,                // api.json の変更を動的反映
     "Interval": "1s"               // Go duration形式の確認間隔
@@ -1809,4 +1812,4 @@ stdioモードでは次の規則が適用されます。
 
 ## 外部MCPクライアント: nyanCallMCP
 
-設定済みの外部MCPツールをサーバー側JavaScriptから呼び出せます。既定は無効です。設定・権限・戻り値・制限は [nyanCallMCP利用ガイド](NYANCALLMCP.md) と [設定・JS例](examples/nyanCallMCP/) を参照してください。
+設定済みの外部MCPツールをサーバー側JavaScriptから呼び出せます。接続先・許可スクリプト・ツール・サイズ上限などは、`config.json`の`mcpClient.connections`に接続ごとに記述します。同梱設定は接続が空で、既定は無効です。例えば結果サイズの上限は`mcpClient.connections.<接続ID>.maxResultBytes`に整数バイト数で指定します（既定8 MiB、256〜8,388,608バイト）。設定変更の反映には再起動が必要です。詳細は [nyanCallMCP利用ガイド](NYANCALLMCP.md) と [config.jsonへ統合する設定例・JS例](examples/nyanCallMCP/) を参照してください。

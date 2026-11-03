@@ -9,6 +9,9 @@
     "./javascript/base.js"
   ],
   "javascript_include_cache": false,
+  "mcpClient": {
+    "connections": {}
+  },
   "log": {
     "Filename": "./logs/nyan8.log",
     "MaxSize": 5,

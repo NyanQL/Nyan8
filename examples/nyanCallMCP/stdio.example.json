@@ -1,31 +1,33 @@
 {
-  "connections": {
-    "inventory-read": {
-      "credentialMode": "service",
-      "allowedScripts": [
-        "/opt/nyan/Nyan8/javascript/mcp_lookup.js"
-      ],
-      "tools": {
-        "lookup_stock": {
-          "readOnly": true
+  "mcpClient": {
+    "connections": {
+      "inventory-read": {
+        "credentialMode": "service",
+        "allowedScripts": [
+          "/opt/nyan/Nyan8/javascript/mcp_lookup.js"
+        ],
+        "tools": {
+          "lookup_stock": {
+            "readOnly": true
+          }
+        },
+        "protocolVersions": [
+          "2025-06-18",
+          "2026-07-28"
+        ],
+        "timeoutMs": 3000,
+        "maxTimeoutMs": 3000,
+        "maxInputBytes": 1048576,
+        "maxResultBytes": 8388608,
+        "maxConcurrent": 4,
+        "allowQLRead": false,
+        "transport": "stdio",
+        "executable": "/opt/nyan/bin/inventory-mcp",
+        "args": [],
+        "directory": "/opt/nyan/mcp-work",
+        "environmentFiles": {
+          "INVENTORY_TOKEN": "/opt/nyan/secrets/inventory-token"
         }
-      },
-      "protocolVersions": [
-        "2025-06-18",
-        "2026-07-28"
-      ],
-      "timeoutMs": 3000,
-      "maxTimeoutMs": 3000,
-      "maxInputBytes": 1048576,
-      "maxResultBytes": 8388608,
-      "maxConcurrent": 4,
-      "allowQLRead": false,
-      "transport": "stdio",
-      "executable": "/opt/nyan/bin/inventory-mcp",
-      "args": [],
-      "directory": "/opt/nyan/mcp-work",
-      "environmentFiles": {
-        "INVENTORY_TOKEN": "/opt/nyan/secrets/inventory-token"
       }
     }
   }

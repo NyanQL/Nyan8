@@ -282,6 +282,7 @@ type Config struct {
 	APIHotReload           APIHotReloadConfig  `json:"APIHotReload"`
 	WebSocket              WebSocketConfig     `json:"websocket"`
 	ProxyProtocol          ProxyProtocolConfig `json:"proxyProtocol"`
+	MCPClient              *nyanMCPConfig      `json:"mcpClient,omitempty"`
 
 	cachedJavaScriptIncludes *string
 }
@@ -512,12 +513,6 @@ var websocketConnectionCount = struct {
 
 // main はメイン関数です。
 func main() {
-	var mcpConfigErr error
-	nyanMCPClient, mcpConfigErr = loadNyanMCPConfig(os.Getenv("NYAN_MCP_CONFIG"))
-	if mcpConfigErr != nil {
-		fatalServiceError("mcp_client_config_failed", mcpConfigErr)
-	}
-	watchNyanMCPShutdown(nyanMCPClient)
 	// 実行ファイルのディレクトリを取得
 	execPath, err := filepath.Abs(filepath.Dir(os.Args[0]))
 	if err != nil {
@@ -553,6 +548,11 @@ func main() {
 	if err := initLogger(configBaseDir); err != nil {
 		fatalServiceError("invalid_log_level", err, "expected", "debug, info, warn, or error")
 	}
+	nyanMCPClient, err = loadNyanMCPConfig(globalConfig.MCPClient)
+	if err != nil {
+		fatalServiceError("mcp_client_config_failed", err)
+	}
+	watchNyanMCPShutdown(nyanMCPClient)
 	if err := globalConfig.prepareJavaScriptIncludes(execDir); err != nil {
 		fatalServiceError("javascript_include_load_failed", err)
 	}
@@ -8698,7 +8698,7 @@ func receiveLimitH2CHandler(next http.Handler, timeouts HTTPTimeoutsConfig) http
 	})
 }
 
-// BEGIN shared nyanCallMCP contract. Keep this block identical in all three products.
+// BEGIN shared nyanCallMCP contract. Review contract changes across products.
 // SDK v1.7.0 owns protocol negotiation; raw responses are retained at the wire
 // boundary because typed SDK results can omit extension fields and explicit null.
 type nyanMCPToolPolicy struct {
@@ -8728,6 +8728,21 @@ type nyanMCPConnectionConfig struct {
 type nyanMCPConfig struct {
 	Connections map[string]nyanMCPConnectionConfig `json:"connections"`
 }
+
+// Validate the MCP section strictly without changing the decoding rules for
+// unrelated config.json settings. The limit applies only to this section.
+func (cfg *nyanMCPConfig) UnmarshalJSON(data []byte) error {
+	type configValue nyanMCPConfig
+	var value configValue
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if len(data) > 1<<20 || dec.Decode(&value) != nil || dec.Decode(new(any)) != io.EOF || value.Connections == nil || len(value.Connections) > 64 {
+		return errors.New("invalid config.json mcpClient; see NYANCALLMCP.md")
+	}
+	*cfg = nyanMCPConfig(value)
+	return nil
+}
+
 type nyanMCPEndpoint struct {
 	config   nyanMCPConnectionConfig
 	slots    chan struct{}
@@ -8796,28 +8811,16 @@ func nyanMCPFailure(code string) *nyanMCPError {
 	return &nyanMCPError{Code: code, ExecutionState: "not_sent"}
 }
 
-func loadNyanMCPConfig(path string) (*nyanMCPManager, error) {
+func loadNyanMCPConfig(cfg *nyanMCPConfig) (*nyanMCPManager, error) {
 	manager := newNyanMCPManager()
-	if path == "" {
+	if cfg == nil {
 		return manager, nil
 	}
-	fail := func() (*nyanMCPManager, error) { return nil, errors.New("invalid NYAN_MCP_CONFIG; see NYANCALLMCP.md") }
-	if !filepath.IsAbs(path) {
-		return fail()
+	fail := func() (*nyanMCPManager, error) {
+		manager.cancel()
+		return nil, errors.New("invalid config.json mcpClient; see NYANCALLMCP.md")
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return fail()
-	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, (1<<20)+1))
-	if err != nil || len(data) > 1<<20 {
-		return fail()
-	}
-	var cfg nyanMCPConfig
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if dec.Decode(&cfg) != nil || dec.Decode(new(any)) != io.EOF || cfg.Connections == nil || len(cfg.Connections) > 64 {
+	if cfg.Connections == nil || len(cfg.Connections) > 64 {
 		return fail()
 	}
 	for id, c := range cfg.Connections {

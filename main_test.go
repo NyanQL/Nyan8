@@ -445,7 +445,6 @@ func TestJavaScriptIncludeCacheStartup(t *testing.T) {
 			writeHotReloadTestFile(t, apiPath, `{}`)
 			cmd := loggingTestCommand(t, configPath, apiPath)
 			cmd.Args = append(cmd.Args, "--mcp-server", "missing")
-			cmd.Env = append(cmd.Env, "NYAN_MCP_CONFIG=")
 			var stdout, stderr bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &stdout, &stderr
 			if err := cmd.Run(); err == nil {
@@ -457,6 +456,156 @@ func TestJavaScriptIncludeCacheStartup(t *testing.T) {
 			}
 			if !strings.Contains(stderr.String(), want) || stdout.Len() != 0 {
 				t.Fatalf("expected %s on stderr only; stdout=%q stderr=%q", want, stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+func TestMCPClientConfig(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "caller.js")
+	writeHotReloadTestFile(t, script, "0")
+	scriptJSON, err := json.Marshal(script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := fmt.Sprintf(`{"transport":"streamable_http","url":"https://mcp.example.invalid/mcp","credentialMode":"service","allowedScripts":[%s],"tools":{"echo":{"readOnly":true}},"protocolVersions":["2025-06-18"]}`, scriptJSON)
+	section := func(extra string) string {
+		return `{"connections":{"local":` + strings.TrimSuffix(connection, "}") + extra + `}}}`
+	}
+	for _, tc := range []struct {
+		name          string
+		section       string
+		decodeError   bool
+		configError   bool
+		connections   int
+		maxResultSize int
+	}{
+		{name: "omitted"},
+		{name: "null", section: `null`},
+		{name: "empty connections", section: `{"connections":{}}`},
+		{name: "defaults", section: section(""), connections: 1, maxResultSize: 8 << 20},
+		{name: "custom result limit", section: section(`,"maxResultBytes":1048576`), connections: 1, maxResultSize: 1 << 20},
+		{name: "minimum result limit", section: section(`,"maxResultBytes":256`), connections: 1, maxResultSize: 256},
+		{name: "result limit too small", section: section(`,"maxResultBytes":255`), configError: true},
+		{name: "result limit too large", section: section(`,"maxResultBytes":8388609`), configError: true},
+		{name: "negative input limit", section: section(`,"maxInputBytes":-1`), configError: true},
+		{name: "unknown section field", section: `{"connections":{},"unknown":true}`, decodeError: true},
+		{name: "unknown connection field", section: section(`,"unknown":true`), decodeError: true},
+		{name: "unknown tool policy", section: strings.Replace(section(""), `"readOnly":true`, `"readOnly":true,"unknown":true`, 1), decodeError: true},
+		{name: "missing connections", section: `{}`, decodeError: true},
+		{name: "null connections", section: `{"connections":null}`, decodeError: true},
+		{name: "wrong section type", section: `"client.json"`, decodeError: true},
+		{name: "wrong limit type", section: section(`,"maxResultBytes":"1MB"`), decodeError: true},
+		{name: "section size limit", section: `{"connections":{}` + strings.Repeat(" ", (1<<20)-18) + `}`, decodeError: false},
+		{name: "oversized section", section: `{"connections":{}` + strings.Repeat(" ", 1<<20) + `}`, decodeError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configJSON := `{}`
+			if tc.section != "" {
+				configJSON = `{"mcpClient":` + tc.section + `}`
+			}
+			path := filepath.Join(dir, "config.json")
+			writeHotReloadTestFile(t, path, configJSON)
+			cfg, err := loadConfig(path)
+			if (err != nil) != tc.decodeError {
+				t.Fatalf("loadConfig error=%v, want error=%v", err, tc.decodeError)
+			}
+			if err != nil {
+				return
+			}
+			manager, err := loadNyanMCPConfig(cfg.MCPClient)
+			if (err != nil) != tc.configError {
+				t.Fatalf("loadNyanMCPConfig error=%v, want error=%v", err, tc.configError)
+			}
+			if err != nil {
+				if !strings.Contains(err.Error(), "config.json mcpClient") {
+					t.Fatalf("error does not identify the config section: %v", err)
+				}
+				return
+			}
+			t.Cleanup(manager.cancel)
+			if len(manager.endpoints) != tc.connections {
+				t.Fatalf("connections=%d, want %d", len(manager.endpoints), tc.connections)
+			}
+			if tc.connections > 0 && manager.endpoints["local"].config.MaxResultBytes != tc.maxResultSize {
+				t.Fatalf("maxResultBytes=%d, want %d", manager.endpoints["local"].config.MaxResultBytes, tc.maxResultSize)
+			}
+		})
+	}
+}
+
+func TestMCPClientConfigStartup(t *testing.T) {
+	f := &nyanMCPFixture{result: json.RawMessage(`{"content":[],"structuredContent":{"source":"config.json"}}`)}
+	server := httptest.NewServer(http.HandlerFunc(f.serve))
+	defer server.Close()
+	dir := t.TempDir()
+	script := filepath.Join(dir, "caller.js")
+	writeHotReloadTestFile(t, script, `nyanCallMCP({connection:"local",tool:"echo"}).structuredContent;`)
+	apiPath := filepath.Join(dir, "api.json")
+	writeHotReloadTestFile(t, apiPath, `{"caller":{"script":"./caller.js"},"local_mcp":{"type":"mcp","transport":"stdio","tools":["caller"]}}`)
+	connection := nyanMCPConnectionConfig{Transport: "streamable_http", URL: server.URL, AllowHTTP: true, AllowedCIDRs: []string{"127.0.0.0/8", "::1/128"}, CredentialMode: "service", AllowedScripts: []string{script}, Tools: map[string]nyanMCPToolPolicy{"echo": {ReadOnly: true}}, ProtocolVersions: []string{"2025-06-18"}, MaxResultBytes: 1 << 20}
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		invalid bool
+	}{
+		{name: "config only", enabled: true},
+		{name: "omitted stays disabled"},
+		{name: "invalid connection stops startup", enabled: true, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := map[string]any{"log": map[string]any{"EnableLogging": false}}
+			c := connection
+			if tc.invalid {
+				c.MaxResultBytes = 8<<20 + 1
+			}
+			if tc.enabled {
+				config["mcpClient"] = nyanMCPConfig{Connections: map[string]nyanMCPConnectionConfig{"local": c}}
+			}
+			data, err := json.Marshal(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			configPath := filepath.Join(dir, "config.json")
+			writeHotReloadTestFile(t, configPath, string(data))
+			cmd := loggingTestCommand(t, configPath, apiPath)
+			cmd.Args = append(cmd.Args, "--mcp-server", "local_mcp")
+			// An obsolete environment setting must neither override config.json
+			// nor cause the application to read a separate configuration file.
+			cmd.Env = append(cmd.Env, "NYAN_MCP_CONFIG="+filepath.Join(dir, "does-not-exist.json"))
+			cmd.Stdin = strings.NewReader(mcpPhase12InitializeBody(mcpProtocol20251125) + "\n" + `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}` + "\n" + `{"jsonrpc":"2.0","id":"call","method":"tools/call","params":{"name":"caller","arguments":{}}}` + "\n")
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			err = cmd.Run()
+			if tc.invalid {
+				if err == nil || stdout.Len() != 0 || !strings.Contains(stderr.String(), `"msg":"mcp_client_config_failed"`) {
+					t.Fatalf("invalid configuration did not stop startup: err=%v stdout=%s stderr=%s", err, &stdout, &stderr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("startup failed: %v; stderr=%s", err, &stderr)
+			}
+			var response struct {
+				Result struct {
+					IsError           bool           `json:"isError"`
+					StructuredContent map[string]any `json:"structuredContent"`
+				} `json:"result"`
+			}
+			lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+			if len(lines) != 2 {
+				t.Fatalf("unexpected protocol output: %s; stderr=%s", &stdout, &stderr)
+			}
+			if err := json.Unmarshal([]byte(lines[1]), &response); err != nil {
+				t.Fatal(err)
+			}
+			if tc.enabled {
+				if response.Result.IsError || response.Result.StructuredContent["source"] != "config.json" {
+					t.Fatalf("config.json connection was not used: %s; stderr=%s", &stdout, &stderr)
+				}
+			} else if !response.Result.IsError {
+				t.Fatalf("MCP call unexpectedly succeeded without config: %s", &stdout)
 			}
 		})
 	}
@@ -14085,15 +14234,20 @@ func nyanMCPTestManager(t *testing.T, f *nyanMCPFixture) (*nyanMCPManager, strin
 		t.Fatal(err)
 	}
 	cfg := nyanMCPConfig{Connections: map[string]nyanMCPConnectionConfig{"local": {Transport: "streamable_http", URL: server.URL, AllowHTTP: true, AllowedCIDRs: []string{"127.0.0.0/8", "::1/128"}, CredentialMode: "service", AllowedScripts: []string{script}, Tools: map[string]nyanMCPToolPolicy{"echo": {ReadOnly: true}}, ProtocolVersions: []string{"2025-06-18", "2026-07-28"}, AllowQLRead: true}}}
-	data, _ := json.Marshal(cfg)
-	path := filepath.Join(t.TempDir(), "client.json")
+	data, _ := json.Marshal(Config{MCPClient: &cfg, WebSocket: WebSocketConfig{MaxConnections: 128}})
+	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	manager, err := loadNyanMCPConfig(path)
+	config, err := loadConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	manager, err := loadNyanMCPConfig(config.MCPClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(manager.cancel)
 	return manager, script
 }
 func nyanMCPTestVM(manager *nyanMCPManager, ctx context.Context, script, mode string) *goja.Runtime {
@@ -14336,8 +14490,8 @@ func TestNyanMCPSecurityHelpers(t *testing.T) {
 		t.Fatal("world readable credential accepted")
 	}
 	path := filepath.Join(t.TempDir(), "config.json")
-	_ = os.WriteFile(path, []byte(`{"connections":{},"unknown":true}`), 0600)
-	if _, err := loadNyanMCPConfig(path); err == nil {
+	_ = os.WriteFile(path, []byte(`{"mcpClient":{"connections":{},"unknown":true}}`), 0600)
+	if _, err := loadConfig(path); err == nil {
 		t.Fatal("unknown config field accepted")
 	}
 }

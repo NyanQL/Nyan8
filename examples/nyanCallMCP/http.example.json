@@ -1,28 +1,30 @@
 {
-  "connections": {
-    "inventory-read": {
-      "credentialMode": "service",
-      "allowedScripts": [
-        "/opt/nyan/Nyan8/javascript/mcp_lookup.js"
-      ],
-      "tools": {
-        "lookup_stock": {
-          "readOnly": true
-        }
-      },
-      "protocolVersions": [
-        "2025-06-18",
-        "2026-07-28"
-      ],
-      "timeoutMs": 3000,
-      "maxTimeoutMs": 3000,
-      "maxInputBytes": 1048576,
-      "maxResultBytes": 8388608,
-      "maxConcurrent": 4,
-      "allowQLRead": false,
-      "transport": "streamable_http",
-      "url": "https://mcp.example.invalid/mcp",
-      "bearerTokenFile": "/opt/nyan/secrets/mcp-token"
+  "mcpClient": {
+    "connections": {
+      "inventory-read": {
+        "credentialMode": "service",
+        "allowedScripts": [
+          "/opt/nyan/Nyan8/javascript/mcp_lookup.js"
+        ],
+        "tools": {
+          "lookup_stock": {
+            "readOnly": true
+          }
+        },
+        "protocolVersions": [
+          "2025-06-18",
+          "2026-07-28"
+        ],
+        "timeoutMs": 3000,
+        "maxTimeoutMs": 3000,
+        "maxInputBytes": 1048576,
+        "maxResultBytes": 8388608,
+        "maxConcurrent": 4,
+        "allowQLRead": false,
+        "transport": "streamable_http",
+        "url": "https://mcp.example.invalid/mcp",
+        "bearerTokenFile": "/opt/nyan/secrets/mcp-token"
+      }
     }
   }
 }

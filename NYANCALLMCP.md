@@ -38,28 +38,38 @@ const data = result.structuredContent;
 
 ## 起動設定
 
-`NYAN_MCP_CONFIG` に管理者管理のJSONファイルの**絶対パス**を設定します。設定は起動時に一度だけ読み、未指定なら全接続を拒否します。未知キー・不正値・存在しない許可スクリプト・不適切な秘密ファイルは起動エラーです。既存のapi.jsonのhot reloadと独立しており、MCP設定の変更は再起動が必要です。
+接続設定は、Nyan8本体の **`config.json` の `mcpClient.connections`** に記述します。MCP専用の設定ファイルは使用しません。設定は起動時に一度だけ読み、`mcpClient`が未指定・null、または`connections`が空なら全接続を拒否します。`mcpClient`内の未知キー・不正値・存在しない許可スクリプト・不適切な秘密ファイルは起動エラーです。既存のapi.jsonのhot reloadと独立しており、MCP接続設定の変更は再起動が必要です。
 
-```sh
-NYAN_MCP_CONFIG=/opt/nyan/mcp-client.json ./YOUR_PRODUCT
+同梱の`config.json`では、次のように接続を空にしてあります。
+
+```json
+{
+  "mcpClient": {
+    "connections": {}
+  }
+}
 ```
 
-このリポジトリの `examples/nyanCallMCP/` にHTTP/stdio別の設定例と参照用JSがあります。パス・tool名・接続先は環境に合わせて編集してください。例を置くだけでは接続しません。
+このリポジトリの `examples/nyanCallMCP/` にHTTP/stdio別の`mcpClient`設定例と参照用JSがあります。例の`mcpClient`項目を既存の`config.json`へ統合し、パス・tool名・接続先を環境に合わせて編集してください。例のJSONファイル自体を別途読み込む仕組みはありません。
+
+以前の`NYAN_MCP_CONFIG`環境変数は使用しません。既存の専用設定を移行する場合は、その`connections`を`config.json`の`mcpClient.connections`へ移してください。
 
 | フィールド | 意味 |
 |---|---|
-| connections | 接続IDをキーとするobject（最大64接続） |
+| connections | `mcpClient`直下に置く、接続IDをキーとするobject（最大64接続） |
 | transport | `streamable_http` または `stdio` |
 | allowedScripts | 呼出し元本体JSの絶対パス。symlink解決後のパスを照合。API名や引数のuserIdで権限を選ばない |
 | tools | 正確なtool名 → `{ "readOnly": true/false }`。実行権限と参照/更新の管理者宣言 |
 | protocolVersions | `2025-06-18` / `2026-07-28` の明示許可リスト |
 | credentialMode | 初期版は `service` のみ。利用者別資格情報を黙ってサービス主体へ代替しない |
 | timeoutMs / maxTimeoutMs | 既定30,000 / 上限120,000ミリ秒。親contextの期限を優先 |
-| maxInputBytes / maxResultBytes | 既定1 MiB / 8 MiB。増やせず、より小さく設定可能 |
+| maxInputBytes / maxResultBytes | 接続ごとに整数バイト数で指定。既定1 MiB / 8 MiB。指定範囲はそれぞれ1〜1,048,576 / 256〜8,388,608。省略・0は既定値 |
 | maxConcurrent | 接続単位で既定4、最大32。同一プロセス全体でも32。待機キューなし、超過はBUSY |
 | allowQLRead | QLから参照を許可する明示フラグ。既定false |
 
 `allowedScripts` はサービス主体の**スクリプト単位の権限**です。エンドユーザーの認可は既存のAPI認証・paramCheck等で実施してください。同じスクリプトが複数APIから利用される場合、その全経路が許可対象になります。includeは本体スクリプトの権限で実行されます。利用者別の資格情報選択・自動OAuthは未対応です。
+
+例えば接続IDが`inventory-read`の場合、結果サイズの上限は`config.json`の`mcpClient.connections.inventory-read.maxResultBytes`で指定します。`1048576`なら1 MiBです。
 
 ### Streamable HTTP
 
@@ -101,7 +111,7 @@ NYAN_MCP_CONFIG=/opt/nyan/mcp-client.json ./YOUR_PRODUCT
 
 ## 開発・試験
 
-3製品の `main.go` の `BEGIN shared nyanCallMCP` ブロックと `main_test.go` の共通適合テストを同一に保ってください。独立リポジトリとNyan8の単一ファイル方針に従い、初期版は共有モジュールへの物理分割を行っていません。
+`main.go` の `BEGIN shared nyanCallMCP` ブロックと `main_test.go` の共通適合テストは、関連製品との契約確認に使用します。設定読み込みは本製品の`config.json`へ統合しています。独立リポジトリとNyan8の単一ファイル方針に従い、初期版は共有モジュールへの物理分割を行っていません。
 
 ```sh
 go test -run '^TestNyanMCP' -count=1 ./...
