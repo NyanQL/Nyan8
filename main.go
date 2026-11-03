@@ -264,23 +264,26 @@ func newConfiguredHTTPServer(address string, handler http.Handler, timeouts HTTP
 }
 
 type Config struct {
-	HTTPTimeouts      HTTPTimeoutsConfig  `json:"httpTimeouts"`
-	ReceiveLimits     ReceiveLimitsConfig `json:"receiveLimits"`
-	Name              string              `json:"name"`
-	Profile           string              `json:"profile"`
-	Version           string              `json:"version"`
-	Port              int                 `json:"Port"`
-	BindAddress       string              `json:"bindAddress"`
-	CertFile          string              `json:"certPath"`
-	KeyFile           string              `json:"keyPath"`
-	JavaScriptInclude []string            `json:"javascript_include"`
-	Log               LogConfig           `json:"log"`
-	SMTP              SMTPConfig          `json:"smtp"`
-	OAuthAdmin        OAuthAdminConfig    `json:"oauth_admin"`
-	OAuthStateRoot    string              `json:"oauth_state_directory"`
-	APIHotReload      APIHotReloadConfig  `json:"APIHotReload"`
-	WebSocket         WebSocketConfig     `json:"websocket"`
-	ProxyProtocol     ProxyProtocolConfig `json:"proxyProtocol"`
+	HTTPTimeouts           HTTPTimeoutsConfig  `json:"httpTimeouts"`
+	ReceiveLimits          ReceiveLimitsConfig `json:"receiveLimits"`
+	Name                   string              `json:"name"`
+	Profile                string              `json:"profile"`
+	Version                string              `json:"version"`
+	Port                   int                 `json:"Port"`
+	BindAddress            string              `json:"bindAddress"`
+	CertFile               string              `json:"certPath"`
+	KeyFile                string              `json:"keyPath"`
+	JavaScriptInclude      []string            `json:"javascript_include"`
+	JavaScriptIncludeCache bool                `json:"javascript_include_cache"`
+	Log                    LogConfig           `json:"log"`
+	SMTP                   SMTPConfig          `json:"smtp"`
+	OAuthAdmin             OAuthAdminConfig    `json:"oauth_admin"`
+	OAuthStateRoot         string              `json:"oauth_state_directory"`
+	APIHotReload           APIHotReloadConfig  `json:"APIHotReload"`
+	WebSocket              WebSocketConfig     `json:"websocket"`
+	ProxyProtocol          ProxyProtocolConfig `json:"proxyProtocol"`
+
+	cachedJavaScriptIncludes *string
 }
 
 // WebSocketConfig keeps the legacy API WebSocket feature available while
@@ -549,6 +552,9 @@ func main() {
 
 	if err := initLogger(configBaseDir); err != nil {
 		fatalServiceError("invalid_log_level", err, "expected", "debug, info, warn, or error")
+	}
+	if err := globalConfig.prepareJavaScriptIncludes(execDir); err != nil {
+		fatalServiceError("javascript_include_load_failed", err)
 	}
 	binaryVersion := BinaryVersion
 	if strings.TrimSpace(binaryVersion) == "" {
@@ -1531,6 +1537,48 @@ func writeWebSocketCheckResponse(conn *serverWebSocket, messageType int, respons
 	return conn.WriteMessage(messageType, body)
 }
 
+func readJavaScriptIncludeFiles(basePath string, paths []string) (string, error) {
+	var source strings.Builder
+	for _, includePath := range paths {
+		includeAbs, err := resolvePath(basePath, includePath)
+		if err != nil {
+			return "", fmt.Errorf("failed to resolve included JS file %s: %w", includePath, err)
+		}
+		code, err := os.ReadFile(includeAbs)
+		if err != nil {
+			return "", fmt.Errorf("failed to read included JS file %s: %w", includeAbs, err)
+		}
+		source.Write(code)
+		source.WriteByte('\n')
+	}
+	return source.String(), nil
+}
+
+// Called after config-relative paths are resolved and before starting workers.
+// Only source text is cached; each execution still creates a fresh goja runtime.
+func (cfg *Config) prepareJavaScriptIncludes(basePath string) error {
+	cfg.cachedJavaScriptIncludes = nil
+	if !cfg.JavaScriptIncludeCache {
+		return nil
+	}
+	source, err := readJavaScriptIncludeFiles(basePath, cfg.JavaScriptInclude)
+	if err != nil {
+		return err
+	}
+	cfg.cachedJavaScriptIncludes = &source
+	return nil
+}
+
+func (cfg *Config) javaScriptIncludes(basePath string) (string, error) {
+	if !cfg.JavaScriptIncludeCache {
+		return readJavaScriptIncludeFiles(basePath, cfg.JavaScriptInclude)
+	}
+	if cfg.cachedJavaScriptIncludes == nil {
+		return "", errors.New("javascript include cache has not been initialized")
+	}
+	return *cfg.cachedJavaScriptIncludes, nil
+}
+
 // runJavaScript はJavaScriptを実行します。
 // runJavaScript は、指定された JavaScript コードを goja で実行します。
 func runJavaScript(scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (string, error) {
@@ -1589,19 +1637,9 @@ func runJavaScriptValueForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath s
 		}
 	}
 
-	// globalConfig.JavaScriptInclude にある各ファイルを読み込み、連結する
-	var jsCode string
-	for _, includePath := range globalConfig.JavaScriptInclude {
-		// ★★★ 修正：resolvePath で絶対/相対/URL/環境変数/波線を解決 ★★★
-		includeAbs, rerr := resolvePath(basePath, includePath)
-		if rerr != nil {
-			return nil, fmt.Errorf("failed to resolve included JS file %s: %v", includePath, rerr)
-		}
-		code, err := ioutil.ReadFile(includeAbs)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read included JS file %s: %v", includeAbs, err)
-		}
-		jsCode += string(code) + "\n"
+	jsCode, err := globalConfig.javaScriptIncludes(basePath)
+	if err != nil {
+		return nil, err
 	}
 
 	// メインスクリプトを読み込む

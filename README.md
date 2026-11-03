@@ -125,6 +125,7 @@ JavaScriptの `nyanGetFile` / `nyanReadFileB64` / `nyanSendMailAttachment` と `
   "javascript_include": [           // 共通 JS をロード（任意複数可）
     "libs/common.js"
   ],
+  "javascript_include_cache": false, // trueで共通JSのソースを起動時にキャッシュ
   "APIHotReload": {
     "Enabled": true,                // api.json の変更を動的反映
     "Interval": "1s"               // Go duration形式の確認間隔
@@ -162,6 +163,13 @@ JavaScriptの `nyanGetFile` / `nyanReadFileB64` / `nyanSendMailAttachment` と `
   }
 }
 ```
+
+`javascript_include_cache` は共通JavaScriptの読込方法を切り替えます。
+
+- `false` または省略時：実行ごとにファイルを読み込み、次回の実行から変更を反映します。
+- `true`：起動時に設定順で読み込み、連結したソース文字列をキャッシュします。読込に失敗すると起動を中止します。ファイルの変更を反映するにはプロセスの再起動が必要で、`api.json` のホットリロードではキャッシュを更新しません。
+
+キャッシュの対象は `javascript_include` のソース文字列です。共通JSは実行ごとに新しいVMで評価され、本体・`paramCheck`・`outCheck` のファイルは引き続き毎回読み込みます。HTTP、JSON-RPC、MCP、schedule、WebSocket、`nyanCallMe()`、Pushで共通の設定を使用します。OAuth専用の実行環境は従来どおり共通JSを読み込みません。
 
 <details>
 <summary>ログ設定項目の説明</summary>
@@ -463,7 +471,7 @@ schedule の `script` では通常の API と同じように `nyanAllParams`、`
 | `nyanAllParams.nyan_schedule_time` | 実行予定時刻 |
 | `nyanAllParams.nyan_schedule_description` | `api.json` に書いた説明 |
 
-schedule は HTTP リクエストから実行されないため、`nyanGetRemoteIP()`、`nyanGetUserAgent()`、`nyanGetRequestHeaders()` などリクエスト情報に依存する関数は空の値を返します。`javascript_include` に設定した共通 JavaScript は、schedule の `script` 実行時にも毎回読み込まれます。
+schedule は HTTP リクエストから実行されないため、`nyanGetRemoteIP()`、`nyanGetUserAgent()`、`nyanGetRequestHeaders()` などリクエスト情報に依存する関数は空の値を返します。`javascript_include` に設定した共通 JavaScript は、schedule の `script` 実行時にも評価されます。ファイルを毎回読み込むか、起動時のソースキャッシュを使うかは `javascript_include_cache` に従います。
 
 schedule 定義自体には `paramCheck` / `outCheck` / `push` は適用されません。`nyanCallMe()` で通常APIを呼び出す場合は、呼び出し先の `paramCheck` / `outCheck` が実行されます。呼び出し先APIに `push` があれば、そのAPIのチェックと本体が成功した後にPushも実行します。
 
@@ -1785,7 +1793,7 @@ MCP clientの一般的な設定は次の形です。
 stdioモードでは次の規則が適用されます。
 
 - HTTP/HTTPS listener、OAuth endpoint、schedule、WebSocket client、API hot reloadを開始しません。
-- API snapshot、Tool allowlist、JSON Schemaは起動時に作成したものを利用します。本体・`paramCheck`・`outCheck` のJavaScriptと共通の `javascript_include` ファイルは、それぞれの実行時に読み込みます。
+- API snapshot、Tool allowlist、JSON Schemaは起動時に作成したものを利用します。本体・`paramCheck`・`outCheck` のJavaScriptは実行時に読み込みます。共通の `javascript_include` は `javascript_include_cache` が `true` なら起動時のソースキャッシュを使い、`false` または省略時は毎回ファイルを読み込みます。
 - OAuth tokenは要求せず、子プロセスを起動できるOS userをsecurity boundaryとします。
 - Tool JavaScriptの`nyanAllParams.mcp_principal.transport`は`"stdio"`です。
 - HTTP用の`securitySchemes`はstdioの`tools/list`へ出力しません。
