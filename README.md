@@ -207,6 +207,8 @@ HTTPサーバーモードでは、ルートの `api.json` と、そこから `in
 
 不正なJSON、存在しないinclude先、不正なschedule／ws_client設定などは採用されず、直前の正常な定義で稼働を継続します。失敗した候補内で新しく見つかったinclude先も監視されるため、ファイルの作成や修正だけで自動的に再試行されます。同じファイル状態とエラーは繰り返しログ出力されません。
 
+読込中に設定ファイルが変わった場合も、直前の正常な定義を維持し、次の確認時に再読込します。ルートとinclude先は指定されたパスを監視するため、symlinkの参照先を差し替える更新にも対応します。同じファイルを複数のsymlinkで参照している場合も、それぞれの差し替えを検知します。
+
 通常APIは `/API名` と、API名が `api/` で始まらない場合の `/api/API名` に登録されます。`x` と `api/x` のように同じURLへ登録される通常APIの組み合わせは、include展開後の検証で設定エラーになります。初回起動では起動を中止し、ホットリロードでは直前の正常な定義を維持します。
 
 `Interval` は `500ms`、`1s`、`1m`、`24h` などのGo duration形式です。空の場合は `1s` になります。0以下または解析できない値は起動エラーです。ホットリロードを無効にする場合は `Enabled` を `false` にします。`APIHotReload` 全体を省略した場合は有効、1秒間隔です。
@@ -731,6 +733,8 @@ JSON化できても、各経路の応答形式の要件は変わりません。�
 GET/POST/JSON 受信パラメータをまとめたオブジェクトです。
 このオブジェクトから受信した情報をすべて取得することができます。
 
+JSONの`__proto__`も通常のデータキーとして保持します。入れ子のオブジェクトや配列内でも、その値がJavaScriptオブジェクトのプロトタイプとして扱われることはありません。
+
 通常HTTP API（`/API名`・`/?api=API名`）では、URLクエリとJSON・フォーム本文に同じ項目がある場合、本文の値を優先します。`nyan_mode` も同じ規則です。統合後の値を `paramCheck`・本体・`outCheck` に渡します。通常パスの `nyanAllParams.api` は呼び出し先API名に固定されます。JSON-RPCは `params` を入力として使用し、URLクエリを統合しません。
 
 `Content-Type: application/json` の本文は全体を検証します。空本文・空白だけの本文・本文全体の `null` は、本文からの追加パラメータなしとして受理します。空でない本文はJSONオブジェクトまたは `null` の1文書である必要があり、連結JSON（`{"x":1}{"x":2}`）や末尾の余分なデータ、不正なJSONはHTTP 400として、チェック・本体・Pushより前に拒否します。`{"x":null}` はURL側の `x` を明示的な `null` に置き換えます。空本文でも必要な入力の検査は `paramCheck` が行います。OAuth・MCP・JSON-RPCにはそれぞれ専用の入力処理があり、ここで説明する通常HTTPの規則とは分けて扱います。
@@ -979,6 +983,8 @@ console.log(result);
 #### 戻り値
 成功時：`true`
 失敗時：JavaScript 側で例外（`Error` 相当）が投げられます。
+
+SMTPSでサーバーが`DATA`を拒否した場合も、`try/catch`で送信失敗を受け取れます。
 
 ### 4‑13 添付ヘルパー nyanSendMailAttachment
 ファイルパスを渡すと、`nyanSendMail` 用の添付オブジェクトを返します。
@@ -1499,6 +1505,8 @@ MCP Toolの `arguments.nyan_mode` は `verifyAccess` に引き継ぎません。
 | `redirect_uri_allowed_prefixes` | MCP定義の `redirectURIAllowedPrefixes` |
 | `state_directory` | 解決済みのOAuth state保存先 |
 
+`scopes`と`redirect_uri_allowed_prefixes`は、要求ごとに設定からコピーした配列です。hookやチェック内で要素を書き換えても、共有設定・次の要求・公開メタデータには反映されません。
+
 `authorize`、`token`、`register`、`adminUser` とメタデータ用のチェックには、次のHTTPリクエスト情報も入ります。
 
 | キー | 内容 |
@@ -1805,11 +1813,6 @@ stdioモードでは次の規則が適用されます。
 - `allowedOrigins`、OAuth API参照、公開domainはstdio専用定義では不要です。
 
 
----
-## 8 ライセンス
-[MIT License](LICENSE.md)
-
-
 ## 外部MCPクライアント: nyanCallMCP
 
 設定済みの外部MCPツールをサーバー側JavaScriptから呼び出せます。接続先・許可スクリプト・ツール・サイズ上限などは、`config.json`の`mcpClient.connections`に接続ごとに記述します。同梱設定は接続が空で、既定は無効です。例えば結果サイズの上限は`mcpClient.connections.<接続ID>.maxResultBytes`に整数バイト数で指定します（既定8 MiB、256〜8,388,608バイト）。設定変更の反映には再起動が必要です。
@@ -1939,3 +1942,9 @@ go build -o /tmp/nyan-mcp-check main.go
 ### Nyan8での利用
 
 APIのscriptやscheduleのJS本体をallowedScriptsに登録します。JS全体を包むDBトランザクションはありません。更新系を使う場合はAPI認可・利用者の明示操作・接続先の冪等性/結果照会を組み合わせてください。scheduleの削除は進行中MCPを取消しますが、外部実行の取り消しや重複防止を保証しません。OAuth専用の制限付きVMには追加していません。
+
+---
+
+## 8 ライセンス
+
+[MIT License](LICENSE.md)

@@ -1649,12 +1649,16 @@ func runJavaScriptValueForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath s
 	}
 	jsCode += string(mainCode)
 
-	// allParams を JSON 化して、グローバル変数 allParams としてセットする
+	// JSONとして解析し、__proto__も通常のデータキーとして保持する。
 	allParamsJSON, err := json.Marshal(allParams)
 	if err != nil {
 		return nil, err
 	}
-	_, err = vm.RunString(fmt.Sprintf("let nyanAllParams = %s;", string(allParamsJSON)))
+	paramsLiteral, err := json.Marshal(string(allParamsJSON))
+	if err != nil {
+		return nil, err
+	}
+	_, err = vm.RunString("let nyanAllParams = JSON.parse(" + string(paramsLiteral) + ");")
 	if err != nil {
 		return nil, err
 	}
@@ -4078,8 +4082,8 @@ func invokeOAuthHook(snapshot *APIConfigSnapshot, mcp *MCPServerConfig, runtimeU
 		"resource":                      runtimeURLs.Resource,
 		"issuer":                        runtimeURLs.Issuer,
 		"path":                          apiPath,
-		"scopes":                        mcp.OAuth.Scopes,
-		"redirect_uri_allowed_prefixes": mcp.RedirectURIAllowedPrefixes,
+		"scopes":                        append([]string(nil), mcp.OAuth.Scopes...),
+		"redirect_uri_allowed_prefixes": append([]string(nil), mcp.RedirectURIAllowedPrefixes...),
 		"state_directory":               mcp.OAuth.StateDirectory,
 	}
 	for key, value := range extra {
@@ -6421,6 +6425,7 @@ func sendMail(
 		if err != nil {
 			return err
 		}
+		defer conn.Close()
 		c, err := smtp.NewClient(conn, s.Host)
 		if err != nil {
 			return err
@@ -6438,7 +6443,10 @@ func sendMail(
 				return err
 			}
 		}
-		w, _ := c.Data()
+		w, err := c.Data()
+		if err != nil {
+			return err
+		}
 		if _, err := w.Write(msg.Bytes()); err != nil {
 			return err
 		}
@@ -7075,10 +7083,11 @@ type APIConfigSnapshot struct {
 }
 
 type APIFileState struct {
-	Path   string
-	Exists bool
-	Hash   [sha256.Size]byte
-	Error  string
+	Path     string // Configured path, retained so symlink replacements are observed.
+	Identity string // Resolved path, also used independently for include cycle detection.
+	Exists   bool
+	Hash     [sha256.Size]byte
+	Error    string
 }
 
 type apiConfigLoadResult struct {
@@ -7136,8 +7145,8 @@ func readAPIConfigFileAttempt(apiFilePath, apiBaseDir string) (*apiConfigLoadRes
 	if err != nil {
 		return nil, nil, err
 	}
-	identity, state, data, err := inspectAPIFile(normalizedPath)
-	discovered := map[string]APIFileState{identity: state}
+	_, state, data, err := inspectAPIFile(normalizedPath)
+	discovered := map[string]APIFileState{normalizedPath: state}
 	if err != nil {
 		return nil, discovered, fmt.Errorf("read api file %s: %w", normalizedPath, err)
 	}
@@ -7273,7 +7282,7 @@ func (loader *apiGraphLoader) loadFile(filePath, identity string, data []byte, m
 		return includeCycleError(stack, filePath)
 	}
 	stack = append(stack, apiIncludeFrame{path: filePath, identity: identity})
-	loader.fileStates[identity] = APIFileState{Path: identity, Exists: true, Hash: sha256.Sum256(data)}
+	loader.fileStates[filePath] = APIFileState{Path: filePath, Identity: identity, Exists: true, Hash: sha256.Sum256(data)}
 	rawDefinitions, err := decodeRawAPIDefinitions(data)
 	if err != nil {
 		return fmt.Errorf("API file %s: %w", filePath, err)
@@ -7311,7 +7320,7 @@ func (loader *apiGraphLoader) loadFile(filePath, identity string, data []byte, m
 			return fmt.Errorf("include %q in %s: %w", name, filePath, err)
 		}
 		includeIdentity, includeState, includeData, err := inspectAPIFile(includePath)
-		loader.fileStates[includeIdentity] = includeState
+		loader.fileStates[includePath] = includeState
 		if err != nil {
 			return fmt.Errorf("include %q in %s: %w", name, filePath, err)
 		}
@@ -7531,10 +7540,10 @@ func inspectAPIFile(path string) (string, APIFileState, []byte, error) {
 	}
 	data, err := os.ReadFile(normalizedPath)
 	if err != nil {
-		state := APIFileState{Path: identity, Exists: true, Error: "read_error"}
+		state := APIFileState{Path: normalizedPath, Identity: identity, Exists: true, Error: "read_error"}
 		return identity, state, nil, fmt.Errorf("file cannot be read: %s: %w", normalizedPath, err)
 	}
-	state := APIFileState{Path: identity, Exists: true, Hash: sha256.Sum256(data)}
+	state := APIFileState{Path: normalizedPath, Identity: identity, Exists: true, Hash: sha256.Sum256(data)}
 	return identity, state, data, nil
 }
 
@@ -7853,6 +7862,8 @@ func apiFileStatesFingerprint(states map[string]APIFileState) [sha256.Size]byte 
 		_, _ = hasher.Write([]byte{0})
 		_, _ = io.WriteString(hasher, state.Path)
 		_, _ = hasher.Write([]byte{0})
+		_, _ = io.WriteString(hasher, state.Identity)
+		_, _ = hasher.Write([]byte{0})
 		if state.Exists {
 			_, _ = hasher.Write([]byte{1})
 		} else {
@@ -7924,21 +7935,22 @@ func reloadAPIConfigGraphIfChanged(apiFilePath, apiBaseDir string, lastObservedS
 		return lastObservedStates, false, nil
 	}
 	loaded, discoveredStates, err := readAPIConfigFileAttempt(apiFilePath, apiBaseDir)
+	return finishAPIConfigReload(loaded, discoveredStates, err)
+}
+
+func finishAPIConfigReload(loaded *apiConfigLoadResult, discoveredStates map[string]APIFileState, err error) (map[string]APIFileState, bool, error) {
+	if err == nil {
+		err = verifyAPIFileStates(loaded.Snapshot.FileStates)
+	}
 	if err != nil {
 		var activeStates map[string]APIFileState
 		if snapshot := currentAPISnapshot(); snapshot != nil {
 			activeStates = snapshot.FileStates
 		}
-		watched := mergeAPIFileStates(activeStates, discoveredStates)
-		return observeAPIFileStates(watched), false, err
-	}
-	if err := verifyAPIFileStates(loaded.Snapshot.FileStates); err != nil {
-		var activeStates map[string]APIFileState
-		if snapshot := currentAPISnapshot(); snapshot != nil {
-			activeStates = snapshot.FileStates
-		}
-		watched := mergeAPIFileStates(activeStates, discoveredStates)
-		return observeAPIFileStates(watched), false, err
+		// Retain the candidate states actually read, including failures. Recording
+		// newer, unvalidated contents here would suppress the next reload attempt.
+		watched := mergeAPIFileStates(observeAPIFileStates(activeStates), discoveredStates)
+		return watched, false, err
 	}
 	configChanged := publishLoadedAPIConfig(loaded)
 	return cloneAPIFileStates(loaded.Snapshot.FileStates), configChanged, nil
@@ -9157,7 +9169,8 @@ func (t *nyanMCPHTTP) RoundTrip(request *http.Request) (*http.Response, error) {
 			t.wire.setFailure(failure)
 		}
 	}
-	if strings.Contains(response.Header.Get("Content-Type"), "text/event-stream") {
+	mediaType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
+	if mediaType == "text/event-stream" {
 		// SSE data fields can span lines; comments and notifications are not results.
 		var event strings.Builder
 		eventName := ""

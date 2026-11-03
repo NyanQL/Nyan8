@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -3033,11 +3034,7 @@ func TestReloadAPIConfigGraphWatchesInvalidCandidateUntilCorrected(t *testing.T)
 	if err == nil || reloaded {
 		t.Fatalf("invalid candidate reload=%t err=%v", reloaded, err)
 	}
-	canonicalChild, err := canonicalExistingAPIFilePath(childPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	invalid, exists := observed[canonicalChild]
+	invalid, exists := observed[childPath]
 	if !exists || !invalid.Exists || invalid.Hash == ([sha256.Size]byte{}) {
 		t.Fatalf("invalid candidate state=%#v exists=%t", invalid, exists)
 	}
@@ -14880,5 +14877,411 @@ func TestNyanMCPHTTPCloseRespectsCallContext(t *testing.T) {
 				t.Fatalf("tools/call count=%d, want 1", f.calls)
 			}
 		})
+	}
+}
+
+func TestSMTPSDataRefusalReturnsError(t *testing.T) {
+	// Fallback roots are process-global and can only be installed once. Keep
+	// the local test certificate and the SMTP configuration in a subprocess.
+	if os.Getenv("NYAN8_TEST_SMTPS_CHILD") != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSMTPSDataRefusalReturnsError$", "-test.count=1", "-test.timeout=15s")
+		cmd.Env = append(os.Environ(), "NYAN8_TEST_SMTPS_CHILD=1")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("SMTPS subprocess: %v\n%s", err, output)
+		}
+		return
+	}
+	initTestLogger()
+	t.Setenv("GODEBUG", "x509usefallbackroots=1")
+	certServer := httptest.NewTLSServer(http.NotFoundHandler())
+	roots := x509.NewCertPool()
+	roots.AddCert(certServer.Certificate())
+	tlsConfig := certServer.TLS.Clone()
+	certServer.Close()
+	x509.SetFallbackRoots(roots)
+	for _, tc := range []struct {
+		name, dataReply, bodyReply, want string
+		legacy                           bool
+	}{
+		{name: "DATA permanent refusal", dataReply: "554 delivery rejected", want: "554"},
+		{name: "DATA temporary refusal legacy", dataReply: "451 try later", want: "451", legacy: true},
+		{name: "body refusal", dataReply: "354 send message", bodyReply: "554 rejected after body", want: "554"},
+		{name: "success", dataReply: "354 send message", bodyReply: "250 queued", want: "true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tcp, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			listener := tls.NewListener(tcp, tlsConfig)
+			defer listener.Close()
+			done := make(chan error, 1)
+			go func() {
+				conn, err := listener.Accept()
+				if err != nil {
+					done <- err
+					return
+				}
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+				reader := bufio.NewReader(conn)
+				reply := "220 localhost ESMTP"
+				for {
+					if _, err := io.WriteString(conn, reply+"\r\n"); err != nil {
+						done <- err
+						return
+					}
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						done <- err
+						return
+					}
+					switch {
+					case strings.HasPrefix(line, "EHLO"):
+						reply = "250-localhost\r\n250 AUTH PLAIN"
+					case strings.HasPrefix(line, "AUTH"):
+						reply = "235 accepted"
+					case strings.HasPrefix(line, "DATA"):
+						if strings.HasPrefix(tc.dataReply, "354") {
+							if _, err := io.WriteString(conn, tc.dataReply+"\r\n"); err != nil {
+								done <- err
+								return
+							}
+							if _, err := textproto.NewReader(reader).ReadDotBytes(); err != nil {
+								done <- err
+								return
+							}
+							reply = tc.bodyReply
+						} else {
+							reply = tc.dataReply
+						}
+					case strings.HasPrefix(line, "QUIT"):
+						_, err := io.WriteString(conn, "221 bye\r\n")
+						done <- err
+						return
+					default:
+						reply = "250 ok"
+					}
+				}
+			}()
+			globalConfig.SMTP = SMTPConfig{Host: "127.0.0.1", Port: tcp.Addr().(*net.TCPAddr).Port, Username: "test", Password: "test", FromEmail: "sender@example.test", TLS: true}
+			call := `nyanSendMail({to:"recipient@example.test",subject:"test",body:"body"})`
+			if tc.legacy {
+				call = `nyanSendMail("recipient@example.test", "test", "body")`
+			}
+			script := filepath.Join(t.TempDir(), "mail.js")
+			writeHotReloadTestFile(t, script, `var result=""; try { result=String(`+call+`); } catch(e) { result=String(e); } result;`)
+			value, err := runJavaScriptWithSnapshot(nil, script, nil, nil)
+			if err != nil || !strings.Contains(value, tc.want) {
+				t.Fatalf("result=%q err=%v want=%q", value, err, tc.want)
+			}
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRequestJSONPrototypePreserved(t *testing.T) {
+	initTestLogger()
+	script := filepath.Join(t.TempDir(), "echo.js")
+	writeHotReloadTestFile(t, script, `
+function verify(value) {
+  if (value === null || typeof value !== "object") return;
+  if (!Array.isArray(value) && Object.getPrototypeOf(value) !== Object.prototype) throw new Error("changed prototype");
+  if (value.unexpected !== undefined) throw new Error("inherited request data");
+  Object.keys(value).forEach(function(key) { if (key !== "__proto__") verify(value[key]); });
+}
+verify(nyanAllParams);
+JSON.stringify(nyanAllParams);`)
+	for _, body := range []string{
+		`{"__proto__":{"unexpected":"injected"},"nested":{"__proto__":{"unexpected":"nested"}},"items":[{"__proto__":{"unexpected":true}}]}`,
+		`{"__proto__":null,"nested":{"__proto__":"text"},"items":[{"__proto__":1}],"text":"日本語\n\"\\\u2028\u2029"}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/?api=echo", strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = request
+			params, err := collectRequestParams(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := runJavaScriptWithSnapshot(nil, script, params, c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var actual interface{}
+			if err := json.Unmarshal([]byte(result), &actual); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(actual, params) {
+				t.Fatalf("JSON keys or values changed: got=%#v want=%#v", actual, params)
+			}
+		})
+	}
+}
+
+func TestOAuthHookConfigArraysAreIsolated(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	writeHotReloadTestFile(t, filepath.Join(dir, "oauth-hook.js"), `
+if (nyanAllParams.scopes[0] !== "nyan8:read" || nyanAllParams.redirect_uri_allowed_prefixes[0] !== "https://chatgpt.com/connector/oauth/") throw new Error("previous hook changed settings");
+nyanAllParams.scopes[0] = "changed";
+nyanAllParams.redirect_uri_allowed_prefixes[0] = "https://changed.example/";
+({authenticated:false});`)
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcp := loaded.Snapshot.MCPServers["custom-mcp"]
+	wantScopes := append([]string(nil), mcp.OAuth.Scopes...)
+	wantPrefixes := append([]string(nil), mcp.RedirectURIAllowedPrefixes...)
+	for i := 0; i < 2; i++ {
+		if _, err := invokeOAuthHook(loaded.Snapshot, mcp, mcpRuntimeURLs{}, "oauthValidateAccessToken", nil); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(mcp.OAuth.Scopes, wantScopes) || !reflect.DeepEqual(mcp.RedirectURIAllowedPrefixes, wantPrefixes) {
+			t.Fatal("hook changed shared configuration")
+		}
+	}
+	for _, role := range []string{"authorizationServerMetadata", "protectedResourceMetadata"} {
+		value, err := invokeOAuthHook(loaded.Snapshot, mcp, mcpRuntimeURLs{}, role, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := value.(map[string]interface{})["body"].(map[string]interface{})
+		if !reflect.DeepEqual(body["scopes_supported"], wantScopes) {
+			t.Fatalf("metadata scopes changed: %#v", body)
+		}
+	}
+	writeHotReloadTestFile(t, filepath.Join(dir, "oauth-hook.js"), `
+for (var i=0; i<100; i++) {
+  nyanAllParams.scopes[0] = nyanAllParams.scopes[0].trim();
+  nyanAllParams.redirect_uri_allowed_prefixes[0] = nyanAllParams.redirect_uri_allowed_prefixes[0].trim();
+}
+({authenticated:false});`)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := invokeOAuthHook(loaded.Snapshot, mcp, mcpRuntimeURLs{}, "oauthValidateAccessToken", nil); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestReloadAPIConfigGraphRetriesChangedCandidate(t *testing.T) {
+	initTestLogger()
+	previous, manager := currentAPISnapshot(), backgroundRuntimes
+	defer func() { publishAPISnapshot(previous); backgroundRuntimes = manager }()
+	backgroundRuntimes = nil
+	for _, invalidCandidate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("invalid=%t", invalidCandidate), func(t *testing.T) {
+			dir := t.TempDir()
+			root := filepath.Join(dir, "api.json")
+			child := filepath.Join(dir, "child.json")
+			writeHotReloadTestFile(t, root, `{"active":{"description":"initial"}}`)
+			initial, err := readAPIConfigFile(root, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			publishAPISnapshot(initial.Snapshot)
+			writeHotReloadTestFile(t, root, `{"sub":{"type":"include","path":"./child.json"}}`)
+			candidate := `{"candidate":{"description":"in progress"}}`
+			if invalidCandidate {
+				candidate = `{"broken":`
+			}
+			writeHotReloadTestFile(t, child, candidate)
+			loaded, discovered, loadErr := readAPIConfigFileAttempt(root, dir)
+			if (loadErr != nil) != invalidCandidate {
+				t.Fatalf("load error=%v", loadErr)
+			}
+			// Force the edit between reading and committing the candidate without
+			// depending on file size, CPU speed, or a sleep in another goroutine.
+			writeHotReloadTestFile(t, child, `{"final":{"description":"stable"}}`)
+			states, reloaded, err := finishAPIConfigReload(loaded, discovered, loadErr)
+			if err == nil || reloaded {
+				t.Fatalf("changed candidate published: reloaded=%v err=%v", reloaded, err)
+			}
+			if currentAPISnapshot() != initial.Snapshot {
+				t.Fatal("last good snapshot was replaced")
+			}
+			states, reloaded, err = reloadAPIConfigGraphIfChanged(root, dir, states)
+			if err != nil || !reloaded {
+				t.Fatalf("stable candidate not retried: reloaded=%v err=%v", reloaded, err)
+			}
+			if _, ok := currentAPIFiles()["sub/final"]; !ok {
+				t.Fatal("stable candidate missing")
+			}
+			if _, reloaded, err := reloadAPIConfigGraphIfChanged(root, dir, states); err != nil || reloaded {
+				t.Fatalf("unchanged configuration reloaded: %v %v", reloaded, err)
+			}
+		})
+	}
+}
+
+func TestReloadAPIConfigGraphRetargetedSymlink(t *testing.T) {
+	initTestLogger()
+	previous, manager := currentAPISnapshot(), backgroundRuntimes
+	defer func() { publishAPISnapshot(previous); backgroundRuntimes = manager }()
+	backgroundRuntimes = nil
+	for _, mode := range []string{"root", "include", "shared_target"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			root := filepath.Join(dir, "api.json")
+			old := filepath.Join(dir, "old.json")
+			next := filepath.Join(dir, "next.json")
+			link, prefix := root, ""
+			writeHotReloadTestFile(t, old, `{"old":{"description":"initial"}}`)
+			writeHotReloadTestFile(t, next, `{"new":{"description":"updated"}}`)
+			if mode != "root" {
+				link, prefix = filepath.Join(dir, "child.json"), "sub/"
+				rootData := `{"sub":{"type":"include","path":"./child.json"}}`
+				if mode == "shared_target" {
+					rootData = `{"sub":{"type":"include","path":"./child.json"},"other":{"type":"include","path":"./other.json"}}`
+					if err := os.Symlink(old, filepath.Join(dir, "other.json")); err != nil {
+						t.Fatal(err)
+					}
+				}
+				writeHotReloadTestFile(t, root, rootData)
+			}
+			if err := os.Symlink(old, link); err != nil {
+				t.Fatal(err)
+			}
+			initial, err := readAPIConfigFile(root, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			publishAPISnapshot(initial.Snapshot)
+			if mode == "shared_target" && len(initial.Snapshot.FileStates) != 3 {
+				t.Fatal("aliases of the same target were merged")
+			}
+			tempLink := filepath.Join(dir, "temporary-link")
+			if err := os.Symlink(next, tempLink); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(tempLink, link); err != nil {
+				t.Fatal(err)
+			}
+			states, reloaded, err := reloadAPIConfigGraphIfChanged(root, dir, initial.Snapshot.FileStates)
+			if err != nil || !reloaded {
+				t.Fatalf("retargeted symlink not reloaded: %v %v", reloaded, err)
+			}
+			if _, ok := currentAPIFiles()[prefix+"new"]; !ok {
+				t.Fatal("new target not published")
+			}
+			if _, ok := currentAPIFiles()[prefix+"old"]; ok {
+				t.Fatal("old target still active")
+			}
+			if mode == "shared_target" {
+				if _, ok := currentAPIFiles()["other/old"]; !ok {
+					t.Fatal("retargeting one alias changed another")
+				}
+			}
+			writeHotReloadTestFile(t, next, `{"latest":{"description":"edit new target"}}`)
+			states, reloaded, err = reloadAPIConfigGraphIfChanged(root, dir, states)
+			if err != nil || !reloaded {
+				t.Fatalf("new target edit not reloaded: %v %v", reloaded, err)
+			}
+			if _, ok := currentAPIFiles()[prefix+"latest"]; !ok {
+				t.Fatal("new target edit missing")
+			}
+			if _, reloaded, err := reloadAPIConfigGraphIfChanged(root, dir, states); err != nil || reloaded {
+				t.Fatalf("unchanged symlink reloaded: %v %v", reloaded, err)
+			}
+		})
+	}
+}
+
+func TestVerifyAPIFileStatesDetectsSameContentSymlinkRetarget(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "api.json")
+	old := filepath.Join(dir, "old.json")
+	next := filepath.Join(dir, "next.json")
+	writeHotReloadTestFile(t, old, `{"item":{}}`)
+	writeHotReloadTestFile(t, next, `{"item":{}}`)
+	if err := os.Symlink(old, root); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readAPIConfigFile(root, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tempLink := filepath.Join(dir, "temporary-link")
+	if err := os.Symlink(next, tempLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tempLink, root); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyAPIFileStates(loaded.Snapshot.FileStates); err == nil {
+		t.Fatal("symlink identity change was missed")
+	}
+	if apiFileStatesFingerprint(loaded.Snapshot.FileStates) == apiFileStatesFingerprint(observeAPIFileStates(loaded.Snapshot.FileStates)) {
+		t.Fatal("fingerprint missed symlink identity change")
+	}
+}
+
+func TestNyanMCPHTTPContentType(t *testing.T) {
+	for _, modern := range []bool{true, false} {
+		for _, tc := range []struct {
+			contentType string
+			sse         bool
+		}{
+			{contentType: "Text/Event-Stream", sse: true},
+			{contentType: "text/event-stream", sse: true},
+			{contentType: "TEXT/EVENT-STREAM; charset=utf-8", sse: true},
+			{contentType: `application/json; profile="text/event-stream"`},
+			{contentType: "Application/JSON; charset=utf-8"},
+		} {
+			t.Run(fmt.Sprintf("modern=%t/%s", modern, tc.contentType), func(t *testing.T) {
+				f := &nyanMCPFixture{modern: modern, result: json.RawMessage(`{"content":[],"structuredContent":{"ok":true}}`)}
+				manager, script := nyanMCPTestManager(t, f)
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodDelete {
+						w.WriteHeader(http.StatusNoContent)
+						return
+					}
+					data, _ := io.ReadAll(r.Body)
+					var req struct {
+						Method string `json:"method"`
+					}
+					_ = json.Unmarshal(data, &req)
+					response := f.response(data)
+					if len(response) == 0 {
+						w.WriteHeader(http.StatusAccepted)
+						return
+					}
+					if req.Method != "tools/call" {
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = w.Write(response)
+						return
+					}
+					w.Header().Set("Content-Type", tc.contentType)
+					if tc.sse {
+						_, _ = fmt.Fprintf(w, "event: message\ndata: %s\n\n", response)
+					} else {
+						_, _ = w.Write(response)
+					}
+				}))
+				defer server.Close()
+				manager.endpoints["local"].config.URL = server.URL
+				raw, err := manager.call(context.Background(), script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+				if err != nil || !bytes.Contains(raw, []byte(`"structuredContent":{"ok":true}`)) {
+					t.Fatalf("raw=%s err=%+v", raw, err)
+				}
+				f.mu.Lock()
+				calls := f.calls
+				f.mu.Unlock()
+				if calls != 1 {
+					t.Fatalf("tools/call sent %d times", calls)
+				}
+			})
+		}
 	}
 }
