@@ -1789,7 +1789,7 @@ func TestParseStaticJavaScriptValueRejectsDynamicAndNonJSONValues(t *testing.T) 
 		{name: "getter", source: `{get id() { return 1; }}`, want: `property kind "get" is not supported`},
 		{name: "template literal", source: "`object`", want: `template literals are not supported`},
 		{name: "array hole", source: `[1,,2]`, want: `$[1]: array holes are not supported`},
-		{name: "bigint", source: `1n`, want: `parse static JavaScript value`},
+		{name: "bigint", source: `1n`, want: `numeric value *big.Int is not JSON-compatible`},
 		{name: "infinity", source: `1e400`, want: `non-finite numbers are not JSON-compatible`},
 		{name: "duplicate property", source: `{id: 1, id: 2}`, want: `duplicate property "id"`},
 		{name: "numeric property", source: `{1: "value"}`, want: `property names must be strings`},
