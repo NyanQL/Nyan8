@@ -1896,17 +1896,20 @@ const data = result.structuredContent;
 - `allowHTTP:true`: 管理者がHTTPを明示許可する場合のみ。ローカル試験例以外ではHTTPSを使用してください。
 - `allowedCIDRs`: 省略時は公開宛先のみ。設定すると**そのCIDRに含まれるIPだけ**に接続します。loopback/privateネットワークには明示許可が必要です。metadata/link-local/unspecified/multicastはCIDRで許可しても拒否します。
 - DNSの全解決結果を検証し、そのIPへ直接接続するため検証後に再解決しません。TLS検証は有効。redirect・環境proxyは使いません。ブラウザーから受けたAuthorization/Cookieを転送しません。
-- `bearerTokenFile`: 任意。絶対パスの通常ファイルでowner以外の権限がないもの（例0600）。最大8 KiB、1行の既存トークンを参照します。呼出しごとに再読込するので次回呼出しから更新が有効です。設定例に実トークンを書かないでください。
+- `bearerTokenFile`: 任意。絶対パスの通常ファイルから、最大8 KiB、1行の既存トークンを読み取ります。Linux・macOSでは所有者以外の権限がないことを検査します（例0600）。`environmentFiles` にも同じ検査を適用します。呼出しごとに再読込するので次回呼出しから更新が有効です。設定例に実トークンを書かないでください。
 - JSONとSSEの応答に対応。初期版はSSEの応答ストリーム完了までバッファし、進捗UIは提供しません。展開後の応答全体に上限を適用します。永続GET/SSE、再接続、旧HTTP+SSE transportは使いません。
 
 #### stdio
 
-- `executable`: 管理者管理の実行可能ファイルの絶対パス。通常ファイル・group/other書込不可。symlinkは起動時に固定します。
+- `executable`: 管理者管理の実行可能ファイルの絶対パス。通常ファイルであることを確認し、symlinkは起動時に固定します。Linux・macOSでは実行ビットがあり、group/otherが書込不可であることも検査します。
+- Windowsの `executable` は `.exe` を指定します。
 - `args`: 固定引数のみ（最大64）。`directory`: 固定した絶対作業ディレクトリ。
 - shell・パッケージrunner・主要な汎用インタープリターを実行対象に指定できません。シェル文字列を組み立てません。
 - 親プロセスの環境変数を引き継ぎません。`environmentFiles` は環境変数名→秘密ファイルの絶対パス。必要な値だけを設定し、PATH/HOME/LD_*/DYLD_*などを拒否します。
 - 呼出しごとに専用プロセスを起動し、完了/取消時に終了してWaitします。Unixでは専用プロセスグループも終了させます。stdoutはMCP専用、stderrは保存せず破棄します。stdio入力にはフレーム上限と1セッション最大4×maxResultBytesの受信量上限があります。
 - この機能はOSサンドボックスではありません。信頼するMCP実行ファイルを低権限アカウントで動かし、必要なCPU/メモリ/ファイル/ネットワーク制限はOSやコンテナーで設定してください。任意の子プログラムを安全化する保証はありません。
+
+Windowsでは、Nyan8は上記の実行ファイルと秘密ファイルの所有者・ACLを追加検査しません。読み取り・実行の可否はOSの権限管理に従い、失敗は呼出し元へエラーとして返します。秘密ファイルは設定読込時にも読み取りを確認します。`bearerTokenFile`・`environmentFiles`の秘密情報の保護と、実行ファイル・配置先の改変防止は管理者がOSの権限で管理してください。権限検査用のPowerShellは不要です。Linux・macOSの既存の権限検査は維持します。
 
 ### 検証・互換性
 

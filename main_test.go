@@ -14468,6 +14468,216 @@ func TestNyanMCPStdio(t *testing.T) {
 		t.Fatalf("value=%v err=%v", value, err)
 	}
 }
+func TestNyanMCPSecretFileAccess(t *testing.T) {
+	mode := os.FileMode(0600)
+	if runtime.GOOS == "windows" {
+		mode = 0666
+	}
+	for _, tc := range []struct {
+		name, data, want string
+		valid            bool
+	}{
+		{"single line", "secret", "secret", true},
+		{"trailing newline", "secret\n", "secret", true},
+		{"size limit", strings.Repeat("a", 8192), strings.Repeat("a", 8192), true},
+		{"empty", "", "", false},
+		{"newline only", "\n", "", false},
+		{"multiple lines", "first\nsecond", "", false},
+		{"carriage return", "secret\r\n", "", false},
+		{"nul", "secret\x00", "", false},
+		{"too large", strings.Repeat("a", 8193), "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "秘密 '$(ignored).txt")
+			if err := os.WriteFile(path, []byte(tc.data), mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatal(err)
+			}
+			got, err := nyanMCPSecret(path)
+			if tc.valid {
+				if err != nil || got != tc.want {
+					t.Fatalf("readable credential rejected or changed: err=%v", err)
+				}
+				return
+			}
+			var failure *nyanMCPError
+			if got != "" || !errors.As(err, &failure) || failure.Code != "AUTH_REQUIRED" {
+				t.Fatalf("invalid credential: error=%v, want AUTH_REQUIRED", err)
+			}
+		})
+	}
+	dir := t.TempDir()
+	for _, path := range []string{"relative-secret.txt", dir, filepath.Join(dir, "missing")} {
+		if _, err := nyanMCPSecret(path); err == nil {
+			t.Errorf("invalid credential path accepted: %q", path)
+		}
+	}
+	for _, mode := range []os.FileMode{0644, 0666} {
+		t.Run(fmt.Sprintf("shared permissions %o", mode), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "shared-secret")
+			if err := os.WriteFile(path, []byte("secret"), mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatal(err)
+			}
+			got, err := nyanMCPSecret(path)
+			if runtime.GOOS == "windows" {
+				if err != nil || got != "secret" {
+					t.Fatalf("OS-readable Windows credential rejected: %v", err)
+				}
+				return
+			}
+			var failure *nyanMCPError
+			if got != "" || !errors.As(err, &failure) || failure.Code != "AUTH_REQUIRED" {
+				t.Fatalf("shared Unix credential: error=%v, want AUTH_REQUIRED", err)
+			}
+		})
+	}
+	t.Run("OS read permission denied", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("chmod cannot set Windows read access")
+		}
+		path := filepath.Join(t.TempDir(), "unreadable")
+		if err := os.WriteFile(path, []byte("secret"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(path, 0600) })
+		if _, err := os.ReadFile(path); !errors.Is(err, os.ErrPermission) {
+			t.Skipf("OS does not deny this process read access: %v", err)
+		}
+		_, err := nyanMCPSecret(path)
+		var failure *nyanMCPError
+		if !errors.As(err, &failure) || failure.Code != "AUTH_REQUIRED" {
+			t.Fatalf("OS read denial: error=%v, want AUTH_REQUIRED", err)
+		}
+	})
+}
+
+func TestNyanMCPUnixStdioFilePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits")
+	}
+	dir := t.TempDir()
+	caller := filepath.Join(dir, "caller.js")
+	if err := os.WriteFile(caller, []byte("0"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	executable := filepath.Join(dir, "server")
+	if err := os.WriteFile(executable, []byte("configuration fixture"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	connection := nyanMCPConnectionConfig{Transport: "stdio", Executable: executable, Directory: dir, CredentialMode: "service", AllowedScripts: []string{caller}, Tools: map[string]nyanMCPToolPolicy{"echo": {ReadOnly: true}}, ProtocolVersions: []string{"2025-06-18"}}
+	for _, tc := range []struct {
+		mode os.FileMode
+		want bool
+	}{
+		{0700, true}, {0755, true}, {0775, false}, {0777, false}, {0666, false}, {0600, false},
+	} {
+		t.Run(fmt.Sprintf("%o", tc.mode), func(t *testing.T) {
+			if err := os.Chmod(executable, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			manager, err := loadNyanMCPConfig(&nyanMCPConfig{Connections: map[string]nyanMCPConnectionConfig{"local": connection}})
+			if manager != nil {
+				defer manager.cancel()
+			}
+			if (err == nil) != tc.want {
+				t.Fatalf("mode %o: accepted=%t, want %t; error=%v", tc.mode, err == nil, tc.want, err)
+			}
+		})
+	}
+}
+
+func TestNyanMCPWindowsStdioFileAccess(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows stdio file access without ACL inspection")
+	}
+	dir := t.TempDir()
+	secret := filepath.Join(dir, "秘密 '$(ignored).txt")
+	if err := os.WriteFile(secret, []byte("1"), 0666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(secret, 0666); err != nil {
+		t.Fatal(err)
+	}
+	caller := filepath.Join(dir, "caller.js")
+	if err := os.WriteFile(caller, []byte("0"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable := filepath.Join(dir, "server.exe")
+	if err := os.WriteFile(executable, data, 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(executable, 0777); err != nil {
+		t.Fatal(err)
+	}
+	connection := nyanMCPConnectionConfig{Transport: "stdio", Executable: executable, Directory: dir, Args: []string{"-test.run=^TestNyanMCPStdioHelper$"}, EnvironmentFiles: map[string]string{"NYAN_MCP_TEST_CHILD": secret}, CredentialMode: "service", AllowedScripts: []string{caller}, Tools: map[string]nyanMCPToolPolicy{"echo": {ReadOnly: true}}, ProtocolVersions: []string{"2025-06-18"}}
+	config := &nyanMCPConfig{Connections: map[string]nyanMCPConnectionConfig{"local": connection}}
+	manager, err := loadNyanMCPConfig(config)
+	if err != nil {
+		t.Fatalf("shared writable stdio files rejected: %v", err)
+	}
+	defer manager.cancel()
+	vm := nyanMCPTestVM(manager, context.Background(), caller, "operation")
+	value, err := vm.RunString(`nyanCallMCP({connection:'local',tool:'echo'}).content[0].text`)
+	if err != nil || value.String() != "stdio" {
+		t.Fatalf("stdio call: result=%v err=%v", value, err)
+	}
+	for _, name := range []string{"node.exe", "pwsh.exe"} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("placeholder"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		connection.Executable = path
+		config.Connections["local"] = connection
+		if manager, err := loadNyanMCPConfig(config); err == nil {
+			manager.cancel()
+			t.Errorf("interpreter accepted: %s", name)
+		}
+	}
+	for _, path := range []string{dir, "server.exe"} {
+		connection.Executable = path
+		config.Connections["local"] = connection
+		if manager, err := loadNyanMCPConfig(config); err == nil {
+			manager.cancel()
+			t.Errorf("invalid executable path accepted: %q", path)
+		}
+	}
+	t.Run("OS start refused", func(t *testing.T) {
+		// A regular file can pass configuration checks while the OS refuses
+		// to execute its contents.
+		path := filepath.Join(dir, "invalid.exe")
+		if err := os.WriteFile(path, []byte("not an executable"), 0666); err != nil {
+			t.Fatal(err)
+		}
+		connection.Executable = path
+		config.Connections["local"] = connection
+		manager, err := loadNyanMCPConfig(config)
+		if err != nil {
+			t.Fatalf("regular executable candidate rejected before OS start: %v", err)
+		}
+		defer manager.cancel()
+		_, failure := manager.call(context.Background(), caller, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+		if failure == nil || failure.Code != "TRANSPORT" || failure.ExecutionState != "not_sent" {
+			t.Fatalf("OS start refusal: error=%v, want TRANSPORT/not_sent", failure)
+		}
+	})
+}
+
 func TestNyanMCPSecurityHelpers(t *testing.T) {
 	ep := &nyanMCPEndpoint{}
 	for _, address := range []string{"127.0.0.1", "::1", "169.254.169.254", "100.100.100.200", "10.0.0.1", "192.168.1.2", "fc00::1", "0.0.0.0", "224.0.0.1", "100.64.0.1"} {
@@ -14480,11 +14690,6 @@ func TestNyanMCPSecurityHelpers(t *testing.T) {
 	}
 	if nyanMCPSchema(map[string]any{"$ref": "file:///etc/passwd"}, map[string]any{}) == nil {
 		t.Fatal("external schema accepted")
-	}
-	secret := filepath.Join(t.TempDir(), "secret")
-	_ = os.WriteFile(secret, []byte("secret"), 0644)
-	if _, err := nyanMCPSecret(secret); err == nil {
-		t.Fatal("world readable credential accepted")
 	}
 	path := filepath.Join(t.TempDir(), "config.json")
 	_ = os.WriteFile(path, []byte(`{"mcpClient":{"connections":{},"unknown":true}}`), 0600)

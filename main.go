@@ -8978,10 +8978,16 @@ func loadNyanMCPConfig(cfg *nyanMCPConfig) (*nyanMCPManager, error) {
 			}
 			c.Executable = executable
 			info, err := os.Stat(executable)
-			if err != nil || !info.Mode().IsRegular() || info.Mode()&0111 == 0 || info.Mode().Perm()&0022 != 0 {
+			if err != nil || !info.Mode().IsRegular() {
 				return fail()
 			}
-			switch strings.ToLower(filepath.Base(executable)) {
+			if runtime.GOOS != "windows" && (info.Mode()&0111 == 0 || info.Mode().Perm()&0022 != 0) {
+				return fail()
+			}
+			if runtime.GOOS == "windows" && !strings.EqualFold(filepath.Ext(executable), ".exe") {
+				return fail()
+			}
+			switch strings.TrimSuffix(strings.ToLower(filepath.Base(executable)), ".exe") {
 			case "sh", "bash", "zsh", "fish", "cmd", "cmd.exe", "powershell", "pwsh", "npx", "npm", "yarn", "pnpm", "go", "python", "python3", "node", "ruby", "perl", "env", "osascript":
 				return fail()
 			}
@@ -9008,6 +9014,8 @@ func loadNyanMCPConfig(cfg *nyanMCPConfig) (*nyanMCPManager, error) {
 	return manager, nil
 }
 
+// Windows file access is enforced by the OS without inspecting ACLs. On Unix,
+// retain the requirement that credentials have no group or other permissions.
 func nyanMCPSecret(path string) (string, error) {
 	if !filepath.IsAbs(path) {
 		return "", nyanMCPFailure("AUTH_REQUIRED")
@@ -9018,7 +9026,10 @@ func nyanMCPSecret(path string) (string, error) {
 	}
 	defer f.Close()
 	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
+	if err != nil || !info.Mode().IsRegular() {
+		return "", nyanMCPFailure("AUTH_REQUIRED")
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0 {
 		return "", nyanMCPFailure("AUTH_REQUIRED")
 	}
 	data, err := io.ReadAll(io.LimitReader(f, 8193))
@@ -9845,13 +9856,6 @@ func registerNyanMCP(vm *goja.Runtime, manager *nyanMCPManager, ctx context.Cont
 }
 
 // END shared nyanCallMCP contract.
-
-func nyanMCPContext(contexts []context.Context) context.Context {
-	if len(contexts) > 0 && contexts[0] != nil {
-		return contexts[0]
-	}
-	return context.Background()
-}
 
 // beginMCPExecution binds background calls to removal of this schedule.
 func (runtime *scheduleRuntime) beginMCPExecution() (context.Context, context.CancelFunc) {
