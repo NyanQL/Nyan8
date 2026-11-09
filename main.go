@@ -5707,8 +5707,13 @@ func setupGojaVMForAPI(vm *goja.Runtime, snapshot *APIConfigSnapshot, apiName st
 	jsonAPIFunc := func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
 		data := call.Argument(1).String()
-		user := call.Argument(2).String()
-		pass := call.Argument(3).String()
+		var user, pass string
+		if len(call.Arguments) >= 3 {
+			user = call.Argument(2).String()
+		}
+		if len(call.Arguments) >= 4 {
+			pass = call.Argument(3).String()
+		}
 
 		var hdr map[string]string
 		if len(call.Arguments) >= 5 {

@@ -826,10 +826,22 @@ const response = nyanGetAPI(url); // 認証なし
 
 ### 4‑6 外部APIの呼び出し nyanJsonAPI / nyanCallAPI
 JSON を POST するリクエストができます。`nyanCallAPI()` は `nyanJsonAPI()` のラッパーで、引数と挙動は同じです。
-idとpassはBASIC認証用のIDとパスワードです。必要に応じて設定してください。
+第3・第4引数はBasic認証用のユーザー名とパスワードです。省略した認証引数は空文字列として扱います。`nyanJsonAPI(url, jsonText)` は認証なし、ユーザー名だけ指定した場合は空パスワードでBasic認証を付けて送信します。ユーザー名が空文字列なら、パスワードの指定にかかわらずBasic認証を自動付与しません。`nyanCallAPI` も同じ動作です。
+
+明示した `undefined`・`null` は省略とは区別し、従来どおり文字列 `"undefined"`・`"null"` に変換します。第5引数の追加ヘッダーは自動付与するヘッダーより優先され、`Authorization` や `Content-Type` も上書きできます。
 
 ```javascript
-// (1) ヘッダー無し – 必須 4 引数
+nyanJsonAPI(url, jsonText);                    // 認証なし
+nyanJsonAPI(url, jsonText, "alice");           // 空パスワードでBasic認証
+nyanCallAPI(url, jsonText, "", "", {
+  Authorization: "Bearer " + token
+});
+```
+
+以前は認証引数の省略が文字列 `"undefined"` になっていましたが、現在は空文字列として扱います。認証引数を省略していた呼び出しでは送信する認証情報が変わります。
+
+```javascript
+// (1) Basic認証を指定、追加ヘッダーなし
 let res = nyanJsonAPI(
   "https://example.com/api",
   JSON.stringify({ key: "value" }),
