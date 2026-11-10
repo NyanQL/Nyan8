@@ -1000,6 +1000,16 @@ func TestRootHTTPChecksMatchNamedEndpoint(t *testing.T) {
 		{name: "main exception", param: allow, out: allow, main: `throw new Error("main failed");`, status: 500, order: "param,main,"},
 		{name: "main invalid JSON", param: allow, out: allow, main: `"not JSON";`, status: 500, order: "param,main,"},
 		{name: "main missing status", param: allow, out: allow, main: `JSON.stringify({value:"missing status"});`, status: 500, order: "param,main,"},
+		{name: "main fractional status", param: allow, out: allow, main: `({status:201.5});`, status: 500, order: "param,main,", result: `{"error":"Status field must be an integer in JavaScript response"}`},
+		{name: "main fractional status without checks", main: `({status:201.5});`, status: 500, order: "main,", result: `{"error":"Status field must be an integer in JavaScript response"}`},
+		{name: "main fractional status JSON string", param: allow, out: allow, main: `' {"status":201.5} ';`, status: 500, order: "param,main,", result: `{"error":"Status field must be an integer in JavaScript response"}`},
+		{name: "main negative fractional status", param: allow, out: allow, main: `({status:-1.5});`, status: 500, order: "param,main,", result: `{"error":"Status field must be an integer in JavaScript response"}`},
+		{name: "main integer decimal notation", param: allow, out: allow, main: `JSON.stringify({status:201.0,value:"日本語"});`, status: 201, order: "param,main,out,push,", result: `{"status":201,"value":"日本語"}`},
+		{name: "main integer exponent notation", param: allow, out: allow, main: `JSON.stringify({status:2.01e2,value:"日本語"});`, status: 201, order: "param,main,out,push,", result: `{"status":201,"value":"日本語"}`},
+		{name: "main string status", param: allow, out: allow, main: `({status:"201"});`, status: 500, order: "param,main,"},
+		{name: "main null status", param: allow, out: allow, main: `({status:null});`, status: 500, order: "param,main,"},
+		{name: "main array response", param: allow, out: allow, main: `[1,2,3];`, status: 500, order: "param,main,"},
+		{name: "main integer outside standard range unchanged", main: `({status:600});`, status: 600, order: "main,", result: `{"status":600}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir, key := t.TempDir(), "root HTTP checks: "+t.Name()

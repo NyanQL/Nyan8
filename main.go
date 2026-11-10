@@ -1292,6 +1292,10 @@ func handleAPIRequest(c *gin.Context) {
 		respondWithError(c, http.StatusInternalServerError, "Status field not found in JavaScript response", nil)
 		return
 	}
+	if math.Trunc(status) != status {
+		respondWithError(c, http.StatusInternalServerError, "Status field must be an integer in JavaScript response", nil)
+		return
+	}
 
 	response := APIResponse{Status: int(status), ContentType: "application/json", Headers: map[string]string{}, Body: []byte(result)}
 	if handled := runOutCheckWithSnapshot(snapshot, c, scriptInfo, execDir, allParams, &response); handled {
@@ -2805,6 +2809,10 @@ func executeAPIEndpoint(c *gin.Context, apiName, execDir string) {
 	status, ok := jsonData["status"].(float64)
 	if !ok {
 		respondWithError(c, http.StatusInternalServerError, "Status field not found in JavaScript response", nil)
+		return
+	}
+	if math.Trunc(status) != status {
+		respondWithError(c, http.StatusInternalServerError, "Status field must be an integer in JavaScript response", nil)
 		return
 	}
 	response.Status = int(status)

@@ -1223,6 +1223,8 @@ MCP Toolとして参照されるAPIは、設定スナップショットの作成
 
 本体JavaScriptは数値の `status` を含むJSON文字列を返してください。Nyan8はその値をHTTPステータスに使い、JSON本文を返します。`success` や `result` は自動追加されません。たとえば次のスクリプトはHTTP 200を返します。
 
+通常HTTPの `/API名`・`/?api=API名` では、`status:201.5` のように小数部分がある値は、切り捨てずHTTP 500の実行エラーにします。この場合、`outCheck` と自動Pushは実行しません。`201.0` のように値として整数である数値は受け付けます。`status` の省略・文字列・`null`、配列やテキストだけの応答は、従来どおりエラーです。本体が既に行った外部への処理を取り消すものではありません。
+
 ```javascript
 JSON.stringify({status: 200, success: true, result: []});
 ```
