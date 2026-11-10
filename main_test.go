@@ -298,6 +298,49 @@ func TestResolveStartupOptionsForMCPStdio(t *testing.T) {
 	}
 }
 
+func TestExecutableBaseDirUsesRunningBinary(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep the running test binary outside the temporary-directory exception.
+	temporaryDir := t.TempDir()
+	for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(key, temporaryDir)
+	}
+	want := filepath.Dir(executable)
+	if isTemporaryDirectory(want) {
+		t.Fatalf("test executable unexpectedly inside isolated temp directory: %s", want)
+	}
+	previousArgs := os.Args
+	t.Cleanup(func() { os.Args = previousArgs })
+	for _, argv0 := range []string{"Nyan8", filepath.Join(temporaryDir, "other", "Nyan8")} {
+		os.Args = append([]string{argv0}, previousArgs[1:]...)
+		got, err := executableBaseDir()
+		if err != nil || got != want {
+			t.Fatalf("argv[0]=%q: base=%q, error=%v; want %q", argv0, got, err, want)
+		}
+	}
+}
+
+func TestExecutableBaseDirPreservesTemporaryFallback(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(key, filepath.Dir(executable))
+	}
+	want, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := executableBaseDir()
+	if err != nil || got != want {
+		t.Fatalf("temporary executable: base=%q, error=%v; want cwd %q", got, err, want)
+	}
+}
+
 func TestAdjustConfigPathsResolvesFromConfigDir(t *testing.T) {
 	initTestLogger()
 
@@ -310,7 +353,9 @@ func TestAdjustConfigPathsResolvesFromConfigDir(t *testing.T) {
 		OAuthStateRoot:    "state/oauth",
 	}
 
-	adjustConfigPaths(configBaseDir, &config)
+	if err := adjustConfigPaths(configBaseDir, &config); err != nil {
+		t.Fatal(err)
+	}
 
 	if config.CertFile != filepath.Join(configBaseDir, "ssl/localhost.crt") {
 		t.Fatalf("CertFile = %q, want config-relative path", config.CertFile)
@@ -326,6 +371,59 @@ func TestAdjustConfigPathsResolvesFromConfigDir(t *testing.T) {
 	}
 	if config.OAuthStateRoot != filepath.Join(configBaseDir, "state/oauth") {
 		t.Fatalf("OAuthStateRoot = %q, want config-relative path", config.OAuthStateRoot)
+	}
+}
+
+func TestAdjustConfigPathsTLSFormats(t *testing.T) {
+	base := t.TempDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A percent-encoded dollar sign must not undergo a second expansion.
+	absolute := filepath.Join(base, "TLS $NYAN_TEST_TLS_LITERAL cert.pem")
+	urlPath := filepath.ToSlash(absolute)
+	if !strings.HasPrefix(urlPath, "/") {
+		urlPath = "/" + urlPath
+	}
+	fileURL := strings.ReplaceAll((&url.URL{Scheme: "file", Path: urlPath}).String(), "$", "%24")
+	t.Setenv("NYAN_TEST_TLS_LITERAL", "expanded-only-once")
+	t.Setenv("NYAN_TEST_TLS_FILE_URL", fileURL)
+	t.Setenv("NYAN_TEST_TLS_RELATIVE", "ssl/server.pem")
+	t.Setenv("NYAN_TEST_TLS_EMPTY", "")
+	for _, tc := range []struct{ name, input, want string }{
+		{name: "empty"},
+		{name: "whitespace", input: "  "},
+		{name: "empty environment", input: "$NYAN_TEST_TLS_EMPTY"},
+		{name: "relative", input: "ssl/server.pem", want: filepath.Join(base, "ssl/server.pem")},
+		{name: "absolute", input: filepath.Join(base, "server.pem"), want: filepath.Join(base, "server.pem")},
+		{name: "home", input: "~/ssl/server.pem", want: filepath.Join(home, "ssl/server.pem")},
+		{name: "environment", input: "$NYAN_TEST_TLS_RELATIVE", want: filepath.Join(base, "ssl/server.pem")},
+		{name: "file URL", input: fileURL, want: absolute},
+		{name: "environment file URL", input: "$NYAN_TEST_TLS_FILE_URL", want: absolute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{CertFile: tc.input, KeyFile: tc.input}
+			if err := adjustConfigPaths(base, &cfg); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.CertFile != tc.want || cfg.KeyFile != tc.want {
+				t.Fatalf("certificate=%q, key=%q; want %q", cfg.CertFile, cfg.KeyFile, tc.want)
+			}
+		})
+	}
+	for _, field := range []string{"certPath", "keyPath"} {
+		t.Run("malformed "+field, func(t *testing.T) {
+			cfg := Config{}
+			if field == "certPath" {
+				cfg.CertFile = "file:///bad%zz.pem"
+			} else {
+				cfg.KeyFile = "file:///bad%zz.pem"
+			}
+			if err := adjustConfigPaths(base, &cfg); err == nil || !strings.Contains(err.Error(), field) {
+				t.Fatalf("expected %s file URL error, got %v", field, err)
+			}
+		})
 	}
 }
 
@@ -383,7 +481,9 @@ func TestJavaScriptIncludeCacheHTTP(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			adjustConfigPaths(dir, &cfg)
+			if err := adjustConfigPaths(dir, &cfg); err != nil {
+				t.Fatal(err)
+			}
 			globalConfig = cfg
 			// A different executable directory verifies config-relative includes.
 			exeDir := t.TempDir()
@@ -959,12 +1059,54 @@ if (nyanAllParams.allow === "1") {
 	}
 }
 
-func TestRootHTTPChecksMatchNamedEndpoint(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	oldSnapshot, oldConfig, oldPaths, oldContext := currentAPISnapshot(), globalConfig, servicePaths, ginContext
+func TestConcurrentRootAndPublicRequests(t *testing.T) {
+	oldSnapshot, oldConfig, oldPaths := currentAPISnapshot(), globalConfig, servicePaths
 	t.Cleanup(func() {
 		publishAPISnapshot(oldSnapshot)
-		globalConfig, servicePaths, ginContext = oldConfig, oldPaths, oldContext
+		globalConfig, servicePaths = oldConfig, oldPaths
+	})
+	gin.SetMode(gin.TestMode)
+	globalConfig = Config{}
+	dir := t.TempDir()
+	apiPath := filepath.Join(dir, "api.json")
+	writeHotReloadTestFile(t, filepath.Join(dir, "main.js"), `({status:200,result:"ok"});`)
+	writeHotReloadTestFile(t, filepath.Join(dir, "file.txt"), "public content")
+	servicePaths.API.Path = apiPath
+	setAPIFiles(apiPath, map[string]interface{}{
+		"plain":  map[string]interface{}{"script": "./main.js"},
+		"assets": map[string]interface{}{"type": "public", "path": dir},
+	})
+	router := gin.New()
+	router.GET("/", handleRequest)
+	if err := registerDynamicEndpoints(router, dir); err != nil {
+		t.Fatal(err)
+	}
+	var requests sync.WaitGroup
+	start := make(chan struct{})
+	for _, path := range []string{"/?api=plain", "/assets/file.txt"} {
+		for i := 0; i < 16; i++ {
+			requests.Add(1)
+			go func(path string) {
+				defer requests.Done()
+				<-start
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+				if rec.Code != http.StatusOK {
+					t.Errorf("path=%s status=%d body=%q", path, rec.Code, rec.Body.String())
+				}
+			}(path)
+		}
+	}
+	close(start)
+	requests.Wait()
+}
+
+func TestRootHTTPChecksMatchNamedEndpoint(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	oldSnapshot, oldConfig, oldPaths := currentAPISnapshot(), globalConfig, servicePaths
+	t.Cleanup(func() {
+		publishAPISnapshot(oldSnapshot)
+		globalConfig, servicePaths = oldConfig, oldPaths
 	})
 	globalConfig = Config{}
 	const allow = `({success:true,status:(nyanAllParams.nyan_output ? nyanAllParams.nyan_output.status : 200),result:{checked:true}});`
@@ -1362,6 +1504,49 @@ func TestParseCronScheduleNext(t *testing.T) {
 	want := time.Date(2026, 5, 14, 9, 15, 0, 0, time.Local)
 	if !next.Equal(want) {
 		t.Fatalf("next = %s, want %s", next, want)
+	}
+}
+
+func TestParseCronScheduleDayWeekdayWildcardSemantics(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		expr     string
+		wantDays []int
+	}{
+		{"plain day wildcard", "0 10 * * 1", []int{1, 8, 15, 22, 29}},
+		{"day step one", "0 10 */1 * 1", []int{1, 8, 15, 22, 29}},
+		{"day step two", "0 10 */2 * 1", []int{1, 15, 29}},
+		{"weekday step one", "0 10 10 * */1", []int{10}},
+		{"weekday step two", "0 10 10-11 * */2", []int{11}},
+		{"explicit day range uses OR", "0 10 10-11 * 1", []int{1, 8, 10, 11, 15, 22, 29}},
+		{"explicit weekday range uses OR", "0 10 10 * 1-2", []int{1, 2, 8, 9, 10, 15, 16, 22, 23, 29, 30}},
+		{"leading wildcard list uses AND", "0 10 */2,8 * 1", []int{1, 8, 15, 29}},
+		{"nonleading wildcard list uses OR", "0 10 8,*/2 * 1", []int{1, 3, 5, 7, 8, 9, 11, 13, 15, 17, 19, 21, 22, 23, 25, 27, 29}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			schedule, err := parseCronSchedule(tc.expr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var gotDays []int
+			for day := 1; day <= 30; day++ {
+				if schedule.matches(time.Date(2026, time.June, day, 10, 0, 0, 0, time.UTC)) {
+					gotDays = append(gotDays, day)
+				}
+			}
+			if !reflect.DeepEqual(gotDays, tc.wantDays) {
+				t.Fatalf("%q matches June days %v, want %v", tc.expr, gotDays, tc.wantDays)
+			}
+			after := time.Date(2026, time.May, 31, 23, 59, 0, 0, time.UTC)
+			for _, day := range tc.wantDays {
+				want := time.Date(2026, time.June, day, 10, 0, 0, 0, time.UTC)
+				next := schedule.next(after)
+				if !next.Equal(want) {
+					t.Fatalf("%q next after %s = %s, want %s", tc.expr, after, next, want)
+				}
+				after = next
+			}
+		})
 	}
 }
 
@@ -7609,6 +7794,104 @@ type phase5SMTPResult struct {
 	auth       []byte
 	message    []byte
 	err        error
+}
+
+func TestWriteMIMEBase64LineFolding(t *testing.T) {
+	for _, size := range []int{0, 1, 2, 3, 56, 57, 58, 113, 114, 115, 1024} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			data := make([]byte, size)
+			for i := range data {
+				data[i] = byte(i)
+			}
+			var encoded bytes.Buffer
+			if err := writeMIMEBase64(&encoded, data); err != nil {
+				t.Fatal(err)
+			}
+			if size == 0 && encoded.Len() != 0 {
+				t.Fatalf("empty data produced %q", encoded.String())
+			}
+			if size > 0 && !strings.HasSuffix(encoded.String(), "\r\n") {
+				t.Fatal("encoded data does not end with CRLF")
+			}
+			for _, line := range strings.Split(strings.TrimSuffix(encoded.String(), "\r\n"), "\r\n") {
+				if len(line) > 76 || strings.ContainsAny(line, "\r\n") {
+					t.Fatalf("invalid MIME base64 line %q", line)
+				}
+			}
+			decoded, err := base64.StdEncoding.Strict().DecodeString(encoded.String())
+			if err != nil || !bytes.Equal(decoded, data) {
+				t.Fatalf("decoded data differs: got %x, want %x, err=%v", decoded, data, err)
+			}
+		})
+	}
+}
+
+func TestSendMailBase64LineFolding(t *testing.T) {
+	previousConfig := globalConfig
+	t.Cleanup(func() { globalConfig = previousConfig })
+	host, port, smtpResult := newPhase5SMTPServer(t)
+	globalConfig.SMTP = SMTPConfig{
+		Host: host, Port: port, Username: "local-test", Password: "local-test",
+		FromEmail: "sender@example.test",
+	}
+	body := strings.Repeat("日本語の本文\n", 128)
+	wantParts := [][]byte{[]byte(body)}
+	var attachments []MailAttachment
+	for _, size := range []int{0, 1, 57, 58, 1024} {
+		data := make([]byte, size)
+		for i := range data {
+			data[i] = byte(i)
+		}
+		attachments = append(attachments, MailAttachment{FileName: fmt.Sprintf("sample-%d.bin", size), Data: data})
+		wantParts = append(wantParts, data)
+	}
+	if err := sendMail([]string{"receiver@example.test"}, nil, nil, "line folding", body, false, attachments); err != nil {
+		t.Fatal(err)
+	}
+	var captured phase5SMTPResult
+	select {
+	case captured = <-smtpResult:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for SMTP capture")
+	}
+	if captured.err != nil {
+		t.Fatal(captured.err)
+	}
+	message, err := mail.ReadMessage(bytes.NewReader(captured.message))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, parameters, err := mime.ParseMediaType(message.Header.Get("Content-Type"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := multipart.NewReader(message.Body, parameters["boundary"])
+	for i, want := range wantParts {
+		part, err := reader.NextPart()
+		if err != nil {
+			t.Fatalf("part %d: %v", i, err)
+		}
+		if got := part.Header.Get("Content-Transfer-Encoding"); got != "base64" {
+			t.Fatalf("part %d encoding=%q, want base64", i, got)
+		}
+		encoded, err := io.ReadAll(part)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The SMTP fixture's ReadDotBytes normalizes CRLF to LF.
+		for _, line := range bytes.Split(encoded, []byte("\n")) {
+			if len(line) > 76 {
+				t.Fatalf("part %d has a %d-character base64 line", i, len(line))
+			}
+		}
+		decoded, err := base64.StdEncoding.Strict().DecodeString(string(encoded))
+		if err != nil || !bytes.Equal(decoded, want) {
+			t.Fatalf("part %d differs after decoding: err=%v", i, err)
+		}
+	}
+	if _, err := reader.NextPart(); err != io.EOF {
+		t.Fatalf("unexpected extra MIME part: %v", err)
+	}
 }
 
 func TestPhase5SendMailEnvelopeMIMEAndSecretHygiene(t *testing.T) {
@@ -13947,6 +14230,123 @@ func TestReceiveLimitsWebSocketReleasesHandshakeBody(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if !reachedUpgrade {
 		t.Fatalf("upgrade not reached: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWebSocketHandshakeReleasesMultipartData(t *testing.T) {
+	for _, tc := range []struct {
+		name, query                    string
+		spill, deny, disabled, upgrade bool
+		status                         int
+	}{
+		{name: "memory upload", upgrade: true, status: http.StatusForbidden},
+		{name: "disk upload", spill: true, upgrade: true, status: http.StatusForbidden},
+		{name: "check rejects", spill: true, deny: true, status: http.StatusUnauthorized},
+		{name: "check only", spill: true, query: "&nyan_mode=checkOnly", status: http.StatusOK},
+		{name: "invalid mode", spill: true, query: "&nyan_mode=invalid", status: http.StatusBadRequest},
+		{name: "disabled API", spill: true, disabled: true, status: http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, key := t.TempDir(), t.Name()
+			t.Cleanup(func() { storage.Delete(key) })
+			checkPath := filepath.Join(dir, "check.js")
+			checkStatus := http.StatusOK
+			if tc.deny {
+				checkStatus = http.StatusUnauthorized
+			}
+			writeHotReloadTestFile(t, checkPath, fmt.Sprintf(`
+if(nyanAllParams.token!=="handshake value" || nyanAllParams._headers["X-Handshake"]!=="retained" || nyanGetCookie("session")!=="trusted") throw new Error("handshake data missing");
+nyanSetItem(%q,"checked");
+({success:%t,status:%d,result:null});`, key, !tc.deny, checkStatus))
+			newWebSocketCheckFixture(t, map[string]interface{}{
+				"channel": map[string]interface{}{"script": "unused.js", "paramCheck": checkPath, "websocket": !tc.disabled},
+			})
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			if err := writer.WriteField("token", "handshake value"); err != nil {
+				t.Fatal(err)
+			}
+			part, err := writer.CreateFormFile("upload", "data.bin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(part, strings.Repeat("x", 1024)); err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodGet, "http://service.example/?api=channel"+tc.query, &body)
+			req.Header.Set("Content-Type", writer.FormDataContentType())
+			req.Header.Set("Connection", "Upgrade")
+			req.Header.Set("Upgrade", "websocket")
+			req.Header.Set("Sec-WebSocket-Version", "13")
+			req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+			req.Header.Set("X-Handshake", "retained")
+			req.Header.Set("Cookie", "session=trusted")
+			var upload *multipart.FileHeader
+			router := gin.New()
+			router.Use(receiveLimitMiddleware())
+			if tc.spill {
+				router.Use(func(c *gin.Context) {
+					// Force a real disk-backed upload without a 33 MiB test payload.
+					if err := c.Request.ParseMultipartForm(1); err != nil {
+						t.Fatal(err)
+					}
+					form := c.Request.MultipartForm
+					t.Cleanup(func() { _ = form.RemoveAll() })
+					upload = form.File["upload"][0]
+					file, err := upload.Open()
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, diskBacked := file.(*os.File); !diskBacked {
+						t.Error("upload did not spill to disk")
+					}
+					file.Close()
+					c.Next()
+				})
+			}
+			router.GET("/", handleWebSocket)
+			assertReleased := func(r *http.Request) {
+				t.Helper()
+				if r.Body != http.NoBody || r.GetBody != nil || r.Form != nil || r.PostForm != nil || r.MultipartForm != nil {
+					t.Error("handshake body or parsed form remains referenced")
+				}
+				if upload != nil {
+					file, err := upload.Open()
+					if file != nil {
+						file.Close()
+					}
+					if !errors.Is(err, os.ErrNotExist) {
+						t.Errorf("temporary upload remains: %v", err)
+					}
+				}
+			}
+			oldCheck := upgrader.CheckOrigin
+			t.Cleanup(func() { upgrader.CheckOrigin = oldCheck })
+			reachedUpgrade := false
+			upgrader.CheckOrigin = func(r *http.Request) bool {
+				reachedUpgrade = true
+				assertReleased(r)
+				context := readOnlyScriptRequestContext(&gin.Context{Request: r})
+				if context.Request.MultipartForm != nil || context.Request.Header.Get("X-Handshake") != "retained" {
+					t.Error("detached request retained uploads or lost metadata")
+				}
+				return false // Verify the upgrade boundary and its failure cleanup.
+			}
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != tc.status || reachedUpgrade != tc.upgrade {
+				t.Fatalf("status=%d upgrade=%v body=%s", rec.Code, reachedUpgrade, rec.Body.String())
+			}
+			assertReleased(req)
+			if tc.upgrade || tc.deny || tc.query == "&nyan_mode=checkOnly" {
+				if got, _ := storage.Load(key); got != "checked" {
+					t.Errorf("handshake check did not receive request parameters: %v", got)
+				}
+			}
+		})
 	}
 }
 

@@ -94,6 +94,7 @@ HTTP 200で `{"status":200,"result":{"message":"Hello, Nyan8!"}}` が返りま�
 
 Nyan8 は起動時に `api.json` と `config.json` の読み込みパスを指定できます。
 指定がない場合は、従来どおり実行ファイルと同じディレクトリにある `api.json` / `config.json` を読み込みます。
+PATH経由で `Nyan8` を起動する場合も同じ基準です。`go run` / `go test` など、OSの一時ディレクトリにある実行ファイルではカレントディレクトリを使います。
 
 ```bash
 ./Nyan8
@@ -104,6 +105,7 @@ NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./Nyan8
 各 `api.json` 内の `script` / `path` / `paramCheck` / `outCheck` の相対パスは、その定義を書いた `api.json` が置かれているディレクトリから解決されます。
 JavaScriptの `nyanGetFile` / `nyanReadFileB64` / `nyanSendMailAttachment` と `nyanSendMail` の添付 `path` は、最上位の `api.json` のディレクトリを基準にします。多段include先のAPI、本体・`paramCheck`・`outCheck`、`nyanCallMe` の呼び出し先、Push先でも同じ基準です。実行中は、その実行が使う設定スナップショットの基準を維持します。絶対パスはそのまま使用できます。
 `config.json` 内の `certPath` / `keyPath` / `javascript_include` / `log.Filename` の相対パスは、`config.json` が置かれているディレクトリから解決されます。
+`certPath` / `keyPath` は `file:///path/to/cert.pem`（Windowsでは `file:///C:/path/to/cert.pem`）、`~/`、環境変数の展開にも対応します。不正なfile URLは起動エラーです。
 
 ---
 
@@ -455,6 +457,7 @@ console.log(nyanAllParams.ws_message_text);
 ```
 
 各フィールドでは `*`、数値、カンマ区切り、範囲、ステップ指定を使えます。
+日または曜日のフィールドが `*` で始まる場合は、日と曜日の両方に一致した日に実行します。`*/1` や `*/2` もこの規則に従い、`0 10 */1 * 1` は月曜10時だけに実行します。両フィールドが `*` で始まらない場合は、日または曜日のどちらかに一致した日に実行します。
 
 指定例:
 
@@ -665,6 +668,7 @@ HTTP・stdioともに、`tools/call` は入力の `inputSchema` 検証 → 参�
 接続情報は `nyanAllParams._headers`、`_remote_ip`、`_user_agent` で参照できます。接続前と各メッセージの処理で、これらをサーバーが実際の接続情報で上書きします。接続前の `paramCheck` ではクエリーパラメータに加え、`nyanGetCookie()`、`nyanGetRemoteIP()`、`nyanGetUserAgent()`、`nyanGetRequestHeaders()` も利用できます。接続前の `nyanAllParams.api` は接続先のAPI名になります。接続後も、メッセージごとのチェック・本体から同じ取得関数を利用できます。取得するのは接続時のHTTPリクエスト情報であり、接続後にブラウザーのCookieを変更しても既存接続には反映されません。接続時のクエリーパラメータは各メッセージに自動で引き継ぎません。
 
 接続時と受信メッセージでは、それぞれ処理開始時のAPI設定snapshotを使用します。`type: "ws_client"` 自身の受信スクリプトにはチェックを適用しません。
+接続時のHTTP本文・フォームは接続チェック後に解放し、multipartの一時ファイルも削除します。接続拒否時も削除します。接続後に利用するCookie・IP・User-Agent・ヘッダーは保持します。
 
 #### Push先APIのチェック
 
@@ -969,6 +973,7 @@ console.log("Request Headers:", headers);
 
 ### 4‑12 メール送信 nyanSendMail
 強力なメール送信機能を備えています。CC/BCC、添付ファイルもサポートしています。
+本文と添付のBase64はMIMEの規則に従い、76文字以内の行をCRLFで区切って送信します。復号後の本文・添付内容は変わりません。
 
 ```javascript
 let result = nyanSendMail({

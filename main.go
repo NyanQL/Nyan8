@@ -449,8 +449,6 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-var ginContext *gin.Context
-
 var pushConnections = pushConnectionRegistry{connections: make(map[string][]*serverWebSocket)}
 
 type pushConnectionRegistry struct {
@@ -513,20 +511,11 @@ var websocketConnectionCount = struct {
 
 // main はメイン関数です。
 func main() {
-	// 実行ファイルのディレクトリを取得
-	execPath, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	// PATH経由の起動でも実行ファイルの場所を基準にする。
+	execDir, err := executableBaseDir()
 	if err != nil {
 		fatalServiceError("executable_path_failed", err)
 	}
-
-	// 一時ディレクトリを除外してカレントディレクトリを使用
-	if isTemporaryDirectory(execPath) {
-		execPath, err = os.Getwd()
-		if err != nil {
-			fatalServiceError("working_directory_failed", err)
-		}
-	}
-	execDir := execPath
 
 	options, err := resolveStartupOptions(execDir, os.Args[1:])
 	if err != nil {
@@ -542,7 +531,9 @@ func main() {
 	}
 	configBaseDir := filepath.Dir(paths.Config.Path)
 	apiBaseDir := filepath.Dir(paths.API.Path)
-	adjustConfigPaths(configBaseDir, &config)
+	if err := adjustConfigPaths(configBaseDir, &config); err != nil {
+		fatalServiceError("config_path_invalid", err)
+	}
 	globalConfig = config
 
 	if err := initLogger(configBaseDir); err != nil {
@@ -632,17 +623,7 @@ func main() {
 		fatalServiceError("endpoint_registration_failed", err)
 	}
 
-	// HTTPSサーバーを起動するかどうかを判断
-	// ★★★ 修正：cert/key のパス解決に resolvePath を使用 ★★★
-	certFilePath, err := resolvePath(configBaseDir, config.CertFile)
-	if err != nil {
-		fatalServiceError("cert_path_invalid", err)
-	}
-	keyFilePath, err := resolvePath(configBaseDir, config.KeyFile)
-	if err != nil {
-		fatalServiceError("key_path_invalid", err)
-	}
-
+	// 証明書と鍵はadjustConfigPathsで一度だけ解決済み。
 	server := newConfiguredHTTPServer(listenAddress, receiveLimitH2CHandler(r, config.HTTPTimeouts), config.HTTPTimeouts)
 	server.ErrorLog = httpServerErrorLogger()
 	if config.ProxyProtocol.Enabled {
@@ -650,7 +631,7 @@ func main() {
 	}
 	if config.CertFile != "" && config.KeyFile != "" {
 		serviceLog(slog.LevelInfo, "http_server_starting", "transport", "https", "address", listenAddress)
-		err = serveConfiguredHTTPServer(server, certFilePath, keyFilePath, config.ProxyProtocol)
+		err = serveConfiguredHTTPServer(server, config.CertFile, config.KeyFile, config.ProxyProtocol)
 	} else {
 		serviceLog(slog.LevelInfo, "http_server_starting", "transport", "http", "address", listenAddress)
 		err = serveConfiguredHTTPServer(server, "", "", config.ProxyProtocol)
@@ -883,6 +864,21 @@ func isTemporaryDirectory(path string) bool {
 	return strings.HasPrefix(p, t)
 }
 
+// executableBaseDir uses the running program's location rather than argv[0],
+// which may contain only a command name when launched through PATH. Preserve
+// the working-directory fallback for temporary binaries used by go run/test.
+func executableBaseDir() (string, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve executable: %w", err)
+	}
+	dir := filepath.Dir(executable)
+	if isTemporaryDirectory(dir) {
+		return os.Getwd()
+	}
+	return dir, nil
+}
+
 func resolveStartupOptions(execDir string, args []string) (startupOptions, error) {
 	flags := flag.NewFlagSet("Nyan8", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -976,6 +972,9 @@ func resolvePath(baseDir, p string) (string, error) {
 
 	// 環境変数展開
 	p = os.ExpandEnv(p)
+	if p == "" {
+		return "", nil
+	}
 
 	// file:// URL → ローカルパス
 	if strings.HasPrefix(p, "file://") {
@@ -985,8 +984,8 @@ func resolvePath(baseDir, p string) (string, error) {
 		}
 		// / を OS の区切りに
 		p = filepath.FromSlash(u.Path)
-		// Windows の file://C:/... 形式調整（/C:/... → C:/...）
-		if runtime.GOOS == "windows" && strings.HasPrefix(p, string(os.PathSeparator)) && len(p) >= 3 && p[1] == ':' {
+		// Windows の file:///C:/... 形式調整（\C:\... → C:\...）。
+		if runtime.GOOS == "windows" && len(p) >= 4 && p[0] == os.PathSeparator && p[2] == ':' && p[3] == os.PathSeparator {
 			p = p[1:]
 		}
 	}
@@ -1087,14 +1086,22 @@ func loadConfig(filename string) (Config, error) {
 	return config, nil
 }
 
-func adjustConfigPaths(configBaseDir string, config *Config) {
-	config.CertFile = resolvePathFromBase(configBaseDir, config.CertFile)
-	config.KeyFile = resolvePathFromBase(configBaseDir, config.KeyFile)
+func adjustConfigPaths(configBaseDir string, config *Config) error {
+	certFile, err := resolvePath(configBaseDir, strings.TrimSpace(config.CertFile))
+	if err != nil {
+		return fmt.Errorf("invalid certPath: %w", err)
+	}
+	keyFile, err := resolvePath(configBaseDir, strings.TrimSpace(config.KeyFile))
+	if err != nil {
+		return fmt.Errorf("invalid keyPath: %w", err)
+	}
+	config.CertFile, config.KeyFile = certFile, keyFile
 	config.Log.Filename = resolvePathFromBase(configBaseDir, config.Log.Filename)
 	config.OAuthStateRoot = resolvePathFromBase(configBaseDir, config.OAuthStateRoot)
 	for i, includePath := range config.JavaScriptInclude {
 		config.JavaScriptInclude[i] = resolvePathFromBase(configBaseDir, includePath)
 	}
+	return nil
 }
 
 func resolvePathFromBase(baseDir, pathValue string) string {
@@ -1201,24 +1208,11 @@ func acquireWebSocketConnection(limit int) (func(), bool) {
 // handleAPIRequest はAPIリクエストを処理します。
 func handleAPIRequest(c *gin.Context) {
 	// 実行ファイルのディレクトリを取得
-	execPath, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	execPath, err := executableBaseDir()
 	if err != nil {
 		fatalServiceError("executable_path_failed", err)
 	}
-
-	// 一時ディレクトリを除外してカレントディレクトリを使用
-	if isTemporaryDirectory(execPath) {
-		execPath, err = os.Getwd()
-		if err != nil {
-			fatalServiceError("working_directory_failed", err)
-		}
-	}
 	execDir := apiBaseDir(execPath)
-
-	ginContext = c
-	defer func() {
-		ginContext = nil
-	}()
 
 	// スクリプトリストの取り込み
 	apiJsonPath := apiJSONPath(execDir)
@@ -1321,17 +1315,10 @@ func handleWebSocket(c *gin.Context) {
 		defer release()
 	}
 	// Resolve and check the subscription target before upgrading or registering it.
-	execPath, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	execPath, err := executableBaseDir()
 	if err != nil {
 		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, "Failed to resolve execution directory"))
 		return
-	}
-	if isTemporaryDirectory(execPath) {
-		execPath, err = os.Getwd()
-		if err != nil {
-			writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, "Failed to resolve working directory"))
-			return
-		}
 	}
 	execDir := apiBaseDir(execPath)
 	apiNameValue, _ := c.Get("nyan_api_name")
@@ -1345,6 +1332,9 @@ func handleWebSocket(c *gin.Context) {
 	if apiNameString == "" {
 		apiNameString = c.Query("api")
 	}
+	// Hijacked requests bypass net/http's normal multipart cleanup. Also clean
+	// up rejected handshakes and checks that return before the upgrade.
+	defer releaseWebSocketHandshakeBody(c.Request)
 	params, err := collectRequestParams(c)
 	if err != nil {
 		writeParamCheckResponse(c, newParamCheckError(http.StatusBadRequest, "Invalid request parameters"))
@@ -1379,9 +1369,9 @@ func handleWebSocket(c *gin.Context) {
 		return
 	}
 
-	// Handshake checks are complete. Do not retain the buffered HTTP body
-	// throughout the lifetime of the WebSocket connection.
-	c.Request.Body = http.NoBody
+	// Checks need the handshake parameters, but the long-lived connection only
+	// needs request metadata. Release parsed forms and uploads before cloning it.
+	releaseWebSocketHandshakeBody(c.Request)
 	rawConn, err := upgrader.Upgrade(c.Writer, c.Request, c.Writer.Header())
 	if err != nil {
 		logServiceError(slog.LevelWarn, "websocket_upgrade_failed", err)
@@ -1510,6 +1500,22 @@ func handleWebSocket(c *gin.Context) {
 			performPushForTransport(snapshot, scriptInfo, scriptListData, receivedData, execDir, messageType, true, requestContext)
 		}
 	}
+}
+
+func releaseWebSocketHandshakeBody(request *http.Request) {
+	if request.MultipartForm != nil {
+		if err := request.MultipartForm.RemoveAll(); err != nil {
+			logServiceError(slog.LevelWarn, "websocket_multipart_cleanup_failed", err)
+		}
+		request.MultipartForm = nil
+	}
+	if request.Body != nil {
+		_ = request.Body.Close()
+	}
+	request.Body = http.NoBody
+	request.GetBody = nil
+	request.Form = nil
+	request.PostForm = nil
 }
 
 // Connection metadata is server-owned, both before upgrade and for each message.
@@ -1654,15 +1660,10 @@ func runJavaScriptValueForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath s
 	mcpScript, _ := filepath.Abs(scriptPath)
 	registerNyanMCP(vm, nyanMCPClient, mcpContext, mcpScript, "operation")
 
-	// ★★★ 追加：include の基準ディレクトリを取得（mainと同じロジック） ★★★
-	basePath, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	// includeも起動時と同じ基準ディレクトリを使用する。
+	basePath, err := executableBaseDir()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get base path: %v", err)
-	}
-	if isTemporaryDirectory(basePath) {
-		if basePath, err = os.Getwd(); err != nil {
-			return nil, fmt.Errorf("failed to get working directory: %v", err)
-		}
 	}
 
 	jsCode, err := globalConfig.javaScriptIncludes(basePath)
@@ -2658,8 +2659,6 @@ func servePublicEndpoint(c *gin.Context, endpoint, requestedPath, execDir string
 	allParams["api"] = endpoint
 	allParams["nyan_public_endpoint"] = endpoint
 	allParams["nyan_public_path"] = requestedPath
-	ginContext = c
-	defer func() { ginContext = nil }()
 	if allowed, handled := runParamCheckWithSnapshot(snapshot, c, latest, execDir, allParams); handled || !allowed {
 		return
 	}
@@ -4897,7 +4896,9 @@ func parseCronSchedule(expr string) (cronSchedule, error) {
 
 func parseCronField(field string, minValue, maxValue int, normalizeSunday bool) (cronField, bool, error) {
 	values := make(cronField)
-	isStar := field == "*"
+	// Cron's day/weekday combination uses AND when either field begins with *.
+	// This includes stepped wildcards such as */1 and */2.
+	isStar := strings.HasPrefix(field, "*")
 	for _, part := range strings.Split(field, ",") {
 		if part == "" {
 			return nil, false, fmt.Errorf("empty list item")
@@ -6061,14 +6062,7 @@ func javaScriptFileBaseDir(snapshot *APIConfigSnapshot) (string, error) {
 		return filepath.Abs(filepath.Dir(apiPath))
 	}
 	// Match the default api.json location used at startup when no config is loaded.
-	execDir, err := filepath.Abs(filepath.Dir(os.Args[0]))
-	if err != nil {
-		return "", err
-	}
-	if isTemporaryDirectory(execDir) {
-		return os.Getwd()
-	}
-	return execDir, nil
+	return executableBaseDir()
 }
 
 func newNyanGetFile(vm *goja.Runtime, filePath func(string) string) func(call goja.FunctionCall) goja.Value {
@@ -6146,16 +6140,10 @@ func handleJSONRPC(c *gin.Context) {
 	}
 
 	// 実行ディレクトリの取得
-	execDir, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	execDir, err := executableBaseDir()
 	if err != nil {
 		respondJSONRPCError(c, rpcReq.ID, -32603, "Internal error: cannot get execPath", err)
 		return
-	}
-	if isTemporaryDirectory(execDir) {
-		if execDir, err = os.Getwd(); err != nil {
-			respondJSONRPCError(c, rpcReq.ID, -32603, "Internal error: cannot get working directory", err)
-			return
-		}
 	}
 	execDir = apiBaseDir(execDir)
 
@@ -6365,6 +6353,26 @@ func respondJSONRPCError(c *gin.Context, id interface{}, code int, message strin
 	})
 }
 
+// writeMIMEBase64 writes RFC 2045 base64 with at most 76 characters per line.
+func writeMIMEBase64(w io.Writer, data []byte) error {
+	var line [78]byte
+	for len(data) > 0 {
+		size := min(len(data), 57)
+		encodedSize := base64.StdEncoding.EncodedLen(size)
+		base64.StdEncoding.Encode(line[:encodedSize], data[:size])
+		line[encodedSize], line[encodedSize+1] = '\r', '\n'
+		n, err := w.Write(line[:encodedSize+2])
+		if err != nil {
+			return err
+		}
+		if n != encodedSize+2 {
+			return io.ErrShortWrite
+		}
+		data = data[size:]
+	}
+	return nil
+}
+
 // sendMail は config.json の SMTP 設定でメールを送り、attachments があれば添付する。
 func sendMail(
 	to, cc, bcc []string, // 宛先
@@ -6431,10 +6439,13 @@ func sendMail(
 	}
 	partHdr.Set("Content-Transfer-Encoding", "base64")
 
-	bp, _ := mp.CreatePart(partHdr)
-	encBody := base64.NewEncoder(base64.StdEncoding, bp)
-	encBody.Write([]byte(body))
-	encBody.Close()
+	bp, err := mp.CreatePart(partHdr)
+	if err != nil {
+		return err
+	}
+	if err := writeMIMEBase64(bp, []byte(body)); err != nil {
+		return err
+	}
 
 	// 3-3 添付パート
 	for _, a := range attachments {
@@ -6455,12 +6466,17 @@ func sendMail(
 			fmt.Sprintf(`attachment; filename=%q`, a.FileName))
 		attHdr.Set("Content-Transfer-Encoding", "base64")
 
-		ap, _ := mp.CreatePart(attHdr)
-		encAtt := base64.NewEncoder(base64.StdEncoding, ap)
-		encAtt.Write(a.Data)
-		encAtt.Close()
+		ap, err := mp.CreatePart(attHdr)
+		if err != nil {
+			return err
+		}
+		if err := writeMIMEBase64(ap, a.Data); err != nil {
+			return err
+		}
 	}
-	mp.Close() // --boundary-- を書く
+	if err := mp.Close(); err != nil { // --boundary-- を書く
+		return err
+	}
 
 	serviceLog(slog.LevelDebug, "mail_message_prepared", "attachments", len(attachments), "bytes", msg.Len())
 
