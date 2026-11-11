@@ -8329,6 +8329,47 @@ func TestOAuthStateListIsRootedPrivateAndDeterministic(t *testing.T) {
 }
 
 func TestProductionWebSocketExposureIsBounded(t *testing.T) {
+	t.Run("connection limit configuration", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, config string
+			want         int
+			invalid      bool
+		}{
+			{"omitted", `{}`, 128, false},
+			{"empty websocket", `{"websocket":{}}`, 128, false},
+			{"zero", `{"websocket":{"maxConnections":0}}`, 128, false},
+			{"null", `{"websocket":{"maxConnections":null}}`, 128, false},
+			{"minimum", `{"websocket":{"maxConnections":1}}`, 1, false},
+			{"custom", `{"websocket":{"maxConnections":512}}`, 512, false},
+			{"maximum", `{"websocket":{"maxConnections":4096}}`, 4096, false},
+			{"negative", `{"websocket":{"maxConnections":-1}}`, 0, true},
+			{"too large", `{"websocket":{"maxConnections":4097}}`, 0, true},
+			{"fraction", `{"websocket":{"maxConnections":1.5}}`, 0, true},
+			{"string", `{"websocket":{"maxConnections":"0"}}`, 0, true},
+			{"boolean", `{"websocket":{"maxConnections":false}}`, 0, true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "config.json")
+				if err := os.WriteFile(path, []byte(tc.config), 0600); err != nil {
+					t.Fatal(err)
+				}
+				cfg, err := loadConfig(path)
+				if tc.invalid {
+					if err == nil {
+						t.Fatal("invalid connection limit accepted")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if cfg.WebSocket.MaxConnections != tc.want {
+					t.Fatalf("connection limit=%d, want %d", cfg.WebSocket.MaxConnections, tc.want)
+				}
+			})
+		}
+	})
+
 	t.Run("configuration contract", func(t *testing.T) {
 		backing := map[string]interface{}{"websocket": false}
 		if apiWebSocketAllowed(backing) {

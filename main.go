@@ -1077,8 +1077,11 @@ func loadConfig(filename string) (Config, error) {
 	if err := json.Unmarshal(data, &config); err != nil {
 		return config, err
 	}
+	if config.WebSocket.MaxConnections == 0 {
+		config.WebSocket.MaxConnections = 128
+	}
 	if config.WebSocket.MaxConnections < 1 || config.WebSocket.MaxConnections > 4096 {
-		return config, fmt.Errorf("websocket.maxConnections must be between 1 and 4096")
+		return config, fmt.Errorf("websocket.maxConnections must be 0 (default: 128) or between 1 and 4096")
 	}
 	if _, err := validateProxyProtocolConfig(config.ProxyProtocol); err != nil {
 		return config, err

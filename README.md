@@ -41,7 +41,7 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 
 ### ソースからのビルド
 
-[go.mod](go.mod)に記載されたGoバージョン（現時点では1.26.9）を用意し、リポジトリのルートで `go build -o Nyan8 .` を実行します。Windowsでは `go build -o Nyan8.exe .` です。配布バイナリを使う場合はGoのインストールは不要です。
+[go.mod](go.mod)に記載されたGoバージョン（現時点では1.27.4）を用意し、リポジトリのルートで `go build -o Nyan8 .` を実行します。Windowsでは `go build -o Nyan8.exe .` です。配布バイナリを使う場合はGoのインストールは不要です。
 
 <a id="quickstart"></a>
 ### 最小起動例：固定JSONを返す
@@ -137,7 +137,7 @@ JavaScriptの `nyanGetFile` / `nyanReadFileB64` / `nyanSendMailAttachment` と `
   },
   "websocket": {
     "allowRoot": true,              // ルートのWebSocket upgradeを許可
-    "maxConnections": 128           // WebSocket接続数の上限（1〜4096）
+    "maxConnections": 128           // WebSocket接続数の上限（1〜4096、0は既定128）
   },
   "proxyProtocol": {
     "enabled": false,               // PROXY protocol v2を使用する場合だけtrue
@@ -168,6 +168,8 @@ JavaScriptの `nyanGetFile` / `nyanReadFileB64` / `nyanSendMailAttachment` と `
   }
 }
 ```
+
+`websocket.maxConnections` は1プロセス内で受け付けるWebSocket接続数の上限です。省略または `0` は既定の128接続として扱い、無制限や接続禁止にはなりません。明示する上限は1〜4096の整数で、負数・4096を超える値・小数・文字列・真偽値は設定エラーです。変更の反映にはサービスの再起動が必要です。
 
 `javascript_include_cache` は共通JavaScriptの読込方法を切り替えます。
 
@@ -1932,7 +1934,7 @@ Windowsでは、Nyan8は上記の実行ファイルと秘密ファイルの所�
 
 ### 検証・互換性
 
-公式 [Go SDK v1.7.0](https://github.com/modelcontextprotocol/go-sdk/tree/v1.7.0) を固定依存に追加しています（SDKの最小Goは1.25、製品は既存どおりGo 1.26.9）。SDKの対応版全てをこの製品で許可するわけではありません。
+公式 [Go SDK v1.7.0](https://github.com/modelcontextprotocol/go-sdk/tree/v1.7.0) を固定依存に追加しています（SDKの最小Goは1.25、製品はGo 1.27.4）。SDKの対応版全てをこの製品で許可するわけではありません。
 
 2026-07-28は `server/discover` と要求メタデータ、2025-06-18はSDKによる旧版 `initialize` → `notifications/initialized` を使います。交渉版が接続設定の許可版でなければ `PROTOCOL_VERSION` でtools/call前に停止します。SDKが先に選んだ未許可版から、独自の再交渉・暗黙ダウングレードはしません。
 
