@@ -4014,6 +4014,258 @@ func TestBackgroundRuntimeManagerUpdatesAndStopsSchedule(t *testing.T) {
 	})
 }
 
+func TestScheduleTimeoutConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name, field string
+		want        time.Duration
+		invalid     bool
+	}{
+		{"omitted", "", 0, false}, {"null runtime", `,"runtime":null`, 0, false},
+		{"empty runtime", `,"runtime":{}`, 0, false}, {"null timeout", `,"runtime":{"timeout":null}`, 0, false},
+		{"zero", `,"runtime":{"timeout":0}`, 0, false}, {"zero string", `,"runtime":{"timeout":"0s"}`, 0, false},
+		{"minutes", `,"runtime":{"timeout":"5m"}`, 5 * time.Minute, false},
+		{"exact runtime key", `,"runtime":{"timeout":"1s"},"Runtime":null`, time.Second, false},
+		{"seconds", `,"runtime":{"timeout":1.5}`, 1500 * time.Millisecond, false},
+		{"string seconds", `,"runtime":{"timeout":" 1.5 "}`, 1500 * time.Millisecond, false},
+		{"minimum", `,"runtime":{"timeout":0.000000001}`, time.Nanosecond, false},
+		{"maximum", `,"runtime":{"timeout":9223372036.854775807}`, time.Duration(1<<63 - 1), false},
+		{"overflow", `,"runtime":{"timeout":9223372036.854775808}`, 0, true},
+		{"negative", `,"runtime":{"timeout":-1}`, 0, true}, {"negative zero", `,"runtime":{"timeout":-0}`, 0, true},
+		{"negative duration", `,"runtime":{"timeout":"-1s"}`, 0, true},
+		{"sub nanosecond", `,"runtime":{"timeout":0.0000000001}`, 0, true},
+		{"exponent", `,"runtime":{"timeout":1e3}`, 0, true}, {"exponent string", `,"runtime":{"timeout":"1e3"}`, 0, true},
+		{"empty", `,"runtime":{"timeout":""}`, 0, true}, {"unit", `,"runtime":{"timeout":"1day"}`, 0, true},
+		{"boolean", `,"runtime":{"timeout":true}`, 0, true}, {"array", `,"runtime":{"timeout":[]}`, 0, true},
+		{"object", `,"runtime":{"timeout":{}}`, 0, true}, {"invalid runtime", `,"runtime":1`, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			data := []byte(`{"job":{"type":"schedule","script":"job.js","trigger":{"type":"cron","value":"* * * * *"}` + tc.field + `}}`)
+			writeHotReloadTestFile(t, filepath.Join(dir, "api.json"), string(data))
+			result, err := readAPIConfigFile(filepath.Join(dir, "api.json"), dir)
+			if tc.invalid {
+				if err == nil {
+					t.Fatal("invalid timeout accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := result.Snapshot.Schedules["job"].timeout; got != tc.want {
+				t.Fatalf("timeout=%v want %v", got, tc.want)
+			}
+		})
+	}
+	for _, kind := range []string{"api", "public", "ws_client", "mcp"} {
+		t.Run("wrong type "+kind, func(t *testing.T) {
+			_, err := buildScheduleJobConfigs(map[string]interface{}{"entry": map[string]interface{}{"type": kind, "runtime": map[string]interface{}{"timeout": "1s"}}}, t.TempDir())
+			if err == nil || !strings.Contains(err.Error(), "only allowed") {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
+func TestScheduleTimeoutExecution(t *testing.T) {
+	initTestLogger()
+	dir := t.TempDir()
+	jobPath := filepath.Join(dir, "job.js")
+	childPath := filepath.Join(dir, "child.js")
+	checkPath := filepath.Join(dir, "check.js")
+	pushPath := filepath.Join(dir, "push.js")
+	busy := `const end=Date.now()+2000; while(Date.now()<end){};`
+	normal := `({status:200,success:true,result:"ok"});`
+	for _, scenario := range []string{"body", "getter", "include", "child", "child getter", "paramCheck", "paramCheck getter", "outCheck", "outCheck getter", "push", "push getter", "push check getter", "caught child"} {
+		t.Run(scenario, func(t *testing.T) {
+			globalConfig.JavaScriptInclude = nil
+			child := map[string]interface{}{"script": childPath}
+			push := map[string]interface{}{"script": pushPath}
+			writeHotReloadTestFile(t, childPath, normal)
+			writeHotReloadTestFile(t, checkPath, `({success:true,status:200,result:null});`)
+			writeHotReloadTestFile(t, pushPath, normal)
+			code := `nyanCallMe({api:"child"}); ` + normal
+			switch scenario {
+			case "body":
+				code = busy + normal
+			case "getter":
+				code = `({get value(){` + busy + `return 1;}});`
+			case "include":
+				include := filepath.Join(dir, "include.js")
+				writeHotReloadTestFile(t, include, busy)
+				globalConfig.JavaScriptInclude = []string{include}
+			case "child", "caught child":
+				writeHotReloadTestFile(t, childPath, busy+normal)
+				if scenario == "caught child" {
+					code = `try {nyanCallMe({api:"child"});} catch(e) {} ` + normal
+				}
+			case "child getter":
+				writeHotReloadTestFile(t, childPath, `({get result(){`+busy+`return 1;},status:200});`)
+			case "paramCheck", "outCheck":
+				child[scenario] = checkPath
+				writeHotReloadTestFile(t, checkPath, busy+`({success:true,status:200});`)
+			case "paramCheck getter", "outCheck getter":
+				child[strings.TrimSuffix(scenario, " getter")] = checkPath
+				writeHotReloadTestFile(t, checkPath, `({success:true,status:200,get result(){`+busy+`return null;}});`)
+			case "push":
+				child["push"] = "target"
+				writeHotReloadTestFile(t, pushPath, busy+normal)
+			case "push getter":
+				child["push"] = "target"
+				writeHotReloadTestFile(t, pushPath, `({status:200,get result(){`+busy+`return 1;}});`)
+			case "push check getter":
+				child["push"] = "target"
+				push["paramCheck"] = checkPath
+				writeHotReloadTestFile(t, checkPath, `({success:true,status:200,get result(){`+busy+`return 1;}});`)
+			}
+			writeHotReloadTestFile(t, jobPath, code)
+			snapshot := newAPIConfigSnapshot(filepath.Join(dir, "api.json"), map[string]interface{}{"child": child, "target": push}, nil, nil, nil, nil)
+			job := scheduleJobConfig{name: "job", scriptPath: jobPath, timeout: 50 * time.Millisecond}
+			started := time.Now()
+			_, err := runScheduleScriptWithSnapshot(snapshot, job, map[string]interface{}{"api": "job"}, context.Background())
+			if err == nil || !strings.Contains(err.Error(), "deadline exceeded") || time.Since(started) > time.Second {
+				t.Fatalf("deadline not enforced: elapsed=%v err=%v", time.Since(started), err)
+			}
+			// A timed-out execution must not poison the next execution's fresh VM.
+			globalConfig.JavaScriptInclude = nil
+			writeHotReloadTestFile(t, jobPath, normal)
+			job.timeout = time.Second
+			body, err := runScheduleScriptWithSnapshot(snapshot, job, nil, context.Background())
+			if err != nil || !strings.Contains(body, `"status":200`) {
+				t.Fatalf("next execution: %s %v", body, err)
+			}
+		})
+	}
+	for _, timeout := range []time.Duration{0, time.Second} {
+		writeHotReloadTestFile(t, jobPath, `const end=Date.now()+80;while(Date.now()<end){}; if(typeof nyanCallMe!=="function" || typeof nyanHostExec!=="function") throw Error("restricted"); "done";`)
+		got, err := runScheduleScriptWithSnapshot(nil, scheduleJobConfig{scriptPath: jobPath, timeout: timeout}, nil, context.Background())
+		if err != nil || got != "done" {
+			t.Fatalf("timeout %v: %s %v", timeout, got, err)
+		}
+	}
+	// Ordinary API execution receives no schedule deadline, even with a canceled request.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	got, err := runJavaScriptWithSnapshot(nil, jobPath, nil, nyanMCPGinWithContext(nil, ctx))
+	if err != nil || got != "done" {
+		t.Fatalf("ordinary execution changed: %s %v", got, err)
+	}
+}
+
+func TestScheduleTimeoutAcrossCalls(t *testing.T) {
+	initTestLogger()
+	dir := t.TempDir()
+	script := filepath.Join(dir, "job.js")
+	child := filepath.Join(dir, "child.js")
+	writeHotReloadTestFile(t, script, `for(let i=0;i<10;i++) nyanCallMe({api:"child"}); "done";`)
+	writeHotReloadTestFile(t, child, `const end=Date.now()+80;while(Date.now()<end){};({status:200});`)
+	snapshot := newAPIConfigSnapshot(filepath.Join(dir, "api.json"), map[string]interface{}{"child": map[string]interface{}{"script": child}}, nil, nil, nil, nil)
+	start := time.Now()
+	_, err := runScheduleScriptWithSnapshot(snapshot, scheduleJobConfig{scriptPath: script, timeout: 150 * time.Millisecond}, nil, context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 600*time.Millisecond {
+		t.Fatalf("deadline renewed across calls: elapsed=%v err=%v", time.Since(start), err)
+	}
+}
+
+func TestScheduleTimeoutExternalMCP(t *testing.T) {
+	initTestLogger()
+	f := &nyanMCPFixture{modern: true, result: json.RawMessage(`{"content":[]}`), delay: 2 * time.Second}
+	manager, script := nyanMCPTestManager(t, f)
+	old := nyanMCPClient
+	nyanMCPClient = manager
+	t.Cleanup(func() { nyanMCPClient = old })
+	writeHotReloadTestFile(t, script, `nyanCallMCP({connection:"local",tool:"echo"}); "done";`)
+	start := time.Now()
+	_, err := runScheduleScriptWithSnapshot(nil, scheduleJobConfig{scriptPath: script, timeout: 100 * time.Millisecond}, nil, context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
+		t.Fatalf("MCP ignored job deadline: elapsed=%v err=%v", time.Since(start), err)
+	}
+}
+
+func TestScheduleTimeoutHotReload(t *testing.T) {
+	initTestLogger()
+	dir := t.TempDir()
+	root := filepath.Join(dir, "api.json")
+	child := filepath.Join(dir, "child.json")
+	script := filepath.Join(dir, "job.js")
+	writeHotReloadTestFile(t, root, `{"sub":{"type":"include","path":"child.json"}}`)
+	definition := func(timeout string) string {
+		return `{"job":{"type":"schedule","script":"job.js","trigger":{"type":"cron","value":"0 0 1 1 *"},"runtime":{"timeout":` + timeout + `}}}`
+	}
+	writeHotReloadTestFile(t, child, definition(`"150ms"`))
+	first, err := readAPIConfigFile(root, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSnapshot, oldManager := currentAPISnapshot(), backgroundRuntimes
+	manager := newBackgroundRuntimeManager()
+	backgroundRuntimes = manager
+	publishAPISnapshot(first.Snapshot)
+	t.Cleanup(func() { manager.reconcile(nil, nil); backgroundRuntimes = oldManager; publishAPISnapshot(oldSnapshot) })
+	manager.reconcile(first.Snapshot.Schedules, nil)
+	manager.mu.Lock()
+	rt := manager.schedules["sub/job"]
+	manager.mu.Unlock()
+	// Hold native I/O while the next configuration is installed. It cannot change
+	// the deadline captured by an already-running job.
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(started); <-release })
+		fmt.Fprint(w, "ok")
+	}))
+	defer server.Close()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	writeHotReloadTestFile(t, script, fmt.Sprintf(`nyanGetAPI(%q); const end=Date.now()+400;while(Date.now()<end){}; "ok";`, server.URL))
+	done := make(chan error, 1)
+	go func() {
+		_, err := runScheduleScriptWithSnapshot(first.Snapshot, first.Snapshot.Schedules["sub/job"], nil, context.Background())
+		done <- err
+	}()
+	waitForHotReloadSignal(t, started, "job HTTP call")
+	writeHotReloadTestFile(t, child, definition(`"2s"`))
+	observed, reloaded, err := reloadAPIConfigGraphIfChanged(root, dir, first.Snapshot.FileStates)
+	if err != nil || !reloaded {
+		t.Fatalf("reload=%t err=%v", reloaded, err)
+	}
+	current, active := rt.currentConfig()
+	if !active || current.timeout != 2*time.Second {
+		t.Fatalf("current=%#v active=%t", current, active)
+	}
+	manager.mu.Lock()
+	same := manager.schedules["sub/job"] == rt
+	manager.mu.Unlock()
+	if !same {
+		t.Fatal("timeout update replaced the job runtime")
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "deadline exceeded") {
+			t.Fatalf("running deadline changed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("job did not finish")
+	}
+	body, err := runScheduleScriptWithSnapshot(currentAPISnapshot(), current, nil, context.Background())
+	if err != nil || body != "ok" {
+		t.Fatalf("new deadline: %s %v", body, err)
+	}
+	writeHotReloadTestFile(t, child, definition(`-1`))
+	_, reloaded, err = reloadAPIConfigGraphIfChanged(root, dir, observed)
+	if err == nil || reloaded || currentAPISnapshot().Schedules["sub/job"].timeout != 2*time.Second {
+		t.Fatalf("invalid reload replaced configuration: %t %v", reloaded, err)
+	}
+	manager.reconcile(nil, nil)
+	waitForHotReloadSignal(t, rt.done, "job shutdown")
+}
+
 func TestScheduleDescriptionUpdateDoesNotWakeTimer(t *testing.T) {
 	schedule, err := parseCronSchedule("0 0 1 1 *")
 	if err != nil {
@@ -5824,6 +6076,130 @@ func TestOAuthRandomBase64URLDefaultAndSizes(t *testing.T) {
 			_, err := vm.RunString("nyanRandomBase64URL(" + argument + ");")
 			if err == nil || !strings.Contains(err.Error(), "outside the allowed range") {
 				t.Fatalf("error=%v, want range exception", err)
+			}
+		})
+	}
+}
+
+func TestOAuthJavaScriptIncludesAcrossStages(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		for _, api := range []string{"oauth_authorize", "oauth_verify_access", "oauth_authorization_server_metadata"} {
+			t.Run(fmt.Sprintf("%s/cache=%t", api, cached), func(t *testing.T) {
+				const check = `shared();({success:true,status:200});`
+				body := `({status:200,body:shared()});`
+				if api == "oauth_verify_access" {
+					body = `({authenticated:true,principal:{id:shared()}});`
+				} else if api == "oauth_authorization_server_metadata" {
+					body = ""
+				}
+				loaded, router := newOAuthChecksFixture(t, api, check, check, body)
+				dir := t.TempDir()
+				first, second := filepath.Join(dir, "first.js"), filepath.Join(dir, "second.js")
+				writeSource := func(value string) {
+					writeHotReloadTestFile(t, first, fmt.Sprintf(`let count=0; const prefix=%q; // no trailing newline`, value))
+				}
+				writeSource("original")
+				writeHotReloadTestFile(t, second, `
+const value=prefix+"!";
+if(typeof nyanHostExec!=="undefined" || typeof nyanGetAPI!=="undefined" || typeof nyanCallMe!=="undefined") throw new Error("unrestricted include");
+if(typeof nyanOAuthRead!=="function" || !nyanAllParams.oauth_api) throw new Error("missing OAuth context");
+function shared(){ if(++count!==1) throw new Error("VM state reused"); return value; }`)
+				configPath := filepath.Join(dir, "config.json")
+				writeHotReloadTestFile(t, configPath, fmt.Sprintf(`{"javascript_include":["first.js","second.js"],"javascript_include_cache":%t}`, cached))
+				cfg, err := loadConfig(configPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := adjustConfigPaths(dir, &cfg); err != nil {
+					t.Fatal(err)
+				}
+				globalConfig = cfg
+				if err := globalConfig.prepareJavaScriptIncludes(t.TempDir()); err != nil {
+					t.Fatal(err)
+				}
+				assertRequest := func(want string, success bool) {
+					t.Helper()
+					server := loaded.Snapshot.MCPServers["custom-mcp"]
+					if api == "oauth_verify_access" {
+						_, authenticated, _ := validateMCPAccessToken(loaded.Snapshot, server, mcpRuntimeURLs{}, "Bearer test", "sample", nil)
+						if authenticated != success {
+							t.Fatalf("authenticated=%t want %t", authenticated, success)
+						}
+					} else {
+						rec := serveMCPPhase12Request(router, newMCPPhase12Request(http.MethodGet, "/"+api, ""))
+						status := http.StatusOK
+						if !success {
+							status = http.StatusInternalServerError
+						}
+						if rec.Code != status {
+							t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+						}
+						if success && api == "oauth_authorize" && rec.Body.String() != want+"!" {
+							t.Fatalf("body=%s want %s!", rec.Body.String(), want)
+						}
+					}
+				}
+				writeSource("changed") // Change before first execution to check startup caching.
+				want := "changed"
+				if cached {
+					want = "original"
+				}
+				assertRequest(want, true)
+				assertRequest(want, true)
+				order := "param,main,out,"
+				if body == "" {
+					order = "param,out,"
+				}
+				assertOAuthCheckOrder(t, loaded, order+order)
+				if err := os.Remove(first); err != nil {
+					t.Fatal(err)
+				}
+				assertRequest(want, cached)
+				writeSource("restarted")
+				if err := globalConfig.prepareJavaScriptIncludes(t.TempDir()); err != nil {
+					t.Fatal(err)
+				}
+				assertRequest("restarted", true)
+			})
+		}
+	}
+}
+
+func TestOAuthJavaScriptIncludeFailuresAndDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name, source, body string
+		bodyRuns           bool
+	}{
+		{"syntax", `const broken = ;`, `({status:200});`, false},
+		{"exception", `throw new Error("private include detail");`, `({status:200});`, false},
+		{"restricted function", `nyanHostExec("echo forbidden");`, `({status:200});`, false},
+		{"name collision", `const duplicate=1;`, `const duplicate=2;({status:200});`, false},
+		{"loop", `const end=Date.now()+2000;while(Date.now()<end){}`, `({status:200});`, false},
+		{"getter", `function response(){return {get value(){const end=Date.now()+2000;while(Date.now()<end){};return 1;}};}`, `response();`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			savedConfig := globalConfig
+			t.Cleanup(func() { globalConfig = savedConfig })
+			dir := t.TempDir()
+			include, script := filepath.Join(dir, "include.js"), filepath.Join(dir, "body.js")
+			writeHotReloadTestFile(t, include, tc.source)
+			writeHotReloadTestFile(t, script, `nyanAllParams.started();`+tc.body)
+			globalConfig = Config{JavaScriptInclude: []string{include}}
+			timeout := scriptTimeoutDuration(100 * time.Millisecond)
+			server := &MCPServerConfig{OAuthRuntime: &MCPOAuthRuntimeConfig{Timeout: &timeout}}
+			started := false
+			start := time.Now()
+			result, err := runOAuthHookJavaScript(nil, server, script, map[string]interface{}{"started": func() { started = true }})
+			if err == nil || result != nil || started != tc.bodyRuns || time.Since(start) > time.Second {
+				t.Fatalf("result=%v err=%v started=%t elapsed=%v", result, err, started, time.Since(start))
+			}
+			if strings.Contains(err.Error(), "private include detail") || strings.Contains(err.Error(), dir) {
+				t.Fatal("include error exposed internal details")
+			}
+			writeHotReloadTestFile(t, include, `function response(){return {status:200};}`)
+			writeHotReloadTestFile(t, script, `response();`)
+			if result, err := runOAuthHookJavaScript(nil, server, script, nil); err != nil || result == nil {
+				t.Fatalf("later execution failed: %v %v", result, err)
 			}
 		})
 	}
@@ -16218,6 +16594,315 @@ func TestMCPStdioContinuesAfterResultGetterException(t *testing.T) {
 				t.Fatal("getter failure details leaked")
 			}
 		})
+	}
+}
+
+func TestOAuthRuntimeTimeoutConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw string
+		want      time.Duration
+		invalid   bool
+	}{
+		{"omitted", "", 15 * time.Second, false}, {"null", "null", 15 * time.Second, false}, {"empty", "{}", 15 * time.Second, false},
+		{"null timeout", `{"timeout":null}`, 15 * time.Second, false}, {"zero", `{"timeout":0}`, 0, false}, {"zero duration", `{"timeout":"0s"}`, 0, false},
+		{"long", `{"timeout":"1m"}`, time.Minute, false}, {"decimal", `{"timeout":1.5}`, 1500 * time.Millisecond, false},
+		{"string seconds", `{"timeout":" 1.5 "}`, 1500 * time.Millisecond, false},
+		{"minimum", `{"timeout":0.000000001}`, time.Nanosecond, false}, {"maximum", `{"timeout":9223372036.854775807}`, time.Duration(1<<63 - 1), false},
+		{"overflow", `{"timeout":9223372036.854775808}`, 0, true}, {"negative", `{"timeout":-1}`, 0, true}, {"negative zero", `{"timeout":-0}`, 0, true},
+		{"fractional ns", `{"timeout":"0.1ns"}`, 0, true}, {"exponent", `{"timeout":1e3}`, 0, true}, {"exponent string", `{"timeout":"1e3"}`, 0, true},
+		{"empty string", `{"timeout":""}`, 0, true}, {"boolean", `{"timeout":false}`, 0, true}, {"array timeout", `{"timeout":[]}`, 0, true},
+		{"object timeout", `{"timeout":{}}`, 0, true}, {"array runtime", `[]`, 0, true}, {"unknown field", `{"timeuot":"1s"}`, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, definitions := newMCPPhase12Definitions(t)
+			if tc.raw != "" {
+				definitions["custom-mcp"].(map[string]interface{})["oauthRuntime"] = json.RawMessage(tc.raw)
+			}
+			loaded, err := loadMCPPhase12Config(dir, definitions)
+			if tc.invalid {
+				if err == nil {
+					t.Fatal("invalid timeout accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := loaded.Snapshot.MCPServers["custom-mcp"]
+			if got := server.oauthTimeout(); got != tc.want {
+				t.Fatalf("timeout=%v want %v", got, tc.want)
+			}
+			encoded, err := json.Marshal(server)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var roundTrip MCPServerConfig
+			if err = json.Unmarshal(encoded, &roundTrip); err != nil || roundTrip.oauthTimeout() != tc.want {
+				t.Fatalf("round trip: %s %v", encoded, err)
+			}
+		})
+	}
+	for _, kind := range []string{"api", "schedule", "ws_client", "public", "mcp without oauth"} {
+		t.Run(kind, func(t *testing.T) {
+			dir, definitions := newMCPPhase12Definitions(t)
+			if kind == "mcp without oauth" {
+				server := definitions["custom-mcp"].(map[string]interface{})
+				delete(server, "oauth")
+				server["oauthRuntime"] = map[string]interface{}{"timeout": "1s"}
+			} else {
+				definitions["wrong"] = map[string]interface{}{"type": kind, "oauthRuntime": map[string]interface{}{"timeout": "1s"}}
+			}
+			_, err := loadMCPPhase12Config(dir, definitions)
+			if err == nil || !strings.Contains(err.Error(), "oauthRuntime") {
+				t.Fatalf("misplaced setting accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestOAuthRuntimeTimeoutInheritance(t *testing.T) {
+	savedConfig := globalConfig
+	t.Cleanup(func() { globalConfig = savedConfig })
+	for _, tc := range []struct {
+		name, configJSON, apiJSON string
+		want                      time.Duration
+	}{
+		{"default", `{}`, "", 15 * time.Second},
+		{"null config", `{"oauthRuntime":null}`, "", 15 * time.Second},
+		{"empty config", `{"oauthRuntime":{}}`, "", 15 * time.Second},
+		{"null config timeout", `{"oauthRuntime":{"timeout":null}}`, "", 15 * time.Second},
+		{"inherit omitted", `{"oauthRuntime":{"timeout":"1m"}}`, "", time.Minute},
+		{"inherit null", `{"oauthRuntime":{"timeout":"1m"}}`, `null`, time.Minute},
+		{"inherit empty", `{"oauthRuntime":{"timeout":"1m"}}`, `{}`, time.Minute},
+		{"inherit null timeout", `{"oauthRuntime":{"timeout":"1m"}}`, `{"timeout":null}`, time.Minute},
+		{"override", `{"oauthRuntime":{"timeout":"1m"}}`, `{"timeout":"30s"}`, 30 * time.Second},
+		{"override unlimited", `{"oauthRuntime":{"timeout":"1m"}}`, `{"timeout":0}`, 0},
+		{"inherit unlimited", `{"oauthRuntime":{"timeout":0}}`, `{"timeout":null}`, 0},
+		{"limit unlimited config", `{"oauthRuntime":{"timeout":0}}`, `{"timeout":1.5}`, 1500 * time.Millisecond},
+		{"exact maximum", `{"oauthRuntime":{"timeout":9223372036.854775807}}`, "", time.Duration(1<<63 - 1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, definitions := newMCPPhase12Definitions(t)
+			path := filepath.Join(dir, "config.json")
+			writeHotReloadTestFile(t, path, tc.configJSON)
+			config, err := loadConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			globalConfig = config
+			if tc.apiJSON != "" {
+				definitions["custom-mcp"].(map[string]interface{})["oauthRuntime"] = json.RawMessage(tc.apiJSON)
+			}
+			loaded, err := loadMCPPhase12Config(dir, definitions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := loaded.Snapshot.MCPServers["custom-mcp"].oauthTimeout(); got != tc.want {
+				t.Fatalf("timeout=%v want %v", got, tc.want)
+			}
+		})
+	}
+	for _, raw := range []string{`-1`, `-0`, `1e3`, `9223372036.854775808`, `"0.1ns"`, `""`, `false`, `[]`, `{}`} {
+		t.Run("invalid config "+raw, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			writeHotReloadTestFile(t, path, `{"oauthRuntime":{"timeout":`+raw+`}}`)
+			if _, err := loadConfig(path); err == nil {
+				t.Fatal("invalid startup timeout accepted")
+			}
+		})
+	}
+}
+
+func TestOAuthRuntimeTimeoutInheritedExecution(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want int
+	}{
+		{"inherit", `{"timeout":null}`, http.StatusInternalServerError},
+		{"unlimited override", `{"timeout":0}`, http.StatusOK},
+		{"longer override", `{"timeout":"2s"}`, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loaded, router := newOAuthChecksFixture(t, "oauth_authorize", `({success:true,status:200});`, `({success:true,status:200});`,
+				`const end=Date.now()+200;while(Date.now()<end){};({status:200,body:"ok"});`)
+			timeout := scriptTimeoutDuration(50 * time.Millisecond)
+			globalConfig.MCPOAuthRuntime = MCPOAuthRuntimeConfig{Timeout: &timeout}
+			server := loaded.Snapshot.MCPServers["custom-mcp"]
+			if err := json.Unmarshal([]byte(tc.raw), &server.OAuthRuntime); err != nil {
+				t.Fatal(err)
+			}
+			rec := serveMCPPhase12Request(router, newMCPPhase12Request(http.MethodGet, "/oauth_authorize", ""))
+			if rec.Code != tc.want {
+				t.Fatalf("status=%d want %d body=%s", rec.Code, tc.want, rec.Body.String())
+			}
+			wantOrder := "param,main,out,"
+			if tc.want == http.StatusInternalServerError {
+				wantOrder = "param,main,"
+			}
+			assertOAuthCheckOrder(t, loaded, wantOrder)
+		})
+	}
+}
+
+func TestOAuthRuntimeTimeoutStages(t *testing.T) {
+	const allow = `({success:true,status:200});`
+	const normal = `({status:200,body:"ok"});`
+	for _, api := range []string{"oauth_authorize", "oauth_verify_access", "oauth_authorization_server_metadata"} {
+		for _, stage := range []string{"paramCheck", "script", "outCheck"} {
+			if api == "oauth_authorization_server_metadata" && stage == "script" {
+				continue
+			}
+			for _, getter := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/getter_%t", api, stage, getter), func(t *testing.T) {
+					param, out, body := allow, allow, normal
+					slow := `const end=Date.now()+2000;while(Date.now()<end){};({success:true,status:200});`
+					if getter {
+						slow = `({success:true,status:200,get result(){const end=Date.now()+2000;while(Date.now()<end){};return null;}});`
+					}
+					switch stage {
+					case "paramCheck":
+						param = slow
+					case "script":
+						body = slow
+					case "outCheck":
+						out = slow
+					}
+					if api == "oauth_verify_access" && stage != "script" {
+						body = `({authenticated:true,principal:{id:"test"}});`
+					}
+					loaded, router := newOAuthChecksFixture(t, api, param, out, body)
+					server := loaded.Snapshot.MCPServers["custom-mcp"]
+					timeout := scriptTimeoutDuration(100 * time.Millisecond)
+					if getter {
+						globalConfig.MCPOAuthRuntime = MCPOAuthRuntimeConfig{Timeout: &timeout}
+					} else {
+						server.OAuthRuntime = &MCPOAuthRuntimeConfig{Timeout: &timeout}
+					}
+					start := time.Now()
+					if api == "oauth_verify_access" {
+						_, authenticated, _ := validateMCPAccessToken(loaded.Snapshot, server, mcpRuntimeURLs{}, "Bearer test", "sample", nil)
+						if authenticated {
+							t.Fatal("timed-out verification authenticated")
+						}
+					} else {
+						req := newMCPPhase12Request(http.MethodGet, "/"+api, "")
+						rec := serveMCPPhase12Request(router, req)
+						if rec.Code != http.StatusInternalServerError {
+							t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+						}
+					}
+					if time.Since(start) > time.Second {
+						t.Fatalf("deadline not enforced: %v", time.Since(start))
+					}
+					want := "param,"
+					if stage == "script" {
+						want += "main,"
+					}
+					if stage == "outCheck" {
+						if api != "oauth_authorization_server_metadata" {
+							want += "main,"
+						}
+						want += "out,"
+					}
+					assertOAuthCheckOrder(t, loaded, want)
+				})
+			}
+		}
+	}
+	// Each stage gets a fresh deadline, rather than sharing one request deadline.
+	delay := `const end=Date.now()+100;while(Date.now()<end){};`
+	loaded, router := newOAuthChecksFixture(t, "oauth_authorize", delay+allow, delay+allow, delay+normal)
+	timeout := scriptTimeoutDuration(250 * time.Millisecond)
+	loaded.Snapshot.MCPServers["custom-mcp"].OAuthRuntime = &MCPOAuthRuntimeConfig{Timeout: &timeout}
+	rec := serveMCPPhase12Request(router, newMCPPhase12Request(http.MethodGet, "/oauth_authorize", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stages shared one deadline: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOAuthRuntimeTimeoutLongAndUnlimited(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "hook.js")
+	writeHotReloadTestFile(t, script, `nyanAllParams.wait();({authenticated:false});`)
+	results := make(chan error, 2)
+	for _, value := range []time.Duration{0, 30 * time.Second} {
+		go func(value time.Duration) {
+			duration := scriptTimeoutDuration(value)
+			server := &MCPServerConfig{OAuth: MCPOAuthConfig{StateDirectory: dir}, OAuthRuntime: &MCPOAuthRuntimeConfig{Timeout: &duration}}
+			// Goja's interrupt remains pending through the native wait, so this also
+			// catches an accidentally retained fixed 15-second timer without busy-looping.
+			result, err := runOAuthHookJavaScript(nil, server, script, map[string]interface{}{"wait": func() { time.Sleep(16 * time.Second) }})
+			if err != nil || result == nil {
+				results <- fmt.Errorf("timeout=%v result=%#v err=%v", value, result, err)
+			} else {
+				results <- nil
+			}
+		}(value)
+	}
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+func TestOAuthRuntimeTimeoutHotReload(t *testing.T) {
+	dir, definitions := newMCPPhase12Definitions(t)
+	definitions["custom-mcp"].(map[string]interface{})["oauthRuntime"] = map[string]interface{}{"timeout": "100ms"}
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishMCPPhase12Snapshot(t, loaded)
+	oldServer := loaded.Snapshot.MCPServers["custom-mcp"]
+	script := filepath.Join(dir, "oauth-hook.js")
+	writeHotReloadTestFile(t, script, `nyanAllParams.wait();const end=Date.now()+300;while(Date.now()<end){};({authenticated:false});`)
+	started, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := runOAuthHookJavaScript(loaded.Snapshot, oldServer, script, map[string]interface{}{"wait": func() { close(started); <-release }})
+		done <- err
+	}()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	waitForHotReloadSignal(t, started, "OAuth execution")
+	definitions["custom-mcp"].(map[string]interface{})["oauthRuntime"] = map[string]interface{}{"timeout": 0}
+	data, _ := json.Marshal(definitions)
+	path := filepath.Join(dir, "api.json")
+	writeHotReloadTestFile(t, path, string(data))
+	states, reloaded, err := reloadAPIConfigGraphIfChanged(path, dir, loaded.Snapshot.FileStates)
+	if err != nil || !reloaded {
+		t.Fatalf("reload=%t err=%v", reloaded, err)
+	}
+	next := currentAPISnapshot().MCPServers["custom-mcp"]
+	if next.oauthTimeout() != 0 || oldServer.oauthTimeout() != 100*time.Millisecond {
+		t.Fatal("reload mutated the active server config")
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("old deadline was changed")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("old execution did not finish")
+	}
+	result, err := runOAuthHookJavaScript(currentAPISnapshot(), next, script, map[string]interface{}{"wait": func() {}})
+	if err != nil || result == nil {
+		t.Fatalf("new unlimited setting failed: %#v %v", result, err)
+	}
+	definitions["custom-mcp"].(map[string]interface{})["oauthRuntime"] = map[string]interface{}{"timeout": -1}
+	data, _ = json.Marshal(definitions)
+	writeHotReloadTestFile(t, path, string(data))
+	_, reloaded, err = reloadAPIConfigGraphIfChanged(path, dir, states)
+	if err == nil || reloaded || currentAPISnapshot().MCPServers["custom-mcp"] != next {
+		t.Fatalf("invalid setting replaced snapshot: %t %v", reloaded, err)
 	}
 }
 

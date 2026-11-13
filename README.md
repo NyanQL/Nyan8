@@ -176,7 +176,7 @@ JavaScriptの `nyanGetFile` / `nyanReadFileB64` / `nyanSendMailAttachment` と `
 - `false` または省略時：実行ごとにファイルを読み込み、次回の実行から変更を反映します。
 - `true`：起動時に設定順で読み込み、連結したソース文字列をキャッシュします。読込に失敗すると起動を中止します。ファイルの変更を反映するにはプロセスの再起動が必要で、`api.json` のホットリロードではキャッシュを更新しません。
 
-キャッシュの対象は `javascript_include` のソース文字列です。共通JSは実行ごとに新しいVMで評価され、本体・`paramCheck`・`outCheck` のファイルは引き続き毎回読み込みます。HTTP、JSON-RPC、MCP、schedule、WebSocket、`nyanCallMe()`、Pushで共通の設定を使用します。OAuth専用の実行環境は従来どおり共通JSを読み込みません。
+キャッシュの対象は `javascript_include` のソース文字列です。共通JSは実行ごとに新しいVMで評価され、本体・`paramCheck`・`outCheck` のファイルは引き続き毎回読み込みます。HTTP、JSON-RPC、MCP、OAuth、schedule、WebSocket、`nyanCallMe()`、Pushで共通の設定を使用します。
 
 <details>
 <summary>ログ設定項目の説明</summary>
@@ -446,11 +446,20 @@ console.log(nyanAllParams.ws_message_text);
     "type": "cron",
     "value": "0 10 * * *"
   },
-  "description": "毎日10:00に実行"
+  "description": "毎日10:00に実行",
+  "runtime": {"timeout": "5m"}
 }
 ```
 
 `type: "schedule"` は指定時刻になると `script` の JavaScript を実行します。この定義は HTTP API、WebSocket 接続、JSON-RPC、MCP tools/list には公開されません。
+
+`runtime.timeout` は、このジョブの1回の実行期限です。上の例は5分です。`runtime` の省略・`null`、または `timeout` の省略・`null`・`0`・`"0"`・`"0s"` は期限なしで、既存ジョブの動作を維持します。`"500ms"`・`"30s"`・`"5m"` のような時間文字列のほか、単位なしの数値・数値文字列は秒として扱います（`1.5`・`"1.5"` は1.5秒）。負数・空文字列・真偽値・配列・オブジェクト・不明な単位・指数表記は設定エラーです。正の値は1ナノ秒以上、Goの `time.Duration` の上限（`"2562047h47m16.854775807s"`）まで指定できます。`runtime.timeout` はschedule専用で、他のtypeに非nullの値を指定すると設定エラーです。
+
+期限は共通JS・本体の読み込み、VMの準備、JavaScript実行、戻り値変換を含む経過時間です。`nyanCallMe()` で呼ぶAPIのチェック・本体・Pushにも同じ期限を引き継ぎ、呼出しごとに時間を延長しません。利用可能な関数は制限しません。期限切れは実行エラーとして記録し、今回の処理が終了すると次回の予定へ進みます。同じジョブは重複実行せず、実行中に過ぎた予定を後からまとめて実行することもありません。
+
+外部HTTP・ホストコマンド・ファイル操作・WebSocket送信など、Go側の同期処理は途中で中断できない場合があります。その場合は処理が戻るまで待つため、指定時間ちょうどに終了する保証ではありません。外部MCP呼出しにはジョブの期限も引き継ぎますが、既存の呼出し単位の期限が短ければそちらを優先します。既に完了したファイル更新・送信・外部APIの処理は取り消しません。
+
+APIホットリロードが有効なら期限の変更は次回のジョブ実行から適用し、実行中の期限は変更しません。不正な変更は採用せず、直前の有効な設定を維持します。HTTPの `httpTimeouts` や通常API全体の実行期限とは別の設定です。
 
 `trigger.type` は現在 `cron` のみ対応しています。cron は5フィールド形式です。
 
@@ -1477,9 +1486,36 @@ Go側はAuthorization Server MetadataとProtected Resource Metadata、OAuth endp
 
 以下は、MCPのOAuth設定から専用経路で呼び出されるJavaScriptの仕様です。参照先は通常APIと同じ `script` で指定しますが、OAuth用の入力・戻り値・実行環境を使用します。
 
-呼び出しごとに新しいJavaScript実行環境で対象のファイルを実行し、最後に評価したJavaScriptオブジェクトを戻り値として受け取ります。戻り値全体を `JSON.stringify()` で文字列にしないでください。JavaScript実行には15秒のタイムアウトを設定しています。
+呼び出しごとに新しいJavaScript実行環境で対象のファイルを実行し、最後に評価したJavaScriptオブジェクトを戻り値として受け取ります。戻り値全体を `JSON.stringify()` で文字列にしないでください。JavaScript実行には既定15秒のタイムアウトを設定し、MCP定義の `oauthRuntime.timeout` で変更できます。
 
-`paramCheck` / `outCheck` / `checkOnly` を適用します。チェックと本体はそれぞれ新しいOAuth専用のJavaScript実行環境で動作し、戻り値の変換中に動くgetterも含めて各実行に15秒のタイムアウトを設定します。`javascript_include` は読み込まれません。通常APIの `nyanGetFile`、`nyanCallMe`、`nyanHostExec`、`nyanSendMail` などや `console.log` は登録されません。利用できるのはJavaScriptの標準機能と、後述するOAuth用ヘルパーです。
+`paramCheck` / `outCheck` / `checkOnly` を適用します。チェックと本体はそれぞれ新しいOAuth専用のJavaScript実行環境で動作し、戻り値の変換中に動くgetterも含めて各実行に独立した期限を設定します。`javascript_include` の共通JavaScriptを各段階の先頭に設定順で結合して実行します。`javascript_include_cache` も通常APIと同じ設定を使用しますが、変数の状態は段階間・要求間で共有しません。
+
+共通JavaScriptにもOAuth用の関数制限と実行期限が適用されます。通常APIの `nyanGetFile`、`nyanCallMe`、`nyanHostExec`、`nyanSendMail` などや `console.log` は登録されません。利用できるのはJavaScriptの標準機能と、後述するOAuth用ヘルパーです。従来の共通JSを読み込まない動作から変わるため、共通ファイルのトップレベル処理もOAuthで実行される点に注意してください。利用できない関数の呼び出し・構文エラー・名前の重複などはOAuthの実行エラーになります。
+
+`api.json` のOAuthを使用する `type: "mcp"` 定義に、`oauth` と同じ階層で次の設定を追加できます。参照先の通常API定義には指定しません。全MCP定義に共通の既定値は、`config.json` のルートに同じ `oauthRuntime.timeout` を指定できます。
+
+```json
+"oauthRuntime": {
+  "timeout": "60s"
+}
+```
+
+| 指定 | 各OAuth段階の期限 |
+|---|---|
+| MCP定義で `oauthRuntime` の省略・`null`・`{}`、または `timeout` の省略・`null` | `config.json` の値を継承。そちらも省略・`null` なら15秒 |
+| `"60s"`・`"5m"`・`"500ms"` など | 指定した時間 |
+| 単位なしの数値・数値文字列（`1.5`・`"1.5"` など） | 秒として扱う |
+| `0`・`"0"`・`"0s"` | 実行期限なし。完了まで待つ |
+
+優先順位は、MCP定義の `oauthRuntime.timeout` → `config.json` の `oauthRuntime.timeout` → 既定15秒です。`null` は継承を意味し、明示的な `0` は継承せず期限なしにします。たとえば共通設定が `"60s"` でも、MCP定義で `0` を指定すればそのMCPだけ期限なしになります。
+
+負数・空文字列・真偽値・配列・オブジェクト・不明な単位・指数表記は設定エラーです。正の値の範囲は1ナノ秒からGoの `time.Duration` の上限（`"2562047h47m16.854775807s"`）までです。`api.json` の `oauthRuntime` はOAuthを設定したMCP定義だけに指定できます。
+
+期限は各 `paramCheck`・本体script・`outCheck` の準備開始から、共通JSと対象ファイルの読み込み・JavaScript実行・戻り値変換の完了までに適用します。メタデータAPIのチェックと `verifyAccess` も対象です。各段階に新しい期限を設けるため、HTTP要求全体の合計時間の上限ではありません。ログイン画面の入力待ち時間、トークンの有効期間、認証後のMCP Tool本体の期限も変更しません。
+
+期限を設定した場合、JavaScriptの長時間ループや戻り値getterを中断します。Go側の同期処理は途中で中断できない場合があり、その場合は処理が戻るまで待ちます。完了済みの状態ファイル更新などは取り消しません。期限切れは従来どおり実行エラーとして扱い、公開OAuthエンドポイントではHTTP 500、Tool実行前の `verifyAccess` では認証不成立になります。`0` を指定してもHTTPの `httpTimeouts` 等の別の期限は解除しません。
+
+APIホットリロードが有効なら、MCP定義の変更は再読み込み後に始まる要求から適用します。処理中の要求は開始時の設定を使い、不正な設定への変更は採用しません。ホットリロード無効時、または `config.json` の設定を変更した場合は再起動が必要です。
 
 同じスクリプトを複数のOAuth APIで使う場合は、`nyanAllParams.oauth_hook` で処理を分けます。
 

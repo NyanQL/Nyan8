@@ -264,25 +264,26 @@ func newConfiguredHTTPServer(address string, handler http.Handler, timeouts HTTP
 }
 
 type Config struct {
-	HTTPTimeouts           HTTPTimeoutsConfig  `json:"httpTimeouts"`
-	ReceiveLimits          ReceiveLimitsConfig `json:"receiveLimits"`
-	Name                   string              `json:"name"`
-	Profile                string              `json:"profile"`
-	Version                string              `json:"version"`
-	Port                   int                 `json:"Port"`
-	BindAddress            string              `json:"bindAddress"`
-	CertFile               string              `json:"certPath"`
-	KeyFile                string              `json:"keyPath"`
-	JavaScriptInclude      []string            `json:"javascript_include"`
-	JavaScriptIncludeCache bool                `json:"javascript_include_cache"`
-	Log                    LogConfig           `json:"log"`
-	SMTP                   SMTPConfig          `json:"smtp"`
-	OAuthAdmin             OAuthAdminConfig    `json:"oauth_admin"`
-	OAuthStateRoot         string              `json:"oauth_state_directory"`
-	APIHotReload           APIHotReloadConfig  `json:"APIHotReload"`
-	WebSocket              WebSocketConfig     `json:"websocket"`
-	ProxyProtocol          ProxyProtocolConfig `json:"proxyProtocol"`
-	MCPClient              *nyanMCPConfig      `json:"mcpClient,omitempty"`
+	HTTPTimeouts           HTTPTimeoutsConfig    `json:"httpTimeouts"`
+	ReceiveLimits          ReceiveLimitsConfig   `json:"receiveLimits"`
+	Name                   string                `json:"name"`
+	Profile                string                `json:"profile"`
+	Version                string                `json:"version"`
+	Port                   int                   `json:"Port"`
+	BindAddress            string                `json:"bindAddress"`
+	CertFile               string                `json:"certPath"`
+	KeyFile                string                `json:"keyPath"`
+	JavaScriptInclude      []string              `json:"javascript_include"`
+	JavaScriptIncludeCache bool                  `json:"javascript_include_cache"`
+	Log                    LogConfig             `json:"log"`
+	SMTP                   SMTPConfig            `json:"smtp"`
+	OAuthAdmin             OAuthAdminConfig      `json:"oauth_admin"`
+	OAuthStateRoot         string                `json:"oauth_state_directory"`
+	MCPOAuthRuntime        MCPOAuthRuntimeConfig `json:"oauthRuntime"`
+	APIHotReload           APIHotReloadConfig    `json:"APIHotReload"`
+	WebSocket              WebSocketConfig       `json:"websocket"`
+	ProxyProtocol          ProxyProtocolConfig   `json:"proxyProtocol"`
+	MCPClient              *nyanMCPConfig        `json:"mcpClient,omitempty"`
 
 	cachedJavaScriptIncludes *string
 }
@@ -1603,25 +1604,27 @@ func runJavaScriptWithSnapshot(snapshot *APIConfigSnapshot, scriptPath string, a
 	return runJavaScriptForAPI(snapshot, apiName, scriptPath, allParams, ginCtx)
 }
 
-func runJavaScriptForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (string, error) {
-	value, err := runJavaScriptValueForAPI(snapshot, apiName, scriptPath, allParams, ginCtx)
+func runJavaScriptForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (result string, err error) {
+	err = consumeJavaScriptForAPI(snapshot, apiName, scriptPath, allParams, ginCtx, func(value goja.Value) error {
+		exported, err := exportJavaScriptValue(value)
+		if err != nil {
+			return fmt.Errorf("export script result: %w", err)
+		}
+		if text, ok := exported.(string); ok {
+			result = text
+			return nil
+		}
+		encoded, err := json.Marshal(exported)
+		if err != nil {
+			return fmt.Errorf("encode script result: %w", err)
+		}
+		result = string(encoded)
+		return nil
+	})
 	if err != nil {
 		return "", err
 	}
-	// Preserve existing string responses and encode structured values without
-	// losing their contents to JavaScript's generic string conversion.
-	exported, err := exportJavaScriptValue(value)
-	if err != nil {
-		return "", fmt.Errorf("export script result: %w", err)
-	}
-	if text, ok := exported.(string); ok {
-		return text, nil
-	}
-	encoded, err := json.Marshal(exported)
-	if err != nil {
-		return "", fmt.Errorf("encode script result: %w", err)
-	}
-	return string(encoded), nil
+	return result, nil
 }
 
 // Export can execute getters after RunString has returned. Convert only Goja
@@ -1654,9 +1657,26 @@ func runJavaScriptValueWithSnapshot(snapshot *APIConfigSnapshot, scriptPath stri
 	return runJavaScriptValueForAPI(snapshot, apiName, scriptPath, allParams, ginCtx)
 }
 
-func runJavaScriptValueForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (goja.Value, error) {
+func runJavaScriptValueForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (result goja.Value, err error) {
+	err = consumeJavaScriptForAPI(snapshot, apiName, scriptPath, allParams, ginCtx, func(value goja.Value) error { result = value; return nil })
+	return result, err
+}
+
+// Keep the VM interruptible until the caller has exported the result, including getters.
+func consumeJavaScriptForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context, consume func(goja.Value) error) (runErr error) {
 	// 新たな goja の VM を生成
+	ctx := scheduleScriptContext(ginCtx)
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
 	vm := goja.New()
+	stop := interruptJavaScriptOnCancellation(ctx, vm)
+	defer func() {
+		stop()
+		if ctx != nil && ctx.Err() != nil {
+			runErr = ctx.Err()
+		}
+	}()
 	// 必要なグローバル関数等を登録する
 	setupGojaVMForAPI(vm, snapshot, apiName, ginCtx)
 	mcpContext := nyanMCPGinParent(ginCtx)
@@ -1666,42 +1686,48 @@ func runJavaScriptValueForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath s
 	// includeも起動時と同じ基準ディレクトリを使用する。
 	basePath, err := executableBaseDir()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get base path: %v", err)
+		return fmt.Errorf("failed to get base path: %v", err)
 	}
 
 	jsCode, err := globalConfig.javaScriptIncludes(basePath)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// メインスクリプトを読み込む
 	mainCode, err := ioutil.ReadFile(scriptPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read main script file %s: %v", scriptPath, err)
+		return fmt.Errorf("failed to read main script file %s: %v", scriptPath, err)
 	}
 	jsCode += string(mainCode)
 
 	// JSONとして解析し、__proto__も通常のデータキーとして保持する。
 	allParamsJSON, err := json.Marshal(allParams)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	paramsLiteral, err := json.Marshal(string(allParamsJSON))
 	if err != nil {
-		return nil, err
+		return err
 	}
 	_, err = vm.RunString("let nyanAllParams = JSON.parse(" + string(paramsLiteral) + ");")
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// 連結した JavaScript コードを実行
 	value, err := vm.RunString(jsCode)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return value, nil
+	if err := consume(value); err != nil {
+		return err
+	}
+	if ctx != nil {
+		return ctx.Err()
+	}
+	return nil
 }
 
 // callNyanAPIFromVM は、main.go 側から自身のAPI定義(js)を直接実行します。
@@ -2508,11 +2534,12 @@ func runParamCheckResponseForAPI(snapshot *APIConfigSnapshot, apiName string, ap
 	if err != nil {
 		return true, ParamCheckResponse{}, err
 	}
-	resultValue, err := runJavaScriptValueForAPI(snapshot, apiName, fullPath, allParams, ginCtx)
-	if err != nil {
-		return true, ParamCheckResponse{}, err
-	}
-	checkResponse, err := parseCheckResponse(resultValue, "paramCheck")
+	var checkResponse ParamCheckResponse
+	err = consumeJavaScriptForAPI(snapshot, apiName, fullPath, allParams, ginCtx, func(value goja.Value) error {
+		var parseErr error
+		checkResponse, parseErr = parseCheckResponse(value, "paramCheck")
+		return parseErr
+	})
 	if err != nil {
 		return true, ParamCheckResponse{}, err
 	}
@@ -2550,11 +2577,12 @@ func runOutCheckResponseForAPI(snapshot *APIConfigSnapshot, apiName string, apiM
 	if err != nil {
 		return true, ParamCheckResponse{}, err
 	}
-	resultValue, err := runJavaScriptValueForAPI(snapshot, apiName, fullPath, checkParams, ginCtx)
-	if err != nil {
-		return true, ParamCheckResponse{}, err
-	}
-	checkResponse, err := parseCheckResponse(resultValue, "outCheck")
+	var checkResponse ParamCheckResponse
+	err = consumeJavaScriptForAPI(snapshot, apiName, fullPath, checkParams, ginCtx, func(value goja.Value) error {
+		var parseErr error
+		checkResponse, parseErr = parseCheckResponse(value, "outCheck")
+		return parseErr
+	})
 	if err != nil {
 		return true, ParamCheckResponse{}, err
 	}
@@ -4251,28 +4279,39 @@ func mcpOAuthAPIForRole(mcp *MCPServerConfig, role string) string {
 	}
 }
 
-func runOAuthHookJavaScript(snapshot *APIConfigSnapshot, mcp *MCPServerConfig, scriptPath string, params map[string]interface{}) (interface{}, error) {
+func runOAuthHookJavaScript(snapshot *APIConfigSnapshot, mcp *MCPServerConfig, scriptPath string, params map[string]interface{}) (result interface{}, resultErr error) {
+	var ctx context.Context
+	if timeout := mcp.oauthTimeout(); timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		defer func() {
+			if ctx.Err() != nil {
+				result = nil
+				resultErr = fmt.Errorf("OAuth hook execution failed")
+			}
+		}()
+	}
+	basePath, err := executableBaseDir()
+	if err != nil {
+		return nil, fmt.Errorf("OAuth hook cannot be read")
+	}
+	includes, err := globalConfig.javaScriptIncludes(basePath)
+	if err != nil {
+		return nil, fmt.Errorf("OAuth hook cannot be read")
+	}
 	code, err := os.ReadFile(scriptPath)
 	if err != nil || len(code) > maxMCPRequestBytes {
 		return nil, fmt.Errorf("OAuth hook cannot be read")
 	}
 	vm := goja.New()
+	stop := interruptJavaScriptOnCancellation(ctx, vm)
+	defer stop()
 	setupOAuthGojaVM(vm, snapshot, mcp)
 	if err := vm.Set("nyanAllParams", params); err != nil {
 		return nil, fmt.Errorf("OAuth hook input could not be prepared")
 	}
-	finished := make(chan struct{})
-	defer close(finished)
-	timer := time.NewTimer(15 * time.Second)
-	defer timer.Stop()
-	go func() {
-		select {
-		case <-timer.C:
-			vm.Interrupt("OAuth hook timed out")
-		case <-finished:
-		}
-	}()
-	value, runErr := vm.RunString(string(code))
+	value, runErr := vm.RunString(includes + string(code))
 	if runErr != nil || value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
 		return nil, fmt.Errorf("OAuth hook execution failed")
 	}
@@ -4840,6 +4879,7 @@ type triggerConfig struct {
 }
 
 type scheduleJobConfig struct {
+	timeout     time.Duration
 	name        string
 	scriptPath  string
 	trigger     triggerConfig
@@ -6577,6 +6617,42 @@ type MCPOAuthConfig struct {
 	Scopes         []string `json:"-"`
 }
 
+// Explicit zero disables the deadline; a nil value preserves the default.
+type scriptTimeoutDuration time.Duration
+
+func (duration *scriptTimeoutDuration) UnmarshalJSON(data []byte) error {
+	var raw interface{}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&raw); err != nil {
+		return err
+	}
+	value, err := parseScriptTimeout(raw, "oauthRuntime.timeout")
+	if err != nil {
+		return err
+	}
+	*duration = scriptTimeoutDuration(value)
+	return nil
+}
+
+func (duration scriptTimeoutDuration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(duration).String())
+}
+
+type MCPOAuthRuntimeConfig struct {
+	Timeout *scriptTimeoutDuration `json:"timeout,omitempty"`
+}
+
+func (mcp *MCPServerConfig) oauthTimeout() time.Duration {
+	if mcp != nil && mcp.OAuthRuntime != nil && mcp.OAuthRuntime.Timeout != nil {
+		return time.Duration(*mcp.OAuthRuntime.Timeout)
+	}
+	if globalConfig.MCPOAuthRuntime.Timeout != nil {
+		return time.Duration(*globalConfig.MCPOAuthRuntime.Timeout)
+	}
+	return 15 * time.Second
+}
+
 type MCPToolConfig struct {
 	Name            string                   `json:"name"`
 	API             string                   `json:"api"`
@@ -6592,18 +6668,19 @@ type MCPToolConfig struct {
 // snapshot. Public paths come from API names and public URLs are derived from
 // each validated request; neither is duplicated in api.json.
 type MCPServerConfig struct {
-	Name                       string         `json:"-"`
-	SourcePath                 string         `json:"-"`
-	Type                       string         `json:"type"`
-	Transport                  string         `json:"transport"`
-	ProtocolVersions           []string       `json:"protocolVersions,omitempty"`
-	AllowedOrigins             []string       `json:"allowedOrigins"`
-	RedirectURIAllowedPrefixes []string       `json:"redirectURIAllowedPrefixes,omitempty"`
-	RateLimit                  *MCPRateLimit  `json:"rateLimit,omitempty"`
-	MaxConcurrent              int            `json:"maxConcurrent,omitempty"`
-	OAuth                      MCPOAuthConfig `json:"oauth,omitempty"`
-	ToolAPIs                   []string       `json:"tools"`
-	Instructions               string         `json:"instructions,omitempty"`
+	OAuthRuntime               *MCPOAuthRuntimeConfig `json:"oauthRuntime,omitempty"`
+	Name                       string                 `json:"-"`
+	SourcePath                 string                 `json:"-"`
+	Type                       string                 `json:"type"`
+	Transport                  string                 `json:"transport"`
+	ProtocolVersions           []string               `json:"protocolVersions,omitempty"`
+	AllowedOrigins             []string               `json:"allowedOrigins"`
+	RedirectURIAllowedPrefixes []string               `json:"redirectURIAllowedPrefixes,omitempty"`
+	RateLimit                  *MCPRateLimit          `json:"rateLimit,omitempty"`
+	MaxConcurrent              int                    `json:"maxConcurrent,omitempty"`
+	OAuth                      MCPOAuthConfig         `json:"oauth,omitempty"`
+	ToolAPIs                   []string               `json:"tools"`
+	Instructions               string                 `json:"instructions,omitempty"`
 
 	Path  string          `json:"-"`
 	Tools []MCPToolConfig `json:"-"`
@@ -6638,7 +6715,13 @@ func buildMCPServerConfigs(rootPath string, definitions map[string]interface{}, 
 	result := make(map[string]*MCPServerConfig)
 	for _, name := range sortedDefinitionNames(definitions) {
 		raw, ok := definitions[name].(map[string]interface{})
-		if !ok || getAPIType(raw) != apiTypeMCP {
+		if !ok {
+			continue
+		}
+		if getAPIType(raw) != apiTypeMCP {
+			if raw["oauthRuntime"] != nil {
+				return nil, fmt.Errorf("definition %q: oauthRuntime is only allowed for type:mcp", name)
+			}
 			continue
 		}
 		encoded, err := json.Marshal(raw)
@@ -6745,6 +6828,9 @@ func resolveAndValidateMCPConfig(mcp *MCPServerConfig, definitions map[string]in
 	}
 
 	oauthEnabled := mcpOAuthConfigured(mcp.OAuth)
+	if mcp.OAuthRuntime != nil && !oauthEnabled {
+		return fmt.Errorf("oauthRuntime requires oauth configuration")
+	}
 	if oauthEnabled && !httpEnabled {
 		return fmt.Errorf("oauth requires the streamable_http transport")
 	}
@@ -7473,6 +7559,22 @@ func decodeAPIDefinition(name string, rawDefinition json.RawMessage, sourceDir s
 	if err := json.Unmarshal(rawDefinition, &definition); err != nil {
 		return nil, fmt.Errorf("decode api JSON: definition %q: %w", name, err)
 	}
+	for _, field := range []string{"runtime", "oauthRuntime"} {
+		if _, exists := definition[field]; !exists {
+			continue
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(rawDefinition, &fields); err != nil {
+			return nil, err
+		}
+		var value interface{}
+		decoder := json.NewDecoder(bytes.NewReader(fields[field]))
+		decoder.UseNumber()
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		definition[field] = value
+	}
 	if sourceDir == "" {
 		return definition, nil
 	}
@@ -8190,11 +8292,108 @@ func (manager *backgroundRuntimeManager) runWSClient(name string, runtime *wsCli
 	manager.mu.Unlock()
 }
 
+// Only schedule definitions may opt into an execution deadline. Numeric values
+// retain their JSON spelling so exponent notation and overflow are not rounded.
+func parseScheduleTimeout(entry map[string]interface{}) (time.Duration, error) {
+	raw := entry["runtime"]
+	if raw == nil {
+		return 0, nil
+	}
+	settings, ok := raw.(map[string]interface{})
+	if !ok {
+		if getAPIType(entry) != apiTypeSchedule {
+			return 0, nil
+		}
+		return 0, errors.New("schedule runtime must be an object")
+	}
+	raw = settings["timeout"]
+	if raw == nil {
+		return 0, nil
+	}
+	if getAPIType(entry) != apiTypeSchedule {
+		return 0, errors.New("runtime.timeout is only allowed for type:schedule")
+	}
+	return parseScriptTimeout(raw, "runtime.timeout")
+}
+
+func parseScriptTimeout(raw interface{}, setting string) (time.Duration, error) {
+	var text string
+	switch value := raw.(type) {
+	case string:
+		text = strings.TrimSpace(value)
+	case json.Number:
+		text = value.String()
+	case float64:
+		text = strconv.FormatFloat(value, 'f', -1, 64)
+	default:
+		return 0, fmt.Errorf("%s requires seconds or a duration string", setting)
+	}
+	if text != "" && strings.Trim(text, "+-.0123456789") == "" {
+		text += "s"
+	}
+	duration, err := time.ParseDuration(text)
+	if err != nil || duration < 0 || strings.HasPrefix(text, "-") {
+		return 0, fmt.Errorf("%s requires non-negative seconds or a duration such as 5m or 0s (exponent notation is not supported)", setting)
+	}
+	if duration == 0 && strings.ContainsAny(text, "123456789") {
+		return 0, fmt.Errorf("%s must be zero or at least 1ns", setting)
+	}
+	return duration, nil
+}
+
+type scheduleScriptContextKey struct{}
+
+func scheduleScriptContext(ginCtx *gin.Context) context.Context {
+	ctx, _ := nyanMCPGinParent(ginCtx).Value(scheduleScriptContextKey{}).(context.Context)
+	return ctx
+}
+
+func interruptJavaScriptOnCancellation(ctx context.Context, vm *goja.Runtime) func() {
+	if ctx == nil {
+		return func() {}
+	}
+	if err := ctx.Err(); err != nil {
+		vm.Interrupt(err)
+		return vm.ClearInterrupt
+	}
+	finished, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-ctx.Done():
+			vm.Interrupt(ctx.Err())
+		case <-finished:
+		}
+	}()
+	return func() { close(finished); <-done; vm.ClearInterrupt() }
+}
+
+func runScheduleScriptWithSnapshot(snapshot *APIConfigSnapshot, job scheduleJobConfig, params map[string]interface{}, parent context.Context) (string, error) {
+	if job.timeout > 0 {
+		// Removing a job keeps the existing MCP cancellation behavior; it does
+		// not introduce a new cancellation rule for an already-running JS job.
+		ctx, cancel := context.WithTimeout(context.Background(), job.timeout)
+		defer cancel()
+		deadline, _ := ctx.Deadline()
+		mcpCtx, mcpCancel := context.WithDeadline(parent, deadline)
+		defer mcpCancel()
+		parent = context.WithValue(mcpCtx, scheduleScriptContextKey{}, ctx)
+	}
+	return runJavaScriptWithSnapshot(snapshot, job.scriptPath, params, nyanMCPGinWithContext(nil, parent))
+}
+
 func buildScheduleJobConfigs(files map[string]interface{}, execDir string) (map[string]scheduleJobConfig, error) {
 	configs := make(map[string]scheduleJobConfig)
 	for name, raw := range files {
 		entry, ok := raw.(map[string]interface{})
-		if !ok || getAPIType(entry) != apiTypeSchedule {
+		if !ok {
+			continue
+		}
+		timeout, err := parseScheduleTimeout(entry)
+		if err != nil {
+			return nil, fmt.Errorf("definition %q: %w", name, err)
+		}
+		if getAPIType(entry) != apiTypeSchedule {
 			continue
 		}
 		scriptPath := getAPIString(entry, "script")
@@ -8213,7 +8412,7 @@ func buildScheduleJobConfigs(files map[string]interface{}, execDir string) (map[
 		if err != nil {
 			return nil, fmt.Errorf("schedule %s: invalid script path %s: %w", name, scriptPath, err)
 		}
-		configs[name] = scheduleJobConfig{name: name, scriptPath: scriptAbs, trigger: trigger, description: getAPIString(entry, "description"), schedule: schedule}
+		configs[name] = scheduleJobConfig{name: name, scriptPath: scriptAbs, trigger: trigger, description: getAPIString(entry, "description"), schedule: schedule, timeout: timeout}
 	}
 	return configs, nil
 }
@@ -8256,7 +8455,7 @@ func sameScheduleTiming(a, b scheduleJobConfig) bool {
 }
 
 func sameScheduleJobConfig(a, b scheduleJobConfig) bool {
-	return sameScheduleTiming(a, b) && a.description == b.description
+	return sameScheduleTiming(a, b) && a.description == b.description && a.timeout == b.timeout
 }
 
 func signalRuntime(ch chan struct{}) {
@@ -8364,7 +8563,7 @@ func (runtime *scheduleRuntime) run() {
 			"nyan_schedule_description":  latest.description,
 		}
 		mcpContext, mcpDone := runtime.beginMCPExecution()
-		result, err := runJavaScriptWithSnapshot(snapshot, latest.scriptPath, allParams, nyanMCPGinWithContext(nil, mcpContext))
+		result, err := runScheduleScriptWithSnapshot(snapshot, latest, allParams, mcpContext)
 		mcpDone()
 		if err != nil {
 			logServiceError(slog.LevelError, "schedule_failed", err, "job", latest.name)
