@@ -5037,7 +5037,6 @@ func newMCPPhase12Definitions(t *testing.T) (string, map[string]interface{}) {
 		"oauth_authorize":                     map[string]interface{}{"script": "./oauth-hook.js"},
 		"oauth_token":                         map[string]interface{}{"script": "./oauth-hook.js"},
 		"oauth_register":                      map[string]interface{}{"script": "./oauth-hook.js"},
-		"oauth_admin_user":                    map[string]interface{}{"script": "./oauth-hook.js"},
 		"oauth_verify_access":                 map[string]interface{}{"script": "./oauth-hook.js", "scopes": []interface{}{"nyan8:read"}},
 		"custom-mcp": map[string]interface{}{
 			"type":                       "mcp",
@@ -5051,7 +5050,6 @@ func newMCPPhase12Definitions(t *testing.T) (string, map[string]interface{}) {
 				"authorize":                   "oauth_authorize",
 				"token":                       "oauth_token",
 				"register":                    "oauth_register",
-				"adminUser":                   "oauth_admin_user",
 				"verifyAccess":                "oauth_verify_access",
 			},
 			"tools":        []interface{}{"sample"},
@@ -6205,6 +6203,41 @@ func TestOAuthJavaScriptIncludeFailuresAndDeadline(t *testing.T) {
 	}
 }
 
+func TestOAuthAdministrationRemoved(t *testing.T) {
+	for _, value := range []interface{}{"oauth_admin_user", "", nil, map[string]interface{}{}} {
+		t.Run(fmt.Sprintf("adminUser=%v", value), func(t *testing.T) {
+			dir, definitions := newMCPPhase12Definitions(t)
+			definitions["custom-mcp"].(map[string]interface{})["oauth"].(map[string]interface{})["adminUser"] = value
+			if _, err := loadMCPPhase12Config(dir, definitions); err == nil || !strings.Contains(err.Error(), "adminUser") {
+				t.Fatalf("removed OAuth setting accepted: %v", err)
+			}
+		})
+	}
+	dir, definitions := newMCPPhase12Definitions(t)
+	loaded, err := loadMCPPhase12Config(dir, definitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
+	for _, path := range []string{"/oauth_admin_user", "/oauth/admin/users"} {
+		request := newMCPPhase12Request(http.MethodPost, path, `{}`)
+		request.SetBasicAuth("operator", "old-password")
+		if response := serveMCPPhase12Request(router, request); response.Code != http.StatusNotFound {
+			t.Fatalf("removed route %s returned %d", path, response.Code)
+		}
+	}
+	script := filepath.Join(dir, "removed-helper.js")
+	writeHotReloadTestFile(t, script, `({helper:typeof nyanOAuthAdminAuthorized});`)
+	result, err := runOAuthHookJavaScript(loaded.Snapshot, loaded.Snapshot.MCPServers["custom-mcp"], script, nil)
+	if err != nil || result.(map[string]interface{})["helper"] != "undefined" {
+		t.Fatalf("removed helper remains: %v %v", result, err)
+	}
+	writeHotReloadTestFile(t, script, `nyanOAuthAdminAuthorized("Basic ignored");`)
+	if _, err := runOAuthHookJavaScript(loaded.Snapshot, loaded.Snapshot.MCPServers["custom-mcp"], script, nil); err == nil {
+		t.Fatal("removed helper call succeeded")
+	}
+}
+
 func TestOAuthPhase3RuntimeExcludesGeneralNyanCapabilities(t *testing.T) {
 	dir := t.TempDir()
 	scriptPath := filepath.Join(dir, "runtime-check.js")
@@ -6275,7 +6308,7 @@ func TestOAuthPhase3UsesAPINameRoutesAndRequestOrigin(t *testing.T) {
 		t.Fatalf("query resource metadata = %#v", resourceBody)
 	}
 
-	for _, route := range []string{"/oauth_authorize", "/oauth_token", "/oauth_register", "/oauth_admin_user"} {
+	for _, route := range []string{"/oauth_authorize", "/oauth_token", "/oauth_register"} {
 		recorder = serveMCPPhase12Request(router, newMCPPhase12Request(http.MethodPut, route, ""))
 		if recorder.Code != http.StatusMethodNotAllowed {
 			t.Errorf("configured route %s status=%d, want 405; body=%q", route, recorder.Code, recorder.Body.String())
@@ -6416,7 +6449,6 @@ func TestOAuthChecksHTTPRoutes(t *testing.T) {
 		{"oauth_authorize", "GET", "", "", false},
 		{"oauth_token", "POST", "application/x-www-form-urlencoded", "code=test", false},
 		{"oauth_register", "POST", "application/json", `{}`, false},
-		{"oauth_admin_user", "POST", "application/json", `{}`, false},
 		{"oauth_authorization_server_metadata", "GET", "", "", true},
 		{"oauth_protected_resource_metadata", "GET", "", "", true},
 	} {
@@ -6740,58 +6772,6 @@ func TestOAuthPhase3RejectsUnsafeHookResponseHeaders(t *testing.T) {
 	}
 }
 
-func TestOAuthPhase3AdminBasicCredential(t *testing.T) {
-	dir, definitions := newMCPPhase12Definitions(t)
-	writeHotReloadTestFile(t, filepath.Join(dir, "oauth-hook.js"), `(function () {
-  var authorized = nyanOAuthAdminAuthorized(nyanAllParams.authorization);
-  return {
-    status: authorized ? 201 : 401,
-    contentType: "application/json",
-    headers: {"Cache-Control": "no-store"},
-    body: {authorized: authorized}
-  };
-})()`)
-	loaded, err := loadMCPPhase12Config(dir, definitions)
-	if err != nil {
-		t.Fatal(err)
-	}
-	router := publishMCPPhase12Snapshot(t, loaded)
-	globalConfig.OAuthAdmin = OAuthAdminConfig{Username: "operator", Password: "correct-password"}
-
-	tests := []struct {
-		name       string
-		username   string
-		password   string
-		withBasic  bool
-		wantStatus int
-		wantAuth   bool
-	}{
-		{name: "correct", username: "operator", password: "correct-password", withBasic: true, wantStatus: http.StatusCreated, wantAuth: true},
-		{name: "wrong username", username: "attacker", password: "correct-password", withBasic: true, wantStatus: http.StatusUnauthorized},
-		{name: "wrong password", username: "operator", password: "wrong-password", withBasic: true, wantStatus: http.StatusUnauthorized},
-		{name: "missing", wantStatus: http.StatusUnauthorized},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			request := newMCPPhase12Request(http.MethodPost, "/oauth_admin_user", `{}`)
-			if test.withBasic {
-				request.SetBasicAuth(test.username, test.password)
-			}
-			recorder := serveMCPPhase12Request(router, request)
-			if recorder.Code != test.wantStatus {
-				t.Fatalf("status=%d, want %d; body=%q", recorder.Code, test.wantStatus, recorder.Body.String())
-			}
-			var body map[string]interface{}
-			if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
-				t.Fatal(err)
-			}
-			if body["authorized"] != test.wantAuth {
-				t.Fatalf("authorized=%v, want %t", body["authorized"], test.wantAuth)
-			}
-		})
-	}
-}
-
 func testOAuthPhase3SymlinkRejection(t *testing.T, root string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -6904,29 +6884,38 @@ func oauthPhase3NestedFirstString(body map[string]interface{}, group, key string
 	return value
 }
 
+// Provision the policy fixture without a built-in user administration endpoint.
+func provisionOAuthPhase4User(t *testing.T, root, username, password string) {
+	t.Helper()
+	hash, err := argon2idHash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	usernameHash := sha256Base64URL(username)
+	record, err := json.Marshal(map[string]interface{}{
+		"version": 1, "kind": "user", "username": username, "usernameHash": usernameHash,
+		"passwordHash": hash, "disabled": false,
+		"createdAt": time.Now().UTC().Format(time.RFC3339), "updatedAt": time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := oauthWriteState(root, "users/"+usernameHash+".json", string(record)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOAuthPhase4EndToEndWithRealHooksAndTool(t *testing.T) {
 	router, stateDirectory := newOAuthPhase4Fixture(t)
 	const (
-		adminUsername = "phase4-operator"
-		adminPassword = "Phase4OperatorPassword123"
-		username      = "phase4.user"
-		password      = "Phase4UserPassword123"
-		redirectURI   = "https://chatgpt.com/connector/oauth/phase4"
-		resource      = "https://nyan8.stamps.necomori.asia/server_mcp_http"
+		username    = "phase4.user"
+		password    = "Phase4UserPassword123"
+		redirectURI = "https://chatgpt.com/connector/oauth/phase4"
+		resource    = "https://nyan8.stamps.necomori.asia/server_mcp_http"
 	)
-	globalConfig.OAuthAdmin = OAuthAdminConfig{Username: adminUsername, Password: adminPassword}
 
-	adminRequest := newOAuthPhase4Request(http.MethodPost, "/oauth_admin_user", fmt.Sprintf(`{"username":%q,"password":%q}`, username, password), "application/json")
-	adminRequest.SetBasicAuth(adminUsername, adminPassword)
-	adminResponse := serveMCPPhase12Request(router, adminRequest)
-	if adminResponse.Code != http.StatusCreated {
-		t.Fatalf("admin bootstrap status=%d, want %d; body=%q", adminResponse.Code, http.StatusCreated, adminResponse.Body.String())
-	}
-	adminBody := oauthPhase4JSONBody(t, adminResponse)
-	if adminBody["username"] != username || adminBody["created"] != true {
-		t.Fatalf("admin bootstrap body=%#v", adminBody)
-	}
-	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, adminPassword)
+	provisionOAuthPhase4User(t, stateDirectory, username, password)
+	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password)
 
 	registerBody := `{"redirect_uris":["https://chatgpt.com/connector/oauth/phase4"],"client_name":"Phase 4 integration client","token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"],"response_types":["code"],"scope":"nyan8:read"}`
 	registerResponse := serveMCPPhase12Request(router, newOAuthPhase4Request(http.MethodPost, "/oauth_register", registerBody, "application/json"))
@@ -6945,11 +6934,11 @@ func TestOAuthPhase4EndToEndWithRealHooksAndTool(t *testing.T) {
 	if len(grantTypes) != 2 || grantTypes[0] != "authorization_code" || grantTypes[1] != "refresh_token" {
 		t.Fatalf("DCR grant_types=%#v", registration["grant_types"])
 	}
-	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, adminPassword)
+	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password)
 
 	verifier := strings.Repeat("v", 64)
 	code, csrf := oauthPhase4Authorize(t, router, stateDirectory, clientID, redirectURI, resource, "phase4-state-one", verifier, username, password)
-	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, adminPassword, csrf, code)
+	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, csrf, code)
 
 	wrongVerifier := strings.Repeat("x", 64)
 	invalidPKCE := serveMCPPhase12Request(router, newOAuthPhase4TokenRequest(code, clientID, redirectURI, resource, wrongVerifier))
@@ -6959,7 +6948,7 @@ func TestOAuthPhase4EndToEndWithRealHooksAndTool(t *testing.T) {
 	if body := oauthPhase4JSONBody(t, invalidPKCE); body["error"] != "invalid_grant" {
 		t.Fatalf("invalid PKCE body=%#v", body)
 	}
-	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, adminPassword, csrf, code, wrongVerifier)
+	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, csrf, code, wrongVerifier)
 
 	tokenResponse := serveMCPPhase12Request(router, newOAuthPhase4TokenRequest(code, clientID, redirectURI, resource, verifier))
 	accessToken := oauthPhase4AccessToken(t, tokenResponse)
@@ -6968,7 +6957,7 @@ func TestOAuthPhase4EndToEndWithRealHooksAndTool(t *testing.T) {
 	if !strings.HasPrefix(refreshToken, "rt_") || len(refreshToken) != len("rt_")+43 {
 		t.Fatalf("authorization-code token response has invalid refresh_token: %#v", tokenBody)
 	}
-	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, adminPassword, csrf, code, accessToken, refreshToken)
+	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, csrf, code, accessToken, refreshToken)
 
 	reusedCode := serveMCPPhase12Request(router, newOAuthPhase4TokenRequest(code, clientID, redirectURI, resource, verifier))
 	if reusedCode.Code != http.StatusBadRequest {
@@ -6985,7 +6974,7 @@ func TestOAuthPhase4EndToEndWithRealHooksAndTool(t *testing.T) {
 	if !strings.HasPrefix(rotatedRefreshToken, "rt_") || rotatedRefreshToken == refreshToken {
 		t.Fatalf("refresh-token rotation response=%#v", refreshBody)
 	}
-	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, adminPassword, refreshToken, rotatedRefreshToken, accessToken)
+	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, refreshToken, rotatedRefreshToken, accessToken)
 
 	toolBody := `{"jsonrpc":"2.0","id":"phase4-tool","method":"tools/call","params":{"name":"mcp_sample","arguments":{}}}`
 	unauthenticatedRequest := newOAuthPhase4Request(http.MethodPost, "/server_mcp_http", toolBody, "application/json")
@@ -7042,7 +7031,7 @@ func TestOAuthPhase4EndToEndWithRealHooksAndTool(t *testing.T) {
 	parallelVerifier := strings.Repeat("p", 64)
 	parallelCode, parallelCSRF := oauthPhase4Authorize(t, router, stateDirectory, clientID, redirectURI, resource, "phase4-state-parallel", parallelVerifier, username, password)
 	parallelToken := oauthPhase4ConcurrentTokenExchange(t, router, parallelCode, clientID, redirectURI, resource, parallelVerifier)
-	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, adminPassword, csrf, code, accessToken, parallelCSRF, parallelCode, parallelToken, "phase4-raw-header-secret")
+	assertOAuthPhase4StateSecretsAbsent(t, stateDirectory, password, csrf, code, accessToken, parallelCSRF, parallelCode, parallelToken, "phase4-raw-header-secret")
 }
 
 func loadOAuthPhase4TestConfig(t *testing.T, stateDirectory string, serverScopes, toolScopes []string) *apiConfigLoadResult {
@@ -7090,7 +7079,6 @@ func loadOAuthPhase4TestConfig(t *testing.T, stateDirectory string, serverScopes
 		"oauth_authorize":                     map[string]interface{}{"script": "./oauth_policy_fixture.js"},
 		"oauth_token":                         map[string]interface{}{"script": "./oauth_policy_fixture.js"},
 		"oauth_register":                      map[string]interface{}{"script": "./oauth_policy_fixture.js"},
-		"oauth_admin_user":                    map[string]interface{}{"script": "./oauth_policy_fixture.js"},
 		"oauth_verify_access":                 map[string]interface{}{"script": "./oauth_policy_fixture.js", "scopes": serverScopes},
 		"server_mcp_http": map[string]interface{}{
 			"type":                       "mcp",
@@ -7106,7 +7094,6 @@ func loadOAuthPhase4TestConfig(t *testing.T, stateDirectory string, serverScopes
 				"authorize":                   "oauth_authorize",
 				"token":                       "oauth_token",
 				"register":                    "oauth_register",
-				"adminUser":                   "oauth_admin_user",
 				"verifyAccess":                "oauth_verify_access",
 			},
 			"tools":        []interface{}{"mcp_sample"},
@@ -7141,10 +7128,8 @@ func newOAuthPhase4Fixture(t *testing.T) (http.Handler, string) {
 		t.Fatalf("fixture MCP=%v", mcp)
 	}
 	stateDirectory = mcp.OAuth.StateDirectory
-	router := publishMCPPhase12Snapshot(t, loaded)
-
-	guardPath := filepath.Join(t.TempDir(), "phase4_tool_argument_guard.js")
-	writeHotReloadTestFile(t, guardPath, `(function () {
+	// Check Tool inputs only: OAuth hooks legitimately receive HTTP headers.
+	const toolArgumentGuard = `(function () {
   var serialized = JSON.stringify(nyanAllParams);
   var names = Object.keys(nyanAllParams);
   for (var index = 0; index < names.length; index += 1) {
@@ -7156,8 +7141,18 @@ func newOAuthPhase4Fixture(t *testing.T) (http.Handler, string) {
   if (serialized.indexOf("Bearer ") >= 0 || serialized.indexOf("phase4-raw-header-secret") >= 0) {
     throw new Error("raw HTTP header value reached the Tool backing API");
   }
-})();`)
-	globalConfig.JavaScriptInclude = []string{guardPath}
+})();
+`
+	tool := loaded.Snapshot.Definitions["mcp_sample"].(map[string]interface{})
+	for _, stage := range []string{"paramCheck", "script", "outCheck"} {
+		path := getAPIString(tool, stage)
+		source, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeHotReloadTestFile(t, path, toolArgumentGuard+string(source))
+	}
+	router := publishMCPPhase12Snapshot(t, loaded)
 	return router, stateDirectory
 }
 
@@ -7983,7 +7978,7 @@ func TestOAuthPhase4NegativeStateQuotaDuplicateJSONAndRatePolicy(t *testing.T) {
 
 	t.Run("endpoint rate policy", func(t *testing.T) {
 		mcp := &MCPServerConfig{}
-		want := map[string]int{"oauthAdminUser": 10, "oauthRegister": 10, "oauthAuthorize": 30, "oauthToken": 60}
+		want := map[string]int{"oauthRegister": 10, "oauthAuthorize": 30, "oauthToken": 60}
 		for hook, requests := range want {
 			limit := oauthRateLimitForHook(mcp, hook)
 			if limit.Requests != requests || limit.Window != "1m" {
@@ -8004,7 +7999,6 @@ func newOAuthPhase4NegativeFixture(t *testing.T, serverScopes, toolScopes []stri
 	stateDirectory := filepath.Join(t.TempDir(), "oauth-state")
 	loaded := loadOAuthPhase4TestConfig(t, stateDirectory, serverScopes, toolScopes)
 	router := publishMCPPhase12Snapshot(t, loaded)
-	globalConfig.OAuthAdmin = OAuthAdminConfig{Username: "phase4-negative-operator", Password: "Phase4NegativeOperator123"}
 	fixture := oauthPhase4NegativeFixture{
 		router:         router,
 		stateDirectory: stateDirectory,
@@ -8013,13 +8007,7 @@ func newOAuthPhase4NegativeFixture(t *testing.T, serverScopes, toolScopes []stri
 		redirectURI:    "https://chatgpt.com/connector/oauth/phase4",
 		resource:       "https://nyan8.stamps.necomori.asia/server_mcp_http",
 	}
-	adminBody := fmt.Sprintf(`{"username":%q,"password":%q}`, fixture.username, fixture.password)
-	adminRequest := newOAuthPhase4Request(http.MethodPost, "/oauth_admin_user", adminBody, "application/json")
-	adminRequest.SetBasicAuth(globalConfig.OAuthAdmin.Username, globalConfig.OAuthAdmin.Password)
-	adminResponse := serveMCPPhase12Request(router, adminRequest)
-	if adminResponse.Code != http.StatusCreated {
-		t.Fatalf("negative fixture admin status=%d body=%q", adminResponse.Code, adminResponse.Body.String())
-	}
+	provisionOAuthPhase4User(t, stateDirectory, fixture.username, fixture.password)
 	registerBody := fmt.Sprintf(`{"redirect_uris":[%q],"client_name":"Phase 4 negative client","token_endpoint_auth_method":"none","grant_types":["authorization_code"],"response_types":["code"],"scope":"nyan8:read"}`, fixture.redirectURI)
 	registerResponse := serveMCPPhase12Request(router, newOAuthPhase4Request(http.MethodPost, "/oauth_register", registerBody, "application/json"))
 	if registerResponse.Code != http.StatusCreated {

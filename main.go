@@ -277,7 +277,6 @@ type Config struct {
 	JavaScriptIncludeCache bool                  `json:"javascript_include_cache"`
 	Log                    LogConfig             `json:"log"`
 	SMTP                   SMTPConfig            `json:"smtp"`
-	OAuthAdmin             OAuthAdminConfig      `json:"oauth_admin"`
 	OAuthStateRoot         string                `json:"oauth_state_directory"`
 	MCPOAuthRuntime        MCPOAuthRuntimeConfig `json:"oauthRuntime"`
 	APIHotReload           APIHotReloadConfig    `json:"APIHotReload"`
@@ -303,14 +302,6 @@ type WebSocketConfig struct {
 type ProxyProtocolConfig struct {
 	Enabled      bool     `json:"enabled"`
 	TrustedCIDRs []string `json:"trustedCIDRs"`
-}
-
-// OAuthAdminConfig contains the operator credential used only by the OAuth
-// user bootstrap endpoint. Production values belong in the runtime config
-// rendered by Ansible, never in api.json or a release artifact.
-type OAuthAdminConfig struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
 }
 
 // LogConfig はログ設定データを表します。
@@ -2971,7 +2962,6 @@ func mcpOAuthRoleForAPI(mcp *MCPServerConfig, apiName string) (string, bool) {
 		{mcp.OAuth.Authorize, "oauthAuthorize"},
 		{mcp.OAuth.Token, "oauthToken"},
 		{mcp.OAuth.Register, "oauthRegister"},
-		{mcp.OAuth.AdminUser, "oauthAdminUser"},
 		{mcp.OAuth.VerifyAccess, "oauthValidateAccessToken"},
 	}
 	for _, candidate := range roles {
@@ -2998,7 +2988,6 @@ type mcpRuntimeURLs struct {
 	AuthorizationEndpoint       string
 	TokenEndpoint               string
 	RegistrationEndpoint        string
-	AdminUserEndpoint           string
 }
 
 func deriveMCPRuntimeURLs(request *http.Request, mcp *MCPServerConfig) (mcpRuntimeURLs, error) {
@@ -3062,7 +3051,6 @@ func deriveMCPRuntimeURLs(request *http.Request, mcp *MCPServerConfig) (mcpRunti
 		AuthorizationEndpoint:       apiURL(mcp.OAuth.Authorize),
 		TokenEndpoint:               apiURL(mcp.OAuth.Token),
 		RegistrationEndpoint:        apiURL(mcp.OAuth.Register),
-		AdminUserEndpoint:           apiURL(mcp.OAuth.AdminUser),
 	}, nil
 }
 
@@ -3994,7 +3982,7 @@ func oauthMethodAllowed(hook, method string) bool {
 		return method == http.MethodGet
 	case "oauthAuthorize":
 		return method == http.MethodGet || method == http.MethodPost
-	case "oauthAdminUser", "oauthRegister", "oauthToken":
+	case "oauthRegister", "oauthToken":
 		return method == http.MethodPost
 	default:
 		return false
@@ -4020,7 +4008,7 @@ func validateOAuthContentType(hook string, request *http.Request) error {
 		return err
 	}
 	switch hook {
-	case "oauthRegister", "oauthAdminUser":
+	case "oauthRegister":
 		if mediaType != "application/json" {
 			return fmt.Errorf("JSON is required")
 		}
@@ -4035,7 +4023,7 @@ func validateOAuthContentType(hook string, request *http.Request) error {
 func oauthRateLimitForHook(mcp *MCPServerConfig, hook string) *MCPRateLimit {
 	requests := 60
 	switch hook {
-	case "oauthAdminUser", "oauthRegister":
+	case "oauthRegister":
 		requests = 10
 	case "oauthAuthorize":
 		requests = 30
@@ -4049,8 +4037,6 @@ func oauthRateLimitForHook(mcp *MCPServerConfig, hook string) *MCPRateLimit {
 func oauthMaxConcurrentForHook(mcp *MCPServerConfig, hook string) int {
 	limit := mcpMaxConcurrent(mcp)
 	switch hook {
-	case "oauthAdminUser":
-		return min(limit, 1)
 	case "oauthAuthorize":
 		return min(limit, 2)
 	default:
@@ -4270,8 +4256,6 @@ func mcpOAuthAPIForRole(mcp *MCPServerConfig, role string) string {
 		return mcp.OAuth.Token
 	case "oauthRegister":
 		return mcp.OAuth.Register
-	case "oauthAdminUser":
-		return mcp.OAuth.AdminUser
 	case "oauthValidateAccessToken":
 		return mcp.OAuth.VerifyAccess
 	default:
@@ -4508,7 +4492,6 @@ func setupOAuthGojaVM(vm *goja.Runtime, _ *APIConfigSnapshot, mcp *MCPServerConf
 		return encoded
 	})
 	vm.Set("nyanArgon2idVerify", argon2idVerify)
-	vm.Set("nyanOAuthAdminAuthorized", oauthAdminAuthorized)
 	vm.Set("nyanBase64Decode", func(value string) string {
 		decoded, err := base64.StdEncoding.DecodeString(value)
 		if err != nil {
@@ -4559,27 +4542,6 @@ func argon2idHash(password string) (string, error) {
 func argon2idVerify(password, encoded string) bool {
 	valid, _ := verifyBoundedArgon2id(password, encoded)
 	return valid
-}
-
-func oauthAdminAuthorized(authorization string) bool {
-	if !strings.HasPrefix(authorization, "Basic ") {
-		return false
-	}
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(strings.TrimPrefix(authorization, "Basic ")))
-	if err != nil {
-		return false
-	}
-	username, password, found := strings.Cut(string(decoded), ":")
-	if !found || globalConfig.OAuthAdmin.Username == "" || globalConfig.OAuthAdmin.Password == "" {
-		return false
-	}
-	return constantTimeStringEqual(username, globalConfig.OAuthAdmin.Username) && constantTimeStringEqual(password, globalConfig.OAuthAdmin.Password)
-}
-
-func constantTimeStringEqual(left, right string) bool {
-	leftHash := sha256.Sum256([]byte(left))
-	rightHash := sha256.Sum256([]byte(right))
-	return subtle.ConstantTimeCompare(leftHash[:], rightHash[:]) == 1
 }
 
 func oauthReadState(root, key string) (string, error) {
@@ -6607,7 +6569,6 @@ type MCPOAuthConfig struct {
 	Authorize                   string `json:"authorize"`
 	Token                       string `json:"token"`
 	Register                    string `json:"register"`
-	AdminUser                   string `json:"adminUser,omitempty"`
 	VerifyAccess                string `json:"verifyAccess"`
 
 	// The state directory and supported scopes are derived while the complete
@@ -7002,7 +6963,7 @@ func isReservedNyanAPIName(apiName string) bool {
 }
 
 func mcpOAuthConfigured(config MCPOAuthConfig) bool {
-	return config.AuthorizationServerMetadata != "" || config.ProtectedResourceMetadata != "" || config.Authorize != "" || config.Token != "" || config.Register != "" || config.AdminUser != "" || config.VerifyAccess != ""
+	return config.AuthorizationServerMetadata != "" || config.ProtectedResourceMetadata != "" || config.Authorize != "" || config.Token != "" || config.Register != "" || config.VerifyAccess != ""
 }
 
 func resolveAndValidateMCPOAuthAPIs(mcp *MCPServerConfig, definitions map[string]interface{}) error {
@@ -7041,23 +7002,6 @@ func resolveAndValidateMCPOAuthAPIs(mcp *MCPServerConfig, definitions map[string
 			if info, err := os.Stat(getAPIString(entry, "script")); err != nil || !info.Mode().IsRegular() {
 				return fmt.Errorf("oauth.%s API %q must have a regular JavaScript file", label, apiName)
 			}
-		}
-	}
-	if mcp.OAuth.AdminUser != "" {
-		mcp.OAuth.AdminUser = strings.TrimSpace(mcp.OAuth.AdminUser)
-		apiName := mcp.OAuth.AdminUser
-		if _, err := canonicalAPIEndpointPath(apiName); err != nil {
-			return fmt.Errorf("oauth.adminUser: %w", err)
-		}
-		entry, ok := definitions[apiName].(map[string]interface{})
-		if !ok || getAPIType(entry) != apiTypeAPI {
-			return fmt.Errorf("oauth.adminUser references invalid API %q", apiName)
-		}
-		if info, err := os.Stat(getAPIString(entry, "script")); err != nil || !info.Mode().IsRegular() {
-			return fmt.Errorf("oauth.adminUser API %q must have a regular JavaScript file", apiName)
-		}
-		if previous, exists := seen[apiName]; exists {
-			return fmt.Errorf("oauth.adminUser and oauth.%s reference the same API %q", previous, apiName)
 		}
 	}
 	verifyDefinition, ok := definitions[mcp.OAuth.VerifyAccess].(map[string]interface{})
@@ -7153,9 +7097,6 @@ func mcpPublicOAuthAPINames(mcp *MCPServerConfig) []string {
 		mcp.OAuth.Authorize,
 		mcp.OAuth.Token,
 		mcp.OAuth.Register,
-	}
-	if mcp.OAuth.AdminUser != "" {
-		result = append(result, mcp.OAuth.AdminUser)
 	}
 	return result
 }

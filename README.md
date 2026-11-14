@@ -143,10 +143,6 @@ JavaScriptの `nyanGetFile` / `nyanReadFileB64` / `nyanSendMailAttachment` と `
     "enabled": false,               // PROXY protocol v2を使用する場合だけtrue
     "trustedCIDRs": []              // trueの場合に接続を許可するhost CIDR
   },
-  "oauth_admin": {
-    "username": "operator",        // OAuth利用者登録用の管理ユーザー
-    "password": "change-me"        // 実運用では安全な方法で管理する
-  },
   "log": {
     "Filename": "nyan.log",        // ログファイル
     "MaxSize": 10,                  // MB
@@ -1401,10 +1397,6 @@ Tool本体の例：
     "type": "api",
     "script": "./runtime/oauth_policy.js"
   },
-  "oauth/admin/users": {
-    "type": "api",
-    "script": "./runtime/oauth_policy.js"
-  },
   "oauth/verify_access": {
     "type": "api",
     "script": "./runtime/oauth_policy.js",
@@ -1435,7 +1427,6 @@ Tool本体の例：
       "authorize": "oauth/authorize",
       "token": "oauth/token",
       "register": "oauth/register",
-      "adminUser": "oauth/admin/users",
       "verifyAccess": "oauth/verify_access"
     },
     "tools": ["mcp_example"],
@@ -1524,14 +1515,13 @@ APIホットリロードが有効なら、MCP定義の変更は再読み込み�
 | `authorize` | `oauthAuthorize` | GET、またはフォームのPOST |
 | `token` | `oauthToken` | フォームのPOST |
 | `register` | `oauthRegister` | JSONのPOST |
-| `adminUser` | `oauthAdminUser` | JSONのPOST |
 | `verifyAccess` | `oauthValidateAccessToken` | MCP `tools/call` の実行前に内部呼び出し |
 
 フォームのPOSTには `Content-Type: application/x-www-form-urlencoded`、JSONのPOSTには `Content-Type: application/json` を指定します。OPTIONSにはGo側が応答し、チェックも本体も実行しません。`authorizationServerMetadata` と `protectedResourceMetadata` は、参照先APIの `paramCheck` → Goによるメタデータ生成 → `outCheck` の順で処理します。この2種類では参照先の `script` は実行しません。`oauth_hook` はそれぞれ設定キーと同じ値です。`verifyAccess` のURLへ直接HTTPリクエストすると `404` を返します。
 
 #### OAuthでのチェック
 
-`authorize`、`token`、`register`、`adminUser` は、参照先APIの `paramCheck` → 本体 `script` → `outCheck` → HTTP応答の順に実行します。チェックの通過条件は通常APIと同じ `success: true`（`status` は200〜599の整数）です。別名の `paramcheck` / `check` / `outcheck` も使用できます。チェックにも、本体と同じ `nyanAllParams` のOAuth情報・リクエスト情報とOAuth用ヘルパーを渡します。
+`authorize`、`token`、`register` は、参照先APIの `paramCheck` → 本体 `script` → `outCheck` → HTTP応答の順に実行します。チェックの通過条件は通常APIと同じ `success: true`（`status` は200〜599の整数）です。別名の `paramcheck` / `check` / `outcheck` も使用できます。チェックにも、本体と同じ `nyanAllParams` のOAuth情報・リクエスト情報とOAuth用ヘルパーを渡します。
 
 `paramCheck` が拒否した場合は本体・`outCheck` を実行しません。`outCheck` が拒否した場合は本体の本文・Cookie・リダイレクト先を送信しません。いずれも `{success, status, result}` のチェック結果をJSONで返し、HTTPステータスはチェック結果の `status` とします。チェックの実行失敗・形式不正は、詳細を含まないHTTP `500` を返します。チェック応答の本文も1 MiB以下に制限します。本体によるstate保存やトークン発行の副作用は、出力チェックで拒否しても取り消しません。
 
@@ -1568,7 +1558,7 @@ MCP Toolの `arguments.nyan_mode` は `verifyAccess` に引き継ぎません。
 
 `scopes`と`redirect_uri_allowed_prefixes`は、要求ごとに設定からコピーした配列です。hookやチェック内で要素を書き換えても、共有設定・次の要求・公開メタデータには反映されません。
 
-`authorize`、`token`、`register`、`adminUser` とメタデータ用のチェックには、次のHTTPリクエスト情報も入ります。
+`authorize`、`token`、`register` とメタデータ用のチェックには、次のHTTPリクエスト情報も入ります。
 
 | キー | 内容 |
 |---|---|
@@ -1588,7 +1578,7 @@ MCP Toolの `arguments.nyan_mode` は `verifyAccess` に引き継ぎません。
 
 #### HTTP hookの戻り値
 
-`authorize`、`token`、`register`、`adminUser` は、次の形式のJavaScriptオブジェクトを返します。次はHTTPエラー応答の形式例です。
+`authorize`、`token`、`register` は、次の形式のJavaScriptオブジェクトを返します。次はHTTPエラー応答の形式例です。
 
 ```javascript
 ({
@@ -1647,7 +1637,6 @@ MCP Toolの `arguments.nyan_mode` は `verifyAccess` に引き継ぎません。
 | `nyanSHA256Base64URL(value)` | 文字列のSHA-256を、パディングなしのBase64URL文字列で返す。引数省略時は `TypeError`。明示した空文字列は有効 |
 | `nyanArgon2idHash(password)` | 1〜4096バイトのpasswordからArgon2idハッシュ文字列を生成する |
 | `nyanArgon2idVerify(password, encoded)` | passwordと許可範囲内のArgon2idハッシュが一致するかを真偽値で返す。不一致や非対応の形式・パラメーターでは `false` |
-| `nyanOAuthAdminAuthorized(authorization)` | Authorizationヘッダー全体を受け取り、`config.json` の `oauth_admin` に対するBasic認証の結果を真偽値で返す |
 | `nyanBase64Decode(value)` | 標準Base64文字列をデコードする。不正な値なら空文字 |
 
 stateの `key` は保存先からの相対パスで、末尾を `.json` にします（例：`users/example.json`）。保存先の外へ出るパスやシンボリックリンクは利用できません。保存するJSON文字列は重複キーを含まない有効なJSONで、1 MiB以下にします。state操作の失敗は、上表で示した未存在の場合を除きJavaScript例外になります。
@@ -1709,19 +1698,11 @@ PHC文字列は `$argon2id$v=19$m=65536,t=3,p=2$ソルト$ハッシュ` の形�
 
 OAuth JavaScriptでは、提供される `nyanArgon2idHash` / `nyanArgon2idVerify` を使って利用者のpasswordを扱い、authorization code、access token、refresh token、CSRFなどのcredentialを平文のファイル名として保存しないよう実装してください。state directoryは公開ディレクトリやreleaseの置換対象とは分離し、Nyan8の実行ユーザーだけが読み書きできる権限にしてください。
 
-管理用OAuth JavaScriptは `nyanOAuthAdminAuthorized` を呼び出すことで、`config.json` の `oauth_admin` に対するBasic認証を検証できます。Go側が管理hookの実行前に自動認証するわけではありません。次は、この認証と利用者登録処理を実装したpolicyに対するリクエスト例です。
+Nyan8は組み込みのOAuth利用者管理・管理者認証を提供しません。利用者の登録・更新や管理者の認証方式は、アプリケーション側のJavaScriptなどで実装してください。OAuthの `register` はクライアント登録（DCR）であり、利用者登録ではありません。
 
-```bash
-curl --fail-with-body \
-  --user 'operator:ADMIN_PASSWORD' \
-  --header 'Content-Type: application/json' \
-  --data '{"username":"example-user","password":"CHANGE_TO_A_LONG_PASSWORD"}' \
-  https://mcp.example.com/oauth/admin/users
-```
+旧設定から移行する場合は、`config.json` の `oauth_admin`、MCP定義の `oauth.adminUser`、その参照先の管理API定義を削除してください。`oauth.adminUser` は空文字列・`null` でもAPI設定の読み込みエラーになります。`nyanOAuthAdminAuthorized()` も廃止しており、旧JavaScriptからの呼び出しは実行エラーになります。管理APIを独自に実装し直す場合は、アプリ側で認証・認可を設けてください。
 
-管理credentialとOAuth利用者credentialを`api.json`やGit管理下へ保存しないでください。
-
-通常の`go test ./...`は特定名のOAuth policy JavaScriptを必要としません。実際のOAuth policyを使うE2Eを実行する場合だけ、runtimeファイルを明示します。
+通常の`go test ./...`は特定名のOAuth policy JavaScriptを必要としません。実際のOAuth policyを使うE2Eを実行する場合だけ、runtimeファイルを明示します。E2Eではテスト用の利用者レコードを状態領域へ直接準備し、管理APIによる登録は行いません。
 
 ```bash
 NYAN8_OAUTH_HOOK_TEST_PATH=/path/to/oauth_policy.js go test ./...
@@ -1735,7 +1716,7 @@ ChatGPTでコネクターを作成するときは、`https://公開domain/MCPの
 https://mcp.example.com/mcp_server
 ```
 
-OAuth接続には、metadataに対応するDCR、Authorization Code + PKCE、利用者認証をOAuth JavaScriptに実装しておく必要があります。認可時に表示するログイン画面や、管理endpointで登録した利用者の検証も、このJavaScriptが担当します。
+OAuth接続には、metadataに対応するDCR、Authorization Code + PKCE、利用者認証をOAuth JavaScriptに実装しておく必要があります。認可時に表示するログイン画面や、アプリケーション側で登録した利用者の検証も、このJavaScriptが担当します。
 
 URL、scope、OAuth API参照が一致しない場合は接続できません。とくに次を確認してください。
 
