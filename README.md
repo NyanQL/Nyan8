@@ -41,7 +41,7 @@ javascriptを書くだけで 手軽にAPIサービスを作れます。
 
 ### ソースからのビルド
 
-[go.mod](go.mod)に記載されたGoバージョン（現時点では1.26.9）を用意し、リポジトリのルートで `go build -o Nyan8 .` を実行します。Windowsでは `go build -o Nyan8.exe .` です。配布バイナリを使う場合はGoのインストールは不要です。
+[go.mod](go.mod)に記載されたGoバージョン（現時点では1.27.4）を用意し、リポジトリのルートで `go build -o Nyan8 .` を実行します。Windowsでは `go build -o Nyan8.exe .` です。配布バイナリを使う場合はGoのインストールは不要です。
 
 <a id="quickstart"></a>
 ### 最小起動例：固定JSONを返す
@@ -94,6 +94,7 @@ HTTP 200で `{"status":200,"result":{"message":"Hello, Nyan8!"}}` が返りま�
 
 Nyan8 は起動時に `api.json` と `config.json` の読み込みパスを指定できます。
 指定がない場合は、従来どおり実行ファイルと同じディレクトリにある `api.json` / `config.json` を読み込みます。
+PATH経由で `Nyan8` を起動する場合も同じ基準です。`go run` / `go test` など、OSの一時ディレクトリにある実行ファイルではカレントディレクトリを使います。
 
 ```bash
 ./Nyan8
@@ -104,6 +105,7 @@ NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./Nyan8
 各 `api.json` 内の `script` / `path` / `paramCheck` / `outCheck` の相対パスは、その定義を書いた `api.json` が置かれているディレクトリから解決されます。
 JavaScriptの `nyanGetFile` / `nyanReadFileB64` / `nyanSendMailAttachment` と `nyanSendMail` の添付 `path` は、最上位の `api.json` のディレクトリを基準にします。多段include先のAPI、本体・`paramCheck`・`outCheck`、`nyanCallMe` の呼び出し先、Push先でも同じ基準です。実行中は、その実行が使う設定スナップショットの基準を維持します。絶対パスはそのまま使用できます。
 `config.json` 内の `certPath` / `keyPath` / `javascript_include` / `log.Filename` の相対パスは、`config.json` が置かれているディレクトリから解決されます。
+`certPath` / `keyPath` は `file:///path/to/cert.pem`（Windowsでは `file:///C:/path/to/cert.pem`）、`~/`、環境変数の展開にも対応します。不正なfile URLは起動エラーです。
 
 ---
 
@@ -125,21 +127,21 @@ JavaScriptの `nyanGetFile` / `nyanReadFileB64` / `nyanSendMailAttachment` と `
   "javascript_include": [           // 共通 JS をロード（任意複数可）
     "libs/common.js"
   ],
+  "javascript_include_cache": false, // trueで共通JSのソースを起動時にキャッシュ
+  "mcpClient": {
+    "connections": {}               // 外部MCP接続。空ならnyanCallMCPは無効
+  },
   "APIHotReload": {
     "Enabled": true,                // api.json の変更を動的反映
     "Interval": "1s"               // Go duration形式の確認間隔
   },
   "websocket": {
     "allowRoot": true,              // ルートのWebSocket upgradeを許可
-    "maxConnections": 128           // WebSocket接続数の上限（1〜4096）
+    "maxConnections": 128           // WebSocket接続数の上限（1〜4096、0は既定128）
   },
   "proxyProtocol": {
     "enabled": false,               // PROXY protocol v2を使用する場合だけtrue
     "trustedCIDRs": []              // trueの場合に接続を許可するhost CIDR
-  },
-  "oauth_admin": {
-    "username": "operator",        // OAuth利用者登録用の管理ユーザー
-    "password": "change-me"        // 実運用では安全な方法で管理する
   },
   "log": {
     "Filename": "nyan.log",        // ログファイル
@@ -162,6 +164,15 @@ JavaScriptの `nyanGetFile` / `nyanReadFileB64` / `nyanSendMailAttachment` と `
   }
 }
 ```
+
+`websocket.maxConnections` は1プロセス内で受け付けるWebSocket接続数の上限です。省略または `0` は既定の128接続として扱い、無制限や接続禁止にはなりません。明示する上限は1〜4096の整数で、負数・4096を超える値・小数・文字列・真偽値は設定エラーです。変更の反映にはサービスの再起動が必要です。
+
+`javascript_include_cache` は共通JavaScriptの読込方法を切り替えます。
+
+- `false` または省略時：実行ごとにファイルを読み込み、次回の実行から変更を反映します。
+- `true`：起動時に設定順で読み込み、連結したソース文字列をキャッシュします。読込に失敗すると起動を中止します。ファイルの変更を反映するにはプロセスの再起動が必要で、`api.json` のホットリロードではキャッシュを更新しません。
+
+キャッシュの対象は `javascript_include` のソース文字列です。共通JSは実行ごとに新しいVMで評価され、本体・`paramCheck`・`outCheck` のファイルは引き続き毎回読み込みます。HTTP、JSON-RPC、MCP、OAuth、schedule、WebSocket、`nyanCallMe()`、Pushで共通の設定を使用します。
 
 <details>
 <summary>ログ設定項目の説明</summary>
@@ -195,6 +206,10 @@ HTTPサーバーモードでは、ルートの `api.json` と、そこから `in
 起動時に登録したHTTPルートは再構築されません。そのURLを別のAPI名で再利用する変更などでは、設定のリロードが成功しても新しいAPIへ到達できない場合があり、再起動が必要です。たとえば、起動時の `x` を削除して `api/x` を追加すると、`/api/x` は旧API名 `x` を参照したままとなり、再起動するまで404を返します。
 
 不正なJSON、存在しないinclude先、不正なschedule／ws_client設定などは採用されず、直前の正常な定義で稼働を継続します。失敗した候補内で新しく見つかったinclude先も監視されるため、ファイルの作成や修正だけで自動的に再試行されます。同じファイル状態とエラーは繰り返しログ出力されません。
+
+読込中に設定ファイルが変わった場合も、直前の正常な定義を維持し、次の確認時に再読込します。ルートとinclude先は指定されたパスを監視するため、symlinkの参照先を差し替える更新にも対応します。同じファイルを複数のsymlinkで参照している場合も、それぞれの差し替えを検知します。
+
+同じinclude先を複数の名前でマウントする場合、読込途中で内容や参照先が変わった候補は採用しません。新旧の定義が混在した状態で公開せず、次の確認時に安定した設定を読み直します。
 
 通常APIは `/API名` と、API名が `api/` で始まらない場合の `/api/API名` に登録されます。`x` と `api/x` のように同じURLへ登録される通常APIの組み合わせは、include展開後の検証で設定エラーになります。初回起動では起動を中止し、ホットリロードでは直前の正常な定義を維持します。
 
@@ -427,11 +442,20 @@ console.log(nyanAllParams.ws_message_text);
     "type": "cron",
     "value": "0 10 * * *"
   },
-  "description": "毎日10:00に実行"
+  "description": "毎日10:00に実行",
+  "runtime": {"timeout": "5m"}
 }
 ```
 
 `type: "schedule"` は指定時刻になると `script` の JavaScript を実行します。この定義は HTTP API、WebSocket 接続、JSON-RPC、MCP tools/list には公開されません。
+
+`runtime.timeout` は、このジョブの1回の実行期限です。上の例は5分です。`runtime` の省略・`null`、または `timeout` の省略・`null`・`0`・`"0"`・`"0s"` は期限なしで、既存ジョブの動作を維持します。`"500ms"`・`"30s"`・`"5m"` のような時間文字列のほか、単位なしの数値・数値文字列は秒として扱います（`1.5`・`"1.5"` は1.5秒）。負数・空文字列・真偽値・配列・オブジェクト・不明な単位・指数表記は設定エラーです。正の値は1ナノ秒以上、Goの `time.Duration` の上限（`"2562047h47m16.854775807s"`）まで指定できます。`runtime.timeout` はschedule専用で、他のtypeに非nullの値を指定すると設定エラーです。
+
+期限は共通JS・本体の読み込み、VMの準備、JavaScript実行、戻り値変換を含む経過時間です。`nyanCallMe()` で呼ぶAPIのチェック・本体・Pushにも同じ期限を引き継ぎ、呼出しごとに時間を延長しません。利用可能な関数は制限しません。期限切れは実行エラーとして記録し、今回の処理が終了すると次回の予定へ進みます。同じジョブは重複実行せず、実行中に過ぎた予定を後からまとめて実行することもありません。
+
+外部HTTP・ホストコマンド・ファイル操作・WebSocket送信など、Go側の同期処理は途中で中断できない場合があります。その場合は処理が戻るまで待つため、指定時間ちょうどに終了する保証ではありません。外部MCP呼出しにはジョブの期限も引き継ぎますが、既存の呼出し単位の期限が短ければそちらを優先します。既に完了したファイル更新・送信・外部APIの処理は取り消しません。
+
+APIホットリロードが有効なら期限の変更は次回のジョブ実行から適用し、実行中の期限は変更しません。不正な変更は採用せず、直前の有効な設定を維持します。HTTPの `httpTimeouts` や通常API全体の実行期限とは別の設定です。
 
 `trigger.type` は現在 `cron` のみ対応しています。cron は5フィールド形式です。
 
@@ -440,6 +464,7 @@ console.log(nyanAllParams.ws_message_text);
 ```
 
 各フィールドでは `*`、数値、カンマ区切り、範囲、ステップ指定を使えます。
+日または曜日のフィールドが `*` で始まる場合は、日と曜日の両方に一致した日に実行します。`*/1` や `*/2` もこの規則に従い、`0 10 */1 * 1` は月曜10時だけに実行します。両フィールドが `*` で始まらない場合は、日または曜日のどちらかに一致した日に実行します。
 
 指定例:
 
@@ -463,7 +488,7 @@ schedule の `script` では通常の API と同じように `nyanAllParams`、`
 | `nyanAllParams.nyan_schedule_time` | 実行予定時刻 |
 | `nyanAllParams.nyan_schedule_description` | `api.json` に書いた説明 |
 
-schedule は HTTP リクエストから実行されないため、`nyanGetRemoteIP()`、`nyanGetUserAgent()`、`nyanGetRequestHeaders()` などリクエスト情報に依存する関数は空の値を返します。`javascript_include` に設定した共通 JavaScript は、schedule の `script` 実行時にも毎回読み込まれます。
+schedule は HTTP リクエストから実行されないため、`nyanGetRemoteIP()`、`nyanGetUserAgent()`、`nyanGetRequestHeaders()` などリクエスト情報に依存する関数は空の値を返します。`javascript_include` に設定した共通 JavaScript は、schedule の `script` 実行時にも評価されます。ファイルを毎回読み込むか、起動時のソースキャッシュを使うかは `javascript_include_cache` に従います。
 
 schedule 定義自体には `paramCheck` / `outCheck` / `push` は適用されません。`nyanCallMe()` で通常APIを呼び出す場合は、呼び出し先の `paramCheck` / `outCheck` が実行されます。呼び出し先APIに `push` があれば、そのAPIのチェックと本体が成功した後にPushも実行します。
 
@@ -650,6 +675,7 @@ HTTP・stdioともに、`tools/call` は入力の `inputSchema` 検証 → 参�
 接続情報は `nyanAllParams._headers`、`_remote_ip`、`_user_agent` で参照できます。接続前と各メッセージの処理で、これらをサーバーが実際の接続情報で上書きします。接続前の `paramCheck` ではクエリーパラメータに加え、`nyanGetCookie()`、`nyanGetRemoteIP()`、`nyanGetUserAgent()`、`nyanGetRequestHeaders()` も利用できます。接続前の `nyanAllParams.api` は接続先のAPI名になります。接続後も、メッセージごとのチェック・本体から同じ取得関数を利用できます。取得するのは接続時のHTTPリクエスト情報であり、接続後にブラウザーのCookieを変更しても既存接続には反映されません。接続時のクエリーパラメータは各メッセージに自動で引き継ぎません。
 
 接続時と受信メッセージでは、それぞれ処理開始時のAPI設定snapshotを使用します。`type: "ws_client"` 自身の受信スクリプトにはチェックを適用しません。
+接続時のHTTP本文・フォームは接続チェック後に解放し、multipartの一時ファイルも削除します。接続拒否時も削除します。接続後に利用するCookie・IP・User-Agent・ヘッダーは保持します。
 
 #### Push先APIのチェック
 
@@ -694,6 +720,8 @@ API本体の最終評価値は、文字列ならそのまま使用し、オブ�
 
 文字列は空文字列や空白も保持します。配列・数値・真偽値はJSON化し、`null` と `undefined` はどちらもJSONの `null` になります。循環参照、関数を含むオブジェクト、NaN・InfinityなどGoのJSONエンコードが扱えない値は実行エラーです。JavaScriptの `JSON.stringify()` と細部まで同じ変換という意味ではありません。
 
+戻り値のgetter内で発生したJavaScript例外も、その処理の実行エラーとして扱います。入力・出力チェックやMCP Toolの戻り値でも同様です。
+
 JSON化できても、各経路の応答形式の要件は変わりません。通常HTTPでは従来どおり `status` のあるオブジェクトが必要です。全経路でトップレベルの配列や `null` を受理するという変更ではありません。JSONのキー順・表記を制御する必要がある場合は、スクリプト側でJSON文字列を返してください。
 
 ## 4   Javascript 上で実行可能な関数と概要
@@ -719,6 +747,8 @@ JSON化できても、各経路の応答形式の要件は変わりません。�
 ### 4‑1 nyanAllParams
 GET/POST/JSON 受信パラメータをまとめたオブジェクトです。
 このオブジェクトから受信した情報をすべて取得することができます。
+
+JSONの`__proto__`も通常のデータキーとして保持します。入れ子のオブジェクトや配列内でも、その値がJavaScriptオブジェクトのプロトタイプとして扱われることはありません。
 
 通常HTTP API（`/API名`・`/?api=API名`）では、URLクエリとJSON・フォーム本文に同じ項目がある場合、本文の値を優先します。`nyan_mode` も同じ規則です。統合後の値を `paramCheck`・本体・`outCheck` に渡します。通常パスの `nyanAllParams.api` は呼び出し先API名に固定されます。JSON-RPCは `params` を入力として使用し、URLクエリを統合しません。
 
@@ -807,10 +837,22 @@ const response = nyanGetAPI(url); // 認証なし
 
 ### 4‑6 外部APIの呼び出し nyanJsonAPI / nyanCallAPI
 JSON を POST するリクエストができます。`nyanCallAPI()` は `nyanJsonAPI()` のラッパーで、引数と挙動は同じです。
-idとpassはBASIC認証用のIDとパスワードです。必要に応じて設定してください。
+第3・第4引数はBasic認証用のユーザー名とパスワードです。省略した認証引数は空文字列として扱います。`nyanJsonAPI(url, jsonText)` は認証なし、ユーザー名だけ指定した場合は空パスワードでBasic認証を付けて送信します。ユーザー名が空文字列なら、パスワードの指定にかかわらずBasic認証を自動付与しません。`nyanCallAPI` も同じ動作です。
+
+明示した `undefined`・`null` は省略とは区別し、従来どおり文字列 `"undefined"`・`"null"` に変換します。第5引数の追加ヘッダーは自動付与するヘッダーより優先され、`Authorization` や `Content-Type` も上書きできます。
 
 ```javascript
-// (1) ヘッダー無し – 必須 4 引数
+nyanJsonAPI(url, jsonText);                    // 認証なし
+nyanJsonAPI(url, jsonText, "alice");           // 空パスワードでBasic認証
+nyanCallAPI(url, jsonText, "", "", {
+  Authorization: "Bearer " + token
+});
+```
+
+以前は認証引数の省略が文字列 `"undefined"` になっていましたが、現在は空文字列として扱います。認証引数を省略していた呼び出しでは送信する認証情報が変わります。
+
+```javascript
+// (1) Basic認証を指定、追加ヘッダーなし
 let res = nyanJsonAPI(
   "https://example.com/api",
   JSON.stringify({ key: "value" }),
@@ -938,6 +980,7 @@ console.log("Request Headers:", headers);
 
 ### 4‑12 メール送信 nyanSendMail
 強力なメール送信機能を備えています。CC/BCC、添付ファイルもサポートしています。
+本文と添付のBase64はMIMEの規則に従い、76文字以内の行をCRLFで区切って送信します。復号後の本文・添付内容は変わりません。
 
 ```javascript
 let result = nyanSendMail({
@@ -968,6 +1011,8 @@ console.log(result);
 #### 戻り値
 成功時：`true`
 失敗時：JavaScript 側で例外（`Error` 相当）が投げられます。
+
+SMTPSでサーバーが`DATA`を拒否した場合も、`try/catch`で送信失敗を受け取れます。
 
 ### 4‑13 添付ヘルパー nyanSendMailAttachment
 ファイルパスを渡すと、`nyanSendMail` 用の添付オブジェクトを返します。
@@ -1190,6 +1235,8 @@ MCP Toolとして参照されるAPIは、設定スナップショットの作成
 
 本体JavaScriptは数値の `status` を含むJSON文字列を返してください。Nyan8はその値をHTTPステータスに使い、JSON本文を返します。`success` や `result` は自動追加されません。たとえば次のスクリプトはHTTP 200を返します。
 
+通常HTTPの `/API名`・`/?api=API名` では、`status:201.5` のように小数部分がある値は、切り捨てずHTTP 500の実行エラーにします。この場合、`outCheck` と自動Pushは実行しません。`201.0` のように値として整数である数値は受け付けます。`status` の省略・文字列・`null`、配列やテキストだけの応答は、従来どおりエラーです。本体が既に行った外部への処理を取り消すものではありません。
+
 ```javascript
 JSON.stringify({status: 200, success: true, result: []});
 ```
@@ -1350,10 +1397,6 @@ Tool本体の例：
     "type": "api",
     "script": "./runtime/oauth_policy.js"
   },
-  "oauth/admin/users": {
-    "type": "api",
-    "script": "./runtime/oauth_policy.js"
-  },
   "oauth/verify_access": {
     "type": "api",
     "script": "./runtime/oauth_policy.js",
@@ -1384,7 +1427,6 @@ Tool本体の例：
       "authorize": "oauth/authorize",
       "token": "oauth/token",
       "register": "oauth/register",
-      "adminUser": "oauth/admin/users",
       "verifyAccess": "oauth/verify_access"
     },
     "tools": ["mcp_example"],
@@ -1435,9 +1477,36 @@ Go側はAuthorization Server MetadataとProtected Resource Metadata、OAuth endp
 
 以下は、MCPのOAuth設定から専用経路で呼び出されるJavaScriptの仕様です。参照先は通常APIと同じ `script` で指定しますが、OAuth用の入力・戻り値・実行環境を使用します。
 
-呼び出しごとに新しいJavaScript実行環境で対象のファイルを実行し、最後に評価したJavaScriptオブジェクトを戻り値として受け取ります。戻り値全体を `JSON.stringify()` で文字列にしないでください。JavaScript実行には15秒のタイムアウトを設定しています。
+呼び出しごとに新しいJavaScript実行環境で対象のファイルを実行し、最後に評価したJavaScriptオブジェクトを戻り値として受け取ります。戻り値全体を `JSON.stringify()` で文字列にしないでください。JavaScript実行には既定15秒のタイムアウトを設定し、MCP定義の `oauthRuntime.timeout` で変更できます。
 
-`paramCheck` / `outCheck` / `checkOnly` を適用します。チェックと本体はそれぞれ新しいOAuth専用のJavaScript実行環境で動作し、各実行に15秒のタイムアウトを設定します。`javascript_include` は読み込まれません。通常APIの `nyanGetFile`、`nyanCallMe`、`nyanHostExec`、`nyanSendMail` などや `console.log` は登録されません。利用できるのはJavaScriptの標準機能と、後述するOAuth用ヘルパーです。
+`paramCheck` / `outCheck` / `checkOnly` を適用します。チェックと本体はそれぞれ新しいOAuth専用のJavaScript実行環境で動作し、戻り値の変換中に動くgetterも含めて各実行に独立した期限を設定します。`javascript_include` の共通JavaScriptを各段階の先頭に設定順で結合して実行します。`javascript_include_cache` も通常APIと同じ設定を使用しますが、変数の状態は段階間・要求間で共有しません。
+
+共通JavaScriptにもOAuth用の関数制限と実行期限が適用されます。通常APIの `nyanGetFile`、`nyanCallMe`、`nyanHostExec`、`nyanSendMail` などや `console.log` は登録されません。利用できるのはJavaScriptの標準機能と、後述するOAuth用ヘルパーです。従来の共通JSを読み込まない動作から変わるため、共通ファイルのトップレベル処理もOAuthで実行される点に注意してください。利用できない関数の呼び出し・構文エラー・名前の重複などはOAuthの実行エラーになります。
+
+`api.json` のOAuthを使用する `type: "mcp"` 定義に、`oauth` と同じ階層で次の設定を追加できます。参照先の通常API定義には指定しません。全MCP定義に共通の既定値は、`config.json` のルートに同じ `oauthRuntime.timeout` を指定できます。
+
+```json
+"oauthRuntime": {
+  "timeout": "60s"
+}
+```
+
+| 指定 | 各OAuth段階の期限 |
+|---|---|
+| MCP定義で `oauthRuntime` の省略・`null`・`{}`、または `timeout` の省略・`null` | `config.json` の値を継承。そちらも省略・`null` なら15秒 |
+| `"60s"`・`"5m"`・`"500ms"` など | 指定した時間 |
+| 単位なしの数値・数値文字列（`1.5`・`"1.5"` など） | 秒として扱う |
+| `0`・`"0"`・`"0s"` | 実行期限なし。完了まで待つ |
+
+優先順位は、MCP定義の `oauthRuntime.timeout` → `config.json` の `oauthRuntime.timeout` → 既定15秒です。`null` は継承を意味し、明示的な `0` は継承せず期限なしにします。たとえば共通設定が `"60s"` でも、MCP定義で `0` を指定すればそのMCPだけ期限なしになります。
+
+負数・空文字列・真偽値・配列・オブジェクト・不明な単位・指数表記は設定エラーです。正の値の範囲は1ナノ秒からGoの `time.Duration` の上限（`"2562047h47m16.854775807s"`）までです。`api.json` の `oauthRuntime` はOAuthを設定したMCP定義だけに指定できます。
+
+期限は各 `paramCheck`・本体script・`outCheck` の準備開始から、共通JSと対象ファイルの読み込み・JavaScript実行・戻り値変換の完了までに適用します。メタデータAPIのチェックと `verifyAccess` も対象です。各段階に新しい期限を設けるため、HTTP要求全体の合計時間の上限ではありません。ログイン画面の入力待ち時間、トークンの有効期間、認証後のMCP Tool本体の期限も変更しません。
+
+期限を設定した場合、JavaScriptの長時間ループや戻り値getterを中断します。Go側の同期処理は途中で中断できない場合があり、その場合は処理が戻るまで待ちます。完了済みの状態ファイル更新などは取り消しません。期限切れは従来どおり実行エラーとして扱い、公開OAuthエンドポイントではHTTP 500、Tool実行前の `verifyAccess` では認証不成立になります。`0` を指定してもHTTPの `httpTimeouts` 等の別の期限は解除しません。
+
+APIホットリロードが有効なら、MCP定義の変更は再読み込み後に始まる要求から適用します。処理中の要求は開始時の設定を使い、不正な設定への変更は採用しません。ホットリロード無効時、または `config.json` の設定を変更した場合は再起動が必要です。
 
 同じスクリプトを複数のOAuth APIで使う場合は、`nyanAllParams.oauth_hook` で処理を分けます。
 
@@ -1446,14 +1515,13 @@ Go側はAuthorization Server MetadataとProtected Resource Metadata、OAuth endp
 | `authorize` | `oauthAuthorize` | GET、またはフォームのPOST |
 | `token` | `oauthToken` | フォームのPOST |
 | `register` | `oauthRegister` | JSONのPOST |
-| `adminUser` | `oauthAdminUser` | JSONのPOST |
 | `verifyAccess` | `oauthValidateAccessToken` | MCP `tools/call` の実行前に内部呼び出し |
 
 フォームのPOSTには `Content-Type: application/x-www-form-urlencoded`、JSONのPOSTには `Content-Type: application/json` を指定します。OPTIONSにはGo側が応答し、チェックも本体も実行しません。`authorizationServerMetadata` と `protectedResourceMetadata` は、参照先APIの `paramCheck` → Goによるメタデータ生成 → `outCheck` の順で処理します。この2種類では参照先の `script` は実行しません。`oauth_hook` はそれぞれ設定キーと同じ値です。`verifyAccess` のURLへ直接HTTPリクエストすると `404` を返します。
 
 #### OAuthでのチェック
 
-`authorize`、`token`、`register`、`adminUser` は、参照先APIの `paramCheck` → 本体 `script` → `outCheck` → HTTP応答の順に実行します。チェックの通過条件は通常APIと同じ `success: true`（`status` は200〜599の整数）です。別名の `paramcheck` / `check` / `outcheck` も使用できます。チェックにも、本体と同じ `nyanAllParams` のOAuth情報・リクエスト情報とOAuth用ヘルパーを渡します。
+`authorize`、`token`、`register` は、参照先APIの `paramCheck` → 本体 `script` → `outCheck` → HTTP応答の順に実行します。チェックの通過条件は通常APIと同じ `success: true`（`status` は200〜599の整数）です。別名の `paramcheck` / `check` / `outcheck` も使用できます。チェックにも、本体と同じ `nyanAllParams` のOAuth情報・リクエスト情報とOAuth用ヘルパーを渡します。
 
 `paramCheck` が拒否した場合は本体・`outCheck` を実行しません。`outCheck` が拒否した場合は本体の本文・Cookie・リダイレクト先を送信しません。いずれも `{success, status, result}` のチェック結果をJSONで返し、HTTPステータスはチェック結果の `status` とします。チェックの実行失敗・形式不正は、詳細を含まないHTTP `500` を返します。チェック応答の本文も1 MiB以下に制限します。本体によるstate保存やトークン発行の副作用は、出力チェックで拒否しても取り消しません。
 
@@ -1488,7 +1556,9 @@ MCP Toolの `arguments.nyan_mode` は `verifyAccess` に引き継ぎません。
 | `redirect_uri_allowed_prefixes` | MCP定義の `redirectURIAllowedPrefixes` |
 | `state_directory` | 解決済みのOAuth state保存先 |
 
-`authorize`、`token`、`register`、`adminUser` とメタデータ用のチェックには、次のHTTPリクエスト情報も入ります。
+`scopes`と`redirect_uri_allowed_prefixes`は、要求ごとに設定からコピーした配列です。hookやチェック内で要素を書き換えても、共有設定・次の要求・公開メタデータには反映されません。
+
+`authorize`、`token`、`register` とメタデータ用のチェックには、次のHTTPリクエスト情報も入ります。
 
 | キー | 内容 |
 |---|---|
@@ -1508,7 +1578,7 @@ MCP Toolの `arguments.nyan_mode` は `verifyAccess` に引き継ぎません。
 
 #### HTTP hookの戻り値
 
-`authorize`、`token`、`register`、`adminUser` は、次の形式のJavaScriptオブジェクトを返します。次はHTTPエラー応答の形式例です。
+`authorize`、`token`、`register` は、次の形式のJavaScriptオブジェクトを返します。次はHTTPエラー応答の形式例です。
 
 ```javascript
 ({
@@ -1567,7 +1637,6 @@ MCP Toolの `arguments.nyan_mode` は `verifyAccess` に引き継ぎません。
 | `nyanSHA256Base64URL(value)` | 文字列のSHA-256を、パディングなしのBase64URL文字列で返す。引数省略時は `TypeError`。明示した空文字列は有効 |
 | `nyanArgon2idHash(password)` | 1〜4096バイトのpasswordからArgon2idハッシュ文字列を生成する |
 | `nyanArgon2idVerify(password, encoded)` | passwordと許可範囲内のArgon2idハッシュが一致するかを真偽値で返す。不一致や非対応の形式・パラメーターでは `false` |
-| `nyanOAuthAdminAuthorized(authorization)` | Authorizationヘッダー全体を受け取り、`config.json` の `oauth_admin` に対するBasic認証の結果を真偽値で返す |
 | `nyanBase64Decode(value)` | 標準Base64文字列をデコードする。不正な値なら空文字 |
 
 stateの `key` は保存先からの相対パスで、末尾を `.json` にします（例：`users/example.json`）。保存先の外へ出るパスやシンボリックリンクは利用できません。保存するJSON文字列は重複キーを含まない有効なJSONで、1 MiB以下にします。state操作の失敗は、上表で示した未存在の場合を除きJavaScript例外になります。
@@ -1629,19 +1698,11 @@ PHC文字列は `$argon2id$v=19$m=65536,t=3,p=2$ソルト$ハッシュ` の形�
 
 OAuth JavaScriptでは、提供される `nyanArgon2idHash` / `nyanArgon2idVerify` を使って利用者のpasswordを扱い、authorization code、access token、refresh token、CSRFなどのcredentialを平文のファイル名として保存しないよう実装してください。state directoryは公開ディレクトリやreleaseの置換対象とは分離し、Nyan8の実行ユーザーだけが読み書きできる権限にしてください。
 
-管理用OAuth JavaScriptは `nyanOAuthAdminAuthorized` を呼び出すことで、`config.json` の `oauth_admin` に対するBasic認証を検証できます。Go側が管理hookの実行前に自動認証するわけではありません。次は、この認証と利用者登録処理を実装したpolicyに対するリクエスト例です。
+Nyan8は組み込みのOAuth利用者管理・管理者認証を提供しません。利用者の登録・更新や管理者の認証方式は、アプリケーション側のJavaScriptなどで実装してください。OAuthの `register` はクライアント登録（DCR）であり、利用者登録ではありません。
 
-```bash
-curl --fail-with-body \
-  --user 'operator:ADMIN_PASSWORD' \
-  --header 'Content-Type: application/json' \
-  --data '{"username":"example-user","password":"CHANGE_TO_A_LONG_PASSWORD"}' \
-  https://mcp.example.com/oauth/admin/users
-```
+旧設定から移行する場合は、`config.json` の `oauth_admin`、MCP定義の `oauth.adminUser`、その参照先の管理API定義を削除してください。`oauth.adminUser` は空文字列・`null` でもAPI設定の読み込みエラーになります。`nyanOAuthAdminAuthorized()` も廃止しており、旧JavaScriptからの呼び出しは実行エラーになります。管理APIを独自に実装し直す場合は、アプリ側で認証・認可を設けてください。
 
-管理credentialとOAuth利用者credentialを`api.json`やGit管理下へ保存しないでください。
-
-通常の`go test ./...`は特定名のOAuth policy JavaScriptを必要としません。実際のOAuth policyを使うE2Eを実行する場合だけ、runtimeファイルを明示します。
+通常の`go test ./...`は特定名のOAuth policy JavaScriptを必要としません。実際のOAuth policyを使うE2Eを実行する場合だけ、runtimeファイルを明示します。E2Eではテスト用の利用者レコードを状態領域へ直接準備し、管理APIによる登録は行いません。
 
 ```bash
 NYAN8_OAUTH_HOOK_TEST_PATH=/path/to/oauth_policy.js go test ./...
@@ -1655,7 +1716,7 @@ ChatGPTでコネクターを作成するときは、`https://公開domain/MCPの
 https://mcp.example.com/mcp_server
 ```
 
-OAuth接続には、metadataに対応するDCR、Authorization Code + PKCE、利用者認証をOAuth JavaScriptに実装しておく必要があります。認可時に表示するログイン画面や、管理endpointで登録した利用者の検証も、このJavaScriptが担当します。
+OAuth接続には、metadataに対応するDCR、Authorization Code + PKCE、利用者認証をOAuth JavaScriptに実装しておく必要があります。認可時に表示するログイン画面や、アプリケーション側で登録した利用者の検証も、このJavaScriptが担当します。
 
 URL、scope、OAuth API参照が一致しない場合は接続できません。とくに次を確認してください。
 
@@ -1785,7 +1846,7 @@ MCP clientの一般的な設定は次の形です。
 stdioモードでは次の規則が適用されます。
 
 - HTTP/HTTPS listener、OAuth endpoint、schedule、WebSocket client、API hot reloadを開始しません。
-- API snapshot、Tool allowlist、JSON Schemaは起動時に作成したものを利用します。本体・`paramCheck`・`outCheck` のJavaScriptと共通の `javascript_include` ファイルは、それぞれの実行時に読み込みます。
+- API snapshot、Tool allowlist、JSON Schemaは起動時に作成したものを利用します。本体・`paramCheck`・`outCheck` のJavaScriptは実行時に読み込みます。共通の `javascript_include` は `javascript_include_cache` が `true` なら起動時のソースキャッシュを使い、`false` または省略時は毎回ファイルを読み込みます。
 - OAuth tokenは要求せず、子プロセスを起動できるOS userをsecurity boundaryとします。
 - Tool JavaScriptの`nyanAllParams.mcp_principal.transport`は`"stdio"`です。
 - HTTP用の`securitySchemes`はstdioの`tools/list`へ出力しません。
@@ -1794,6 +1855,139 @@ stdioモードでは次の規則が適用されます。
 - `allowedOrigins`、OAuth API参照、公開domainはstdio専用定義では不要です。
 
 
+## 外部MCPクライアント: nyanCallMCP
+
+設定済みの外部MCPツールをサーバー側JavaScriptから呼び出せます。接続先・許可スクリプト・ツール・サイズ上限などは、`config.json`の`mcpClient.connections`に接続ごとに記述します。同梱設定は接続が空で、既定は無効です。例えば結果サイズの上限は`mcpClient.connections.<接続ID>.maxResultBytes`に整数バイト数で指定します（既定8 MiB、256〜8,388,608バイト）。設定変更の反映には再起動が必要です。
+
+サーバー側Gojaから、管理者が登録した接続ID・ツールを同期呼出しします。機能は既定で無効です。`nyanCallMe` と既存のMCP **server** 機能は変更しません。
+
+```javascript
+const result = nyanCallMCP({
+  connection: "inventory-read",
+  tool: "lookup_stock",
+  arguments: { sku: "CAT-001" },
+  options: { timeoutMs: 3000 }
+});
+if (result.resultType === "input_required") {
+  throw new Error("追加入力が必要です。自動継続しません。");
+}
+if (result.isError === true) {
+  // ツール自身の失敗。外部処理の取消しを意味しません。
+  throw new Error("参照処理を完了できませんでした。");
+}
+if (!Object.prototype.hasOwnProperty.call(result, "structuredContent")) {
+  throw new Error("構造化結果がありません。");
+}
+// false / 0 / null / 空文字列も存在する値として扱います。
+const data = result.structuredContent;
+```
+
+### 契約
+
+- 引数は1つのオブジェクト。`connection` と `tool` は必須の文字列です。URL・コマンド・ヘッダー・資格情報をJSから指定できません。
+- `arguments` はJSON互換objectで、省略時は `{}`。トップレベルarray/null、関数、undefined、BigInt、NaN/Infinity、安全な整数範囲を超える数、循環参照、getter、toJSON、Proxy、疎配列、Symbol、Dateなどは拒否します。通常のJS Numberの小数精度は変わりません。
+- `options` は省略可。`timeoutMs` は正の整数のみ。未知キーを拒否します。指定が管理者上限を超える場合はエラーです。
+- 戻り値は `tools/call` の **result全体** をJSON解析したJSオブジェクトです。`content` の順序・image/audio/resource等・annotations・`_meta`・拡張フィールドを保持します。`content[].text` のJSON文字列を自動解析しません。resource URIを自動取得しません。
+- `structuredContent` の省略と明示的nullを区別します。2025-06-18接続はobjectのみ、2026-07-28接続は任意のJSON値を受け付けます。
+- `isError:true` は例外にせず結果として返します。`input_required` も未完了の結果として返し、自動回答・継続・再送はしません。
+- 通信/JSON-RPC/schema/許可/上限違反は `NyanMCPError` をthrowします。`code`、`executionState`、`connection`、`tool`、`correlationId`、必要に応じて `rpcCode` / `httpStatus` を持ちます。メッセージに外部エラー本文や資格情報を含めません。
+- `executionState:"not_sent"` はtools/call送信前の拒否、`"unknown"` は送信を試みた後です。timeoutや結果検証失敗でも外部処理は成功している可能性があります。**自動再試行は0回**です。
+
+主なcode: `INVALID_ARGUMENT`, `CONNECTION_NOT_ALLOWED`, `CALLER_NOT_ALLOWED`, `TOOL_NOT_ALLOWED`, `INPUT_SCHEMA`, `OUTPUT_SCHEMA`, `AUTH_REQUIRED`, `TRANSPORT`, `MCP_RPC`, `PROTOCOL_VERSION`, `UNSUPPORTED_RESULT`, `NUMBER_RANGE`, `RESULT_TOO_LARGE`, `TIMEOUT`, `CANCELLED`, `BUSY`, `QL_TRANSACTION`, `RENDER_WRITE_FORBIDDEN`。
+
+### 起動設定
+
+接続設定は、Nyan8本体の **`config.json` の `mcpClient.connections`** に記述します。MCP専用の設定ファイルは使用しません。設定は起動時に一度だけ読み、`mcpClient`が未指定・null、または`connections`が空なら全接続を拒否します。`mcpClient`内の未知キー・不正値・存在しない許可スクリプト・不適切な秘密ファイルは起動エラーです。既存のapi.jsonのhot reloadと独立しており、MCP接続設定の変更は再起動が必要です。
+
+同梱の`config.json`では、次のように接続を空にしてあります。
+
+```json
+{
+  "mcpClient": {
+    "connections": {}
+  }
+}
+```
+
+以前の`NYAN_MCP_CONFIG`環境変数は使用しません。既存の専用設定を移行する場合は、その`connections`を`config.json`の`mcpClient.connections`へ移してください。
+
+| フィールド | 意味 |
+|---|---|
+| connections | `mcpClient`直下に置く、接続IDをキーとするobject（最大64接続） |
+| transport | `streamable_http` または `stdio` |
+| allowedScripts | 呼出し元本体JSの絶対パス。symlink解決後のパスを照合。API名や引数のuserIdで権限を選ばない |
+| tools | 正確なtool名 → `{ "readOnly": true/false }`。実行権限と参照/更新の管理者宣言 |
+| protocolVersions | `2025-06-18` / `2026-07-28` の明示許可リスト |
+| credentialMode | 初期版は `service` のみ。利用者別資格情報を黙ってサービス主体へ代替しない |
+| timeoutMs / maxTimeoutMs | 既定30,000 / 上限120,000ミリ秒。親contextの期限を優先 |
+| maxInputBytes / maxResultBytes | 接続ごとに整数バイト数で指定。既定1 MiB / 8 MiB。指定範囲はそれぞれ1〜1,048,576 / 256〜8,388,608。省略・0は既定値 |
+| maxConcurrent | 接続単位で既定4、最大32。同一プロセス全体でも32。待機キューなし、超過はBUSY |
+| allowQLRead | QLから参照を許可する明示フラグ。既定false |
+
+`allowedScripts` はサービス主体の**スクリプト単位の権限**です。エンドユーザーの認可は既存のAPI認証・paramCheck等で実施してください。同じスクリプトが複数APIから利用される場合、その全経路が許可対象になります。includeは本体スクリプトの権限で実行されます。利用者別の資格情報選択・自動OAuthは未対応です。
+
+例えば接続IDが`inventory-read`の場合、結果サイズの上限は`config.json`の`mcpClient.connections.inventory-read.maxResultBytes`で指定します。`1048576`なら1 MiBです。
+
+#### Streamable HTTP
+
+- `url`: 固定のscheme/host/port/path。HTTPSが既定。userinfo/query/fragmentは拒否します。
+- `allowHTTP:true`: 管理者がHTTPを明示許可する場合のみ。ローカル試験例以外ではHTTPSを使用してください。
+- `allowedCIDRs`: 省略時は公開宛先のみ。設定すると**そのCIDRに含まれるIPだけ**に接続します。loopback/privateネットワークには明示許可が必要です。metadata/link-local/unspecified/multicastはCIDRで許可しても拒否します。
+- DNSの全解決結果を検証し、そのIPへ直接接続するため検証後に再解決しません。TLS検証は有効。redirect・環境proxyは使いません。ブラウザーから受けたAuthorization/Cookieを転送しません。
+- `bearerTokenFile`: 任意。絶対パスの通常ファイルから、最大8 KiB、1行の既存トークンを読み取ります。Linux・macOSでは所有者以外の権限がないことを検査します（例0600）。`environmentFiles` にも同じ検査を適用します。呼出しごとに再読込するので次回呼出しから更新が有効です。設定例に実トークンを書かないでください。
+- JSONとSSEの応答に対応。初期版はSSEの応答ストリーム完了までバッファし、進捗UIは提供しません。展開後の応答全体に上限を適用します。永続GET/SSE、再接続、旧HTTP+SSE transportは使いません。
+
+#### stdio
+
+- `executable`: 管理者管理の実行可能ファイルの絶対パス。通常ファイルであることを確認し、symlinkは起動時に固定します。Linux・macOSでは実行ビットがあり、group/otherが書込不可であることも検査します。
+- Windowsの `executable` は `.exe` を指定します。
+- `args`: 固定引数のみ（最大64）。`directory`: 固定した絶対作業ディレクトリ。
+- shell・パッケージrunner・主要な汎用インタープリターを実行対象に指定できません。シェル文字列を組み立てません。
+- 親プロセスの環境変数を引き継ぎません。`environmentFiles` は環境変数名→秘密ファイルの絶対パス。必要な値だけを設定し、PATH/HOME/LD_*/DYLD_*などを拒否します。
+- 呼出しごとに専用プロセスを起動し、完了/取消時に終了してWaitします。Unixでは専用プロセスグループも終了させます。stdoutはMCP専用、stderrは保存せず破棄します。stdio入力にはフレーム上限と1セッション最大4×maxResultBytesの受信量上限があります。
+- この機能はOSサンドボックスではありません。信頼するMCP実行ファイルを低権限アカウントで動かし、必要なCPU/メモリ/ファイル/ネットワーク制限はOSやコンテナーで設定してください。任意の子プログラムを安全化する保証はありません。
+
+Windowsでは、Nyan8は上記の実行ファイルと秘密ファイルの所有者・ACLを追加検査しません。読み取り・実行の可否はOSの権限管理に従い、失敗は呼出し元へエラーとして返します。秘密ファイルは設定読込時にも読み取りを確認します。`bearerTokenFile`・`environmentFiles`の秘密情報の保護と、実行ファイル・配置先の改変防止は管理者がOSの権限で管理してください。権限検査用のPowerShellは不要です。Linux・macOSの既存の権限検査は維持します。
+
+### 検証・互換性
+
+公式 [Go SDK v1.7.0](https://github.com/modelcontextprotocol/go-sdk/tree/v1.7.0) を固定依存に追加しています（SDKの最小Goは1.25、製品はGo 1.27.4）。SDKの対応版全てをこの製品で許可するわけではありません。
+
+2026-07-28は `server/discover` と要求メタデータ、2025-06-18はSDKによる旧版 `initialize` → `notifications/initialized` を使います。交渉版が接続設定の許可版でなければ `PROTOCOL_VERSION` でtools/call前に停止します。SDKが先に選んだ未許可版から、独自の再交渉・暗黙ダウングレードはしません。
+
+呼出しごとにtools/listをページングし、管理者許可と入力schemaを両方確認します。成功結果にoutputSchemaがあればstructuredContentの存在と型を検証します。isErrorには成功schemaを適用しません。schemaの外部URL/file参照は取得しません。JSON Schemaは既存のsanthosh-tekuri/jsonschema v6.0.3を使用します。
+
+接続・認証・schemaの共有キャッシュはありません。Goja VMを別goroutineから操作しません。JSONの深さ64・ノード数100,000を制限し、数値範囲の逸脱は丸めず拒否します。入力はUTF-8 JSON化後、結果は展開済みwire応答で上限を確認します。
+
+監査ログは製品・設定済み接続/ツール・呼出し元・版・分類・経過時間、例外ログは相関IDを記録します。引数/結果全文・資格情報・サーバーエラー本文・stderrは記録しません。アプリ側が結果をconsole.logする場合は別扱いです。ログ保持期間は既存ログ設定・運用方針に従います。
+
+### 期限と未対応事項
+
+親HTTP要求の取消・schedule削除・アプリのSIGINT/SIGTERMをMCP I/Oに伝えます。アプリ終了時は最大2秒だけMCPの解放を待ち、元のシグナル終了へ戻ります。取消は外部処理のrollbackを意味しません。JS全体の任意処理やschemaコンパイルを強制中断する機能ではありません。
+
+未対応: 利用者別資格情報、OAuth同意/更新UI、sampling、elicitation自動回答、input_requiredの継続UI、進捗UI、共有session/cache、キュー・outbox・永続worker・結果照会・冪等性キー管理・自動補償、OS資源制限の自動設定。WebSocketバックグラウンド処理の切断/設定変更は専用の親MCP取消に未接続で、呼出しの期限とアプリ停止で終了します。既存のHTTP/ファイル/host実行関数を含め、信頼できないJSを隔離する仕組みではありません。
+
+外部実行とDB commitは一体ではなく、障害後の結果不明・重複は接続先の契約と業務設計で扱います。scheduleの存在やこのクライアントをもってexactly-onceを保証しません。
+
+### 開発・試験
+
+`main.go` の `BEGIN shared nyanCallMCP` ブロックと `main_test.go` の共通適合テストは、関連製品との契約確認に使用します。設定読み込みは本製品の`config.json`へ統合しています。独立リポジトリとNyan8の単一ファイル方針に従い、初期版は共有モジュールへの物理分割を行っていません。
+
+```sh
+go test -run '^TestNyanMCP' -count=1 ./...
+go test -race -run '^TestNyanMCP' -count=1 ./...
+go test ./...
+go build -o /tmp/nyan-mcp-check main.go
+```
+
+試験はhttptestのランダムloopbackポートとテストバイナリのstdio子プロセスを利用し、実MCPサービスや資格情報を必要としません。テストバイナリを既存の実行ファイルへ上書きしないでください。
+
+### Nyan8での利用
+
+APIのscriptやscheduleのJS本体をallowedScriptsに登録します。JS全体を包むDBトランザクションはありません。更新系を使う場合はAPI認可・利用者の明示操作・接続先の冪等性/結果照会を組み合わせてください。scheduleの削除は進行中MCPを取消しますが、外部実行の取り消しや重複防止を保証しません。OAuth専用の制限付きVMには追加していません。
+
 ---
+
 ## 8 ライセンス
+
 [MIT License](LICENSE.md)

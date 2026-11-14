@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -37,7 +38,11 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+
+	mcpjsonrpc "github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/dop251/goja"
 	"github.com/dop251/goja/ast"
@@ -259,23 +264,27 @@ func newConfiguredHTTPServer(address string, handler http.Handler, timeouts HTTP
 }
 
 type Config struct {
-	HTTPTimeouts      HTTPTimeoutsConfig  `json:"httpTimeouts"`
-	ReceiveLimits     ReceiveLimitsConfig `json:"receiveLimits"`
-	Name              string              `json:"name"`
-	Profile           string              `json:"profile"`
-	Version           string              `json:"version"`
-	Port              int                 `json:"Port"`
-	BindAddress       string              `json:"bindAddress"`
-	CertFile          string              `json:"certPath"`
-	KeyFile           string              `json:"keyPath"`
-	JavaScriptInclude []string            `json:"javascript_include"`
-	Log               LogConfig           `json:"log"`
-	SMTP              SMTPConfig          `json:"smtp"`
-	OAuthAdmin        OAuthAdminConfig    `json:"oauth_admin"`
-	OAuthStateRoot    string              `json:"oauth_state_directory"`
-	APIHotReload      APIHotReloadConfig  `json:"APIHotReload"`
-	WebSocket         WebSocketConfig     `json:"websocket"`
-	ProxyProtocol     ProxyProtocolConfig `json:"proxyProtocol"`
+	HTTPTimeouts           HTTPTimeoutsConfig    `json:"httpTimeouts"`
+	ReceiveLimits          ReceiveLimitsConfig   `json:"receiveLimits"`
+	Name                   string                `json:"name"`
+	Profile                string                `json:"profile"`
+	Version                string                `json:"version"`
+	Port                   int                   `json:"Port"`
+	BindAddress            string                `json:"bindAddress"`
+	CertFile               string                `json:"certPath"`
+	KeyFile                string                `json:"keyPath"`
+	JavaScriptInclude      []string              `json:"javascript_include"`
+	JavaScriptIncludeCache bool                  `json:"javascript_include_cache"`
+	Log                    LogConfig             `json:"log"`
+	SMTP                   SMTPConfig            `json:"smtp"`
+	OAuthStateRoot         string                `json:"oauth_state_directory"`
+	MCPOAuthRuntime        MCPOAuthRuntimeConfig `json:"oauthRuntime"`
+	APIHotReload           APIHotReloadConfig    `json:"APIHotReload"`
+	WebSocket              WebSocketConfig       `json:"websocket"`
+	ProxyProtocol          ProxyProtocolConfig   `json:"proxyProtocol"`
+	MCPClient              *nyanMCPConfig        `json:"mcpClient,omitempty"`
+
+	cachedJavaScriptIncludes *string
 }
 
 // WebSocketConfig keeps the legacy API WebSocket feature available while
@@ -293,14 +302,6 @@ type WebSocketConfig struct {
 type ProxyProtocolConfig struct {
 	Enabled      bool     `json:"enabled"`
 	TrustedCIDRs []string `json:"trustedCIDRs"`
-}
-
-// OAuthAdminConfig contains the operator credential used only by the OAuth
-// user bootstrap endpoint. Production values belong in the runtime config
-// rendered by Ansible, never in api.json or a release artifact.
-type OAuthAdminConfig struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
 }
 
 // LogConfig はログ設定データを表します。
@@ -400,7 +401,7 @@ type MailAttachment struct {
 var (
 	// BinaryVersion can be set at build time with:
 	// go build -ldflags "-X main.BinaryVersion=vX.Y.Z"
-	BinaryVersion = "v1.0.21"
+	BinaryVersion = "v1.1.22"
 )
 
 const (
@@ -439,8 +440,6 @@ var storage sync.Map
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
-
-var ginContext *gin.Context
 
 var pushConnections = pushConnectionRegistry{connections: make(map[string][]*serverWebSocket)}
 
@@ -504,20 +503,11 @@ var websocketConnectionCount = struct {
 
 // main はメイン関数です。
 func main() {
-	// 実行ファイルのディレクトリを取得
-	execPath, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	// PATH経由の起動でも実行ファイルの場所を基準にする。
+	execDir, err := executableBaseDir()
 	if err != nil {
 		fatalServiceError("executable_path_failed", err)
 	}
-
-	// 一時ディレクトリを除外してカレントディレクトリを使用
-	if isTemporaryDirectory(execPath) {
-		execPath, err = os.Getwd()
-		if err != nil {
-			fatalServiceError("working_directory_failed", err)
-		}
-	}
-	execDir := execPath
 
 	options, err := resolveStartupOptions(execDir, os.Args[1:])
 	if err != nil {
@@ -533,11 +523,21 @@ func main() {
 	}
 	configBaseDir := filepath.Dir(paths.Config.Path)
 	apiBaseDir := filepath.Dir(paths.API.Path)
-	adjustConfigPaths(configBaseDir, &config)
+	if err := adjustConfigPaths(configBaseDir, &config); err != nil {
+		fatalServiceError("config_path_invalid", err)
+	}
 	globalConfig = config
 
 	if err := initLogger(configBaseDir); err != nil {
 		fatalServiceError("invalid_log_level", err, "expected", "debug, info, warn, or error")
+	}
+	nyanMCPClient, err = loadNyanMCPConfig(globalConfig.MCPClient)
+	if err != nil {
+		fatalServiceError("mcp_client_config_failed", err)
+	}
+	watchNyanMCPShutdown(nyanMCPClient)
+	if err := globalConfig.prepareJavaScriptIncludes(execDir); err != nil {
+		fatalServiceError("javascript_include_load_failed", err)
 	}
 	binaryVersion := BinaryVersion
 	if strings.TrimSpace(binaryVersion) == "" {
@@ -615,17 +615,7 @@ func main() {
 		fatalServiceError("endpoint_registration_failed", err)
 	}
 
-	// HTTPSサーバーを起動するかどうかを判断
-	// ★★★ 修正：cert/key のパス解決に resolvePath を使用 ★★★
-	certFilePath, err := resolvePath(configBaseDir, config.CertFile)
-	if err != nil {
-		fatalServiceError("cert_path_invalid", err)
-	}
-	keyFilePath, err := resolvePath(configBaseDir, config.KeyFile)
-	if err != nil {
-		fatalServiceError("key_path_invalid", err)
-	}
-
+	// 証明書と鍵はadjustConfigPathsで一度だけ解決済み。
 	server := newConfiguredHTTPServer(listenAddress, receiveLimitH2CHandler(r, config.HTTPTimeouts), config.HTTPTimeouts)
 	server.ErrorLog = httpServerErrorLogger()
 	if config.ProxyProtocol.Enabled {
@@ -633,7 +623,7 @@ func main() {
 	}
 	if config.CertFile != "" && config.KeyFile != "" {
 		serviceLog(slog.LevelInfo, "http_server_starting", "transport", "https", "address", listenAddress)
-		err = serveConfiguredHTTPServer(server, certFilePath, keyFilePath, config.ProxyProtocol)
+		err = serveConfiguredHTTPServer(server, config.CertFile, config.KeyFile, config.ProxyProtocol)
 	} else {
 		serviceLog(slog.LevelInfo, "http_server_starting", "transport", "http", "address", listenAddress)
 		err = serveConfiguredHTTPServer(server, "", "", config.ProxyProtocol)
@@ -866,6 +856,21 @@ func isTemporaryDirectory(path string) bool {
 	return strings.HasPrefix(p, t)
 }
 
+// executableBaseDir uses the running program's location rather than argv[0],
+// which may contain only a command name when launched through PATH. Preserve
+// the working-directory fallback for temporary binaries used by go run/test.
+func executableBaseDir() (string, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve executable: %w", err)
+	}
+	dir := filepath.Dir(executable)
+	if isTemporaryDirectory(dir) {
+		return os.Getwd()
+	}
+	return dir, nil
+}
+
 func resolveStartupOptions(execDir string, args []string) (startupOptions, error) {
 	flags := flag.NewFlagSet("Nyan8", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -959,6 +964,9 @@ func resolvePath(baseDir, p string) (string, error) {
 
 	// 環境変数展開
 	p = os.ExpandEnv(p)
+	if p == "" {
+		return "", nil
+	}
 
 	// file:// URL → ローカルパス
 	if strings.HasPrefix(p, "file://") {
@@ -968,8 +976,8 @@ func resolvePath(baseDir, p string) (string, error) {
 		}
 		// / を OS の区切りに
 		p = filepath.FromSlash(u.Path)
-		// Windows の file://C:/... 形式調整（/C:/... → C:/...）
-		if runtime.GOOS == "windows" && strings.HasPrefix(p, string(os.PathSeparator)) && len(p) >= 3 && p[1] == ':' {
+		// Windows の file:///C:/... 形式調整（\C:\... → C:\...）。
+		if runtime.GOOS == "windows" && len(p) >= 4 && p[0] == os.PathSeparator && p[2] == ':' && p[3] == os.PathSeparator {
 			p = p[1:]
 		}
 	}
@@ -1061,8 +1069,11 @@ func loadConfig(filename string) (Config, error) {
 	if err := json.Unmarshal(data, &config); err != nil {
 		return config, err
 	}
+	if config.WebSocket.MaxConnections == 0 {
+		config.WebSocket.MaxConnections = 128
+	}
 	if config.WebSocket.MaxConnections < 1 || config.WebSocket.MaxConnections > 4096 {
-		return config, fmt.Errorf("websocket.maxConnections must be between 1 and 4096")
+		return config, fmt.Errorf("websocket.maxConnections must be 0 (default: 128) or between 1 and 4096")
 	}
 	if _, err := validateProxyProtocolConfig(config.ProxyProtocol); err != nil {
 		return config, err
@@ -1070,14 +1081,22 @@ func loadConfig(filename string) (Config, error) {
 	return config, nil
 }
 
-func adjustConfigPaths(configBaseDir string, config *Config) {
-	config.CertFile = resolvePathFromBase(configBaseDir, config.CertFile)
-	config.KeyFile = resolvePathFromBase(configBaseDir, config.KeyFile)
+func adjustConfigPaths(configBaseDir string, config *Config) error {
+	certFile, err := resolvePath(configBaseDir, strings.TrimSpace(config.CertFile))
+	if err != nil {
+		return fmt.Errorf("invalid certPath: %w", err)
+	}
+	keyFile, err := resolvePath(configBaseDir, strings.TrimSpace(config.KeyFile))
+	if err != nil {
+		return fmt.Errorf("invalid keyPath: %w", err)
+	}
+	config.CertFile, config.KeyFile = certFile, keyFile
 	config.Log.Filename = resolvePathFromBase(configBaseDir, config.Log.Filename)
 	config.OAuthStateRoot = resolvePathFromBase(configBaseDir, config.OAuthStateRoot)
 	for i, includePath := range config.JavaScriptInclude {
 		config.JavaScriptInclude[i] = resolvePathFromBase(configBaseDir, includePath)
 	}
+	return nil
 }
 
 func resolvePathFromBase(baseDir, pathValue string) string {
@@ -1184,24 +1203,11 @@ func acquireWebSocketConnection(limit int) (func(), bool) {
 // handleAPIRequest はAPIリクエストを処理します。
 func handleAPIRequest(c *gin.Context) {
 	// 実行ファイルのディレクトリを取得
-	execPath, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	execPath, err := executableBaseDir()
 	if err != nil {
 		fatalServiceError("executable_path_failed", err)
 	}
-
-	// 一時ディレクトリを除外してカレントディレクトリを使用
-	if isTemporaryDirectory(execPath) {
-		execPath, err = os.Getwd()
-		if err != nil {
-			fatalServiceError("working_directory_failed", err)
-		}
-	}
 	execDir := apiBaseDir(execPath)
-
-	ginContext = c
-	defer func() {
-		ginContext = nil
-	}()
 
 	// スクリプトリストの取り込み
 	apiJsonPath := apiJSONPath(execDir)
@@ -1275,6 +1281,10 @@ func handleAPIRequest(c *gin.Context) {
 		respondWithError(c, http.StatusInternalServerError, "Status field not found in JavaScript response", nil)
 		return
 	}
+	if math.Trunc(status) != status {
+		respondWithError(c, http.StatusInternalServerError, "Status field must be an integer in JavaScript response", nil)
+		return
+	}
 
 	response := APIResponse{Status: int(status), ContentType: "application/json", Headers: map[string]string{}, Body: []byte(result)}
 	if handled := runOutCheckWithSnapshot(snapshot, c, scriptInfo, execDir, allParams, &response); handled {
@@ -1300,17 +1310,10 @@ func handleWebSocket(c *gin.Context) {
 		defer release()
 	}
 	// Resolve and check the subscription target before upgrading or registering it.
-	execPath, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	execPath, err := executableBaseDir()
 	if err != nil {
 		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, "Failed to resolve execution directory"))
 		return
-	}
-	if isTemporaryDirectory(execPath) {
-		execPath, err = os.Getwd()
-		if err != nil {
-			writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, "Failed to resolve working directory"))
-			return
-		}
 	}
 	execDir := apiBaseDir(execPath)
 	apiNameValue, _ := c.Get("nyan_api_name")
@@ -1324,6 +1327,9 @@ func handleWebSocket(c *gin.Context) {
 	if apiNameString == "" {
 		apiNameString = c.Query("api")
 	}
+	// Hijacked requests bypass net/http's normal multipart cleanup. Also clean
+	// up rejected handshakes and checks that return before the upgrade.
+	defer releaseWebSocketHandshakeBody(c.Request)
 	params, err := collectRequestParams(c)
 	if err != nil {
 		writeParamCheckResponse(c, newParamCheckError(http.StatusBadRequest, "Invalid request parameters"))
@@ -1358,9 +1364,9 @@ func handleWebSocket(c *gin.Context) {
 		return
 	}
 
-	// Handshake checks are complete. Do not retain the buffered HTTP body
-	// throughout the lifetime of the WebSocket connection.
-	c.Request.Body = http.NoBody
+	// Checks need the handshake parameters, but the long-lived connection only
+	// needs request metadata. Release parsed forms and uploads before cloning it.
+	releaseWebSocketHandshakeBody(c.Request)
 	rawConn, err := upgrader.Upgrade(c.Writer, c.Request, c.Writer.Header())
 	if err != nil {
 		logServiceError(slog.LevelWarn, "websocket_upgrade_failed", err)
@@ -1491,6 +1497,22 @@ func handleWebSocket(c *gin.Context) {
 	}
 }
 
+func releaseWebSocketHandshakeBody(request *http.Request) {
+	if request.MultipartForm != nil {
+		if err := request.MultipartForm.RemoveAll(); err != nil {
+			logServiceError(slog.LevelWarn, "websocket_multipart_cleanup_failed", err)
+		}
+		request.MultipartForm = nil
+	}
+	if request.Body != nil {
+		_ = request.Body.Close()
+	}
+	request.Body = http.NoBody
+	request.GetBody = nil
+	request.Form = nil
+	request.PostForm = nil
+}
+
 // Connection metadata is server-owned, both before upgrade and for each message.
 func addWebSocketRequestMetadata(params map[string]interface{}, request *http.Request) {
 	params["_remote_ip"] = getClientIP(request)
@@ -1520,6 +1542,48 @@ func writeWebSocketCheckResponse(conn *serverWebSocket, messageType int, respons
 	return conn.WriteMessage(messageType, body)
 }
 
+func readJavaScriptIncludeFiles(basePath string, paths []string) (string, error) {
+	var source strings.Builder
+	for _, includePath := range paths {
+		includeAbs, err := resolvePath(basePath, includePath)
+		if err != nil {
+			return "", fmt.Errorf("failed to resolve included JS file %s: %w", includePath, err)
+		}
+		code, err := os.ReadFile(includeAbs)
+		if err != nil {
+			return "", fmt.Errorf("failed to read included JS file %s: %w", includeAbs, err)
+		}
+		source.Write(code)
+		source.WriteByte('\n')
+	}
+	return source.String(), nil
+}
+
+// Called after config-relative paths are resolved and before starting workers.
+// Only source text is cached; each execution still creates a fresh goja runtime.
+func (cfg *Config) prepareJavaScriptIncludes(basePath string) error {
+	cfg.cachedJavaScriptIncludes = nil
+	if !cfg.JavaScriptIncludeCache {
+		return nil
+	}
+	source, err := readJavaScriptIncludeFiles(basePath, cfg.JavaScriptInclude)
+	if err != nil {
+		return err
+	}
+	cfg.cachedJavaScriptIncludes = &source
+	return nil
+}
+
+func (cfg *Config) javaScriptIncludes(basePath string) (string, error) {
+	if !cfg.JavaScriptIncludeCache {
+		return readJavaScriptIncludeFiles(basePath, cfg.JavaScriptInclude)
+	}
+	if cfg.cachedJavaScriptIncludes == nil {
+		return "", errors.New("javascript include cache has not been initialized")
+	}
+	return *cfg.cachedJavaScriptIncludes, nil
+}
+
 // runJavaScript はJavaScriptを実行します。
 // runJavaScript は、指定された JavaScript コードを goja で実行します。
 func runJavaScript(scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (string, error) {
@@ -1531,22 +1595,48 @@ func runJavaScriptWithSnapshot(snapshot *APIConfigSnapshot, scriptPath string, a
 	return runJavaScriptForAPI(snapshot, apiName, scriptPath, allParams, ginCtx)
 }
 
-func runJavaScriptForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (string, error) {
-	value, err := runJavaScriptValueForAPI(snapshot, apiName, scriptPath, allParams, ginCtx)
+func runJavaScriptForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (result string, err error) {
+	err = consumeJavaScriptForAPI(snapshot, apiName, scriptPath, allParams, ginCtx, func(value goja.Value) error {
+		exported, err := exportJavaScriptValue(value)
+		if err != nil {
+			return fmt.Errorf("export script result: %w", err)
+		}
+		if text, ok := exported.(string); ok {
+			result = text
+			return nil
+		}
+		encoded, err := json.Marshal(exported)
+		if err != nil {
+			return fmt.Errorf("encode script result: %w", err)
+		}
+		result = string(encoded)
+		return nil
+	})
 	if err != nil {
 		return "", err
 	}
-	// Preserve existing string responses and encode structured values without
-	// losing their contents to JavaScript's generic string conversion.
-	exported := value.Export()
-	if text, ok := exported.(string); ok {
-		return text, nil
-	}
-	encoded, err := json.Marshal(exported)
-	if err != nil {
-		return "", fmt.Errorf("encode script result: %w", err)
-	}
-	return string(encoded), nil
+	return result, nil
+}
+
+// Export can execute getters after RunString has returned. Convert only Goja
+// execution failures into errors; unrelated Go panics must not be hidden.
+func exportJavaScriptValue(value goja.Value) (exported interface{}, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			switch failure := recovered.(type) {
+			case *goja.Exception:
+				err = failure
+			case *goja.InterruptedError:
+				err = failure
+			case *goja.StackOverflowError:
+				err = failure
+			default:
+				panic(recovered)
+			}
+			exported = nil
+		}
+	}()
+	return value.Export(), nil
 }
 
 func runJavaScriptValue(scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (goja.Value, error) {
@@ -1558,62 +1648,77 @@ func runJavaScriptValueWithSnapshot(snapshot *APIConfigSnapshot, scriptPath stri
 	return runJavaScriptValueForAPI(snapshot, apiName, scriptPath, allParams, ginCtx)
 }
 
-func runJavaScriptValueForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (goja.Value, error) {
+func runJavaScriptValueForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context) (result goja.Value, err error) {
+	err = consumeJavaScriptForAPI(snapshot, apiName, scriptPath, allParams, ginCtx, func(value goja.Value) error { result = value; return nil })
+	return result, err
+}
+
+// Keep the VM interruptible until the caller has exported the result, including getters.
+func consumeJavaScriptForAPI(snapshot *APIConfigSnapshot, apiName, scriptPath string, allParams map[string]interface{}, ginCtx *gin.Context, consume func(goja.Value) error) (runErr error) {
 	// 新たな goja の VM を生成
+	ctx := scheduleScriptContext(ginCtx)
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
 	vm := goja.New()
+	stop := interruptJavaScriptOnCancellation(ctx, vm)
+	defer func() {
+		stop()
+		if ctx != nil && ctx.Err() != nil {
+			runErr = ctx.Err()
+		}
+	}()
 	// 必要なグローバル関数等を登録する
 	setupGojaVMForAPI(vm, snapshot, apiName, ginCtx)
+	mcpContext := nyanMCPGinParent(ginCtx)
+	mcpScript, _ := filepath.Abs(scriptPath)
+	registerNyanMCP(vm, nyanMCPClient, mcpContext, mcpScript, "operation")
 
-	// ★★★ 追加：include の基準ディレクトリを取得（mainと同じロジック） ★★★
-	basePath, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	// includeも起動時と同じ基準ディレクトリを使用する。
+	basePath, err := executableBaseDir()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get base path: %v", err)
-	}
-	if isTemporaryDirectory(basePath) {
-		if basePath, err = os.Getwd(); err != nil {
-			return nil, fmt.Errorf("failed to get working directory: %v", err)
-		}
+		return fmt.Errorf("failed to get base path: %v", err)
 	}
 
-	// globalConfig.JavaScriptInclude にある各ファイルを読み込み、連結する
-	var jsCode string
-	for _, includePath := range globalConfig.JavaScriptInclude {
-		// ★★★ 修正：resolvePath で絶対/相対/URL/環境変数/波線を解決 ★★★
-		includeAbs, rerr := resolvePath(basePath, includePath)
-		if rerr != nil {
-			return nil, fmt.Errorf("failed to resolve included JS file %s: %v", includePath, rerr)
-		}
-		code, err := ioutil.ReadFile(includeAbs)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read included JS file %s: %v", includeAbs, err)
-		}
-		jsCode += string(code) + "\n"
+	jsCode, err := globalConfig.javaScriptIncludes(basePath)
+	if err != nil {
+		return err
 	}
 
 	// メインスクリプトを読み込む
 	mainCode, err := ioutil.ReadFile(scriptPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read main script file %s: %v", scriptPath, err)
+		return fmt.Errorf("failed to read main script file %s: %v", scriptPath, err)
 	}
 	jsCode += string(mainCode)
 
-	// allParams を JSON 化して、グローバル変数 allParams としてセットする
+	// JSONとして解析し、__proto__も通常のデータキーとして保持する。
 	allParamsJSON, err := json.Marshal(allParams)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	_, err = vm.RunString(fmt.Sprintf("let nyanAllParams = %s;", string(allParamsJSON)))
+	paramsLiteral, err := json.Marshal(string(allParamsJSON))
 	if err != nil {
-		return nil, err
+		return err
+	}
+	_, err = vm.RunString("let nyanAllParams = JSON.parse(" + string(paramsLiteral) + ");")
+	if err != nil {
+		return err
 	}
 
 	// 連結した JavaScript コードを実行
 	value, err := vm.RunString(jsCode)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return value, nil
+	if err := consume(value); err != nil {
+		return err
+	}
+	if ctx != nil {
+		return ctx.Err()
+	}
+	return nil
 }
 
 // callNyanAPIFromVM は、main.go 側から自身のAPI定義(js)を直接実行します。
@@ -2314,7 +2419,11 @@ func parseCheckResponse(value goja.Value, checkName string) (ParamCheckResponse,
 		return ParamCheckResponse{}, fmt.Errorf("%s must return an object", checkName)
 	}
 
-	return parseExportedCheckResponse(value.Export(), checkName)
+	exported, err := exportJavaScriptValue(value)
+	if err != nil {
+		return ParamCheckResponse{}, fmt.Errorf("export %s result: %w", checkName, err)
+	}
+	return parseExportedCheckResponse(exported, checkName)
 }
 
 func parseExportedCheckResponse(exported interface{}, checkName string) (ParamCheckResponse, error) {
@@ -2416,11 +2525,12 @@ func runParamCheckResponseForAPI(snapshot *APIConfigSnapshot, apiName string, ap
 	if err != nil {
 		return true, ParamCheckResponse{}, err
 	}
-	resultValue, err := runJavaScriptValueForAPI(snapshot, apiName, fullPath, allParams, ginCtx)
-	if err != nil {
-		return true, ParamCheckResponse{}, err
-	}
-	checkResponse, err := parseCheckResponse(resultValue, "paramCheck")
+	var checkResponse ParamCheckResponse
+	err = consumeJavaScriptForAPI(snapshot, apiName, fullPath, allParams, ginCtx, func(value goja.Value) error {
+		var parseErr error
+		checkResponse, parseErr = parseCheckResponse(value, "paramCheck")
+		return parseErr
+	})
 	if err != nil {
 		return true, ParamCheckResponse{}, err
 	}
@@ -2458,11 +2568,12 @@ func runOutCheckResponseForAPI(snapshot *APIConfigSnapshot, apiName string, apiM
 	if err != nil {
 		return true, ParamCheckResponse{}, err
 	}
-	resultValue, err := runJavaScriptValueForAPI(snapshot, apiName, fullPath, checkParams, ginCtx)
-	if err != nil {
-		return true, ParamCheckResponse{}, err
-	}
-	checkResponse, err := parseCheckResponse(resultValue, "outCheck")
+	var checkResponse ParamCheckResponse
+	err = consumeJavaScriptForAPI(snapshot, apiName, fullPath, checkParams, ginCtx, func(value goja.Value) error {
+		var parseErr error
+		checkResponse, parseErr = parseCheckResponse(value, "outCheck")
+		return parseErr
+	})
 	if err != nil {
 		return true, ParamCheckResponse{}, err
 	}
@@ -2570,8 +2681,6 @@ func servePublicEndpoint(c *gin.Context, endpoint, requestedPath, execDir string
 	allParams["api"] = endpoint
 	allParams["nyan_public_endpoint"] = endpoint
 	allParams["nyan_public_path"] = requestedPath
-	ginContext = c
-	defer func() { ginContext = nil }()
 	if allowed, handled := runParamCheckWithSnapshot(snapshot, c, latest, execDir, allParams); handled || !allowed {
 		return
 	}
@@ -2723,6 +2832,10 @@ func executeAPIEndpoint(c *gin.Context, apiName, execDir string) {
 		respondWithError(c, http.StatusInternalServerError, "Status field not found in JavaScript response", nil)
 		return
 	}
+	if math.Trunc(status) != status {
+		respondWithError(c, http.StatusInternalServerError, "Status field must be an integer in JavaScript response", nil)
+		return
+	}
 	response.Status = int(status)
 	if handled := runOutCheckWithSnapshot(snapshot, c, scriptInfo, execDir, allParams, &response); handled {
 		return
@@ -2849,7 +2962,6 @@ func mcpOAuthRoleForAPI(mcp *MCPServerConfig, apiName string) (string, bool) {
 		{mcp.OAuth.Authorize, "oauthAuthorize"},
 		{mcp.OAuth.Token, "oauthToken"},
 		{mcp.OAuth.Register, "oauthRegister"},
-		{mcp.OAuth.AdminUser, "oauthAdminUser"},
 		{mcp.OAuth.VerifyAccess, "oauthValidateAccessToken"},
 	}
 	for _, candidate := range roles {
@@ -2876,7 +2988,6 @@ type mcpRuntimeURLs struct {
 	AuthorizationEndpoint       string
 	TokenEndpoint               string
 	RegistrationEndpoint        string
-	AdminUserEndpoint           string
 }
 
 func deriveMCPRuntimeURLs(request *http.Request, mcp *MCPServerConfig) (mcpRuntimeURLs, error) {
@@ -2940,7 +3051,6 @@ func deriveMCPRuntimeURLs(request *http.Request, mcp *MCPServerConfig) (mcpRunti
 		AuthorizationEndpoint:       apiURL(mcp.OAuth.Authorize),
 		TokenEndpoint:               apiURL(mcp.OAuth.Token),
 		RegistrationEndpoint:        apiURL(mcp.OAuth.Register),
-		AdminUserEndpoint:           apiURL(mcp.OAuth.AdminUser),
 	}, nil
 }
 
@@ -3363,7 +3473,10 @@ func mcpStructuredResult(value goja.Value) (interface{}, []byte, error) {
 	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
 		return nil, nil, fmt.Errorf("empty result")
 	}
-	exported := value.Export()
+	exported, err := exportJavaScriptValue(value)
+	if err != nil {
+		return nil, nil, err
+	}
 	if text, ok := exported.(string); ok {
 		body := []byte(text)
 		var structured interface{}
@@ -3869,7 +3982,7 @@ func oauthMethodAllowed(hook, method string) bool {
 		return method == http.MethodGet
 	case "oauthAuthorize":
 		return method == http.MethodGet || method == http.MethodPost
-	case "oauthAdminUser", "oauthRegister", "oauthToken":
+	case "oauthRegister", "oauthToken":
 		return method == http.MethodPost
 	default:
 		return false
@@ -3895,7 +4008,7 @@ func validateOAuthContentType(hook string, request *http.Request) error {
 		return err
 	}
 	switch hook {
-	case "oauthRegister", "oauthAdminUser":
+	case "oauthRegister":
 		if mediaType != "application/json" {
 			return fmt.Errorf("JSON is required")
 		}
@@ -3910,7 +4023,7 @@ func validateOAuthContentType(hook string, request *http.Request) error {
 func oauthRateLimitForHook(mcp *MCPServerConfig, hook string) *MCPRateLimit {
 	requests := 60
 	switch hook {
-	case "oauthAdminUser", "oauthRegister":
+	case "oauthRegister":
 		requests = 10
 	case "oauthAuthorize":
 		requests = 30
@@ -3924,8 +4037,6 @@ func oauthRateLimitForHook(mcp *MCPServerConfig, hook string) *MCPRateLimit {
 func oauthMaxConcurrentForHook(mcp *MCPServerConfig, hook string) int {
 	limit := mcpMaxConcurrent(mcp)
 	switch hook {
-	case "oauthAdminUser":
-		return min(limit, 1)
 	case "oauthAuthorize":
 		return min(limit, 2)
 	default:
@@ -4026,8 +4137,8 @@ func invokeOAuthHook(snapshot *APIConfigSnapshot, mcp *MCPServerConfig, runtimeU
 		"resource":                      runtimeURLs.Resource,
 		"issuer":                        runtimeURLs.Issuer,
 		"path":                          apiPath,
-		"scopes":                        mcp.OAuth.Scopes,
-		"redirect_uri_allowed_prefixes": mcp.RedirectURIAllowedPrefixes,
+		"scopes":                        append([]string(nil), mcp.OAuth.Scopes...),
+		"redirect_uri_allowed_prefixes": append([]string(nil), mcp.RedirectURIAllowedPrefixes...),
 		"state_directory":               mcp.OAuth.StateDirectory,
 	}
 	for key, value := range extra {
@@ -4145,8 +4256,6 @@ func mcpOAuthAPIForRole(mcp *MCPServerConfig, role string) string {
 		return mcp.OAuth.Token
 	case "oauthRegister":
 		return mcp.OAuth.Register
-	case "oauthAdminUser":
-		return mcp.OAuth.AdminUser
 	case "oauthValidateAccessToken":
 		return mcp.OAuth.VerifyAccess
 	default:
@@ -4154,30 +4263,47 @@ func mcpOAuthAPIForRole(mcp *MCPServerConfig, role string) string {
 	}
 }
 
-func runOAuthHookJavaScript(snapshot *APIConfigSnapshot, mcp *MCPServerConfig, scriptPath string, params map[string]interface{}) (interface{}, error) {
+func runOAuthHookJavaScript(snapshot *APIConfigSnapshot, mcp *MCPServerConfig, scriptPath string, params map[string]interface{}) (result interface{}, resultErr error) {
+	var ctx context.Context
+	if timeout := mcp.oauthTimeout(); timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		defer func() {
+			if ctx.Err() != nil {
+				result = nil
+				resultErr = fmt.Errorf("OAuth hook execution failed")
+			}
+		}()
+	}
+	basePath, err := executableBaseDir()
+	if err != nil {
+		return nil, fmt.Errorf("OAuth hook cannot be read")
+	}
+	includes, err := globalConfig.javaScriptIncludes(basePath)
+	if err != nil {
+		return nil, fmt.Errorf("OAuth hook cannot be read")
+	}
 	code, err := os.ReadFile(scriptPath)
 	if err != nil || len(code) > maxMCPRequestBytes {
 		return nil, fmt.Errorf("OAuth hook cannot be read")
 	}
 	vm := goja.New()
+	stop := interruptJavaScriptOnCancellation(ctx, vm)
+	defer stop()
 	setupOAuthGojaVM(vm, snapshot, mcp)
 	if err := vm.Set("nyanAllParams", params); err != nil {
 		return nil, fmt.Errorf("OAuth hook input could not be prepared")
 	}
-	finished := make(chan struct{})
-	go func() {
-		select {
-		case <-time.After(15 * time.Second):
-			vm.Interrupt("OAuth hook timed out")
-		case <-finished:
-		}
-	}()
-	value, runErr := vm.RunString(string(code))
-	close(finished)
+	value, runErr := vm.RunString(includes + string(code))
 	if runErr != nil || value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
 		return nil, fmt.Errorf("OAuth hook execution failed")
 	}
-	return value.Export(), nil
+	exported, err := exportJavaScriptValue(value)
+	if err != nil {
+		return nil, fmt.Errorf("OAuth hook execution failed")
+	}
+	return exported, nil
 }
 
 func writeOAuthHookResponse(c *gin.Context, value interface{}) error {
@@ -4366,7 +4492,6 @@ func setupOAuthGojaVM(vm *goja.Runtime, _ *APIConfigSnapshot, mcp *MCPServerConf
 		return encoded
 	})
 	vm.Set("nyanArgon2idVerify", argon2idVerify)
-	vm.Set("nyanOAuthAdminAuthorized", oauthAdminAuthorized)
 	vm.Set("nyanBase64Decode", func(value string) string {
 		decoded, err := base64.StdEncoding.DecodeString(value)
 		if err != nil {
@@ -4417,27 +4542,6 @@ func argon2idHash(password string) (string, error) {
 func argon2idVerify(password, encoded string) bool {
 	valid, _ := verifyBoundedArgon2id(password, encoded)
 	return valid
-}
-
-func oauthAdminAuthorized(authorization string) bool {
-	if !strings.HasPrefix(authorization, "Basic ") {
-		return false
-	}
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(strings.TrimPrefix(authorization, "Basic ")))
-	if err != nil {
-		return false
-	}
-	username, password, found := strings.Cut(string(decoded), ":")
-	if !found || globalConfig.OAuthAdmin.Username == "" || globalConfig.OAuthAdmin.Password == "" {
-		return false
-	}
-	return constantTimeStringEqual(username, globalConfig.OAuthAdmin.Username) && constantTimeStringEqual(password, globalConfig.OAuthAdmin.Password)
-}
-
-func constantTimeStringEqual(left, right string) bool {
-	leftHash := sha256.Sum256([]byte(left))
-	rightHash := sha256.Sum256([]byte(right))
-	return subtle.ConstantTimeCompare(leftHash[:], rightHash[:]) == 1
 }
 
 func oauthReadState(root, key string) (string, error) {
@@ -4737,6 +4841,7 @@ type triggerConfig struct {
 }
 
 type scheduleJobConfig struct {
+	timeout     time.Duration
 	name        string
 	scriptPath  string
 	trigger     triggerConfig
@@ -4796,7 +4901,9 @@ func parseCronSchedule(expr string) (cronSchedule, error) {
 
 func parseCronField(field string, minValue, maxValue int, normalizeSunday bool) (cronField, bool, error) {
 	values := make(cronField)
-	isStar := field == "*"
+	// Cron's day/weekday combination uses AND when either field begins with *.
+	// This includes stepped wildcards such as */1 and */2.
+	isStar := strings.HasPrefix(field, "*")
 	for _, part := range strings.Split(field, ",") {
 		if part == "" {
 			return nil, false, fmt.Errorf("empty list item")
@@ -5525,8 +5632,11 @@ func legacyArrayItemsSchema(values []interface{}) map[string]interface{} {
 // Preserve server-observed request data, never user-supplied JS parameters.
 // Detached contexts have no response writer: getters work, but nyanSetCookie is a no-op.
 func readOnlyScriptRequestContext(source *gin.Context) *gin.Context {
-	if source == nil || source.Request == nil {
+	if source == nil {
 		return nil
+	}
+	if source.Request == nil {
+		return nyanMCPGinWithContext(nil, nyanMCPGinParent(source))
 	}
 	request := source.Request.Clone(source.Request.Context())
 	request.Body = nil
@@ -5544,6 +5654,7 @@ func setupGojaVMWithSnapshot(vm *goja.Runtime, snapshot *APIConfigSnapshot, ginC
 }
 
 func setupGojaVMForAPI(vm *goja.Runtime, snapshot *APIConfigSnapshot, apiName string, ginCtx *gin.Context) {
+	registerNyanMCP(vm, nyanMCPClient, context.Background(), "", "operation")
 	writerRoot := ""
 	if snapshot != nil {
 		writerRoot = snapshot.RootPath
@@ -5610,8 +5721,13 @@ func setupGojaVMForAPI(vm *goja.Runtime, snapshot *APIConfigSnapshot, apiName st
 	jsonAPIFunc := func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
 		data := call.Argument(1).String()
-		user := call.Argument(2).String()
-		pass := call.Argument(3).String()
+		var user, pass string
+		if len(call.Arguments) >= 3 {
+			user = call.Argument(2).String()
+		}
+		if len(call.Arguments) >= 4 {
+			pass = call.Argument(3).String()
+		}
 
 		var hdr map[string]string
 		if len(call.Arguments) >= 5 {
@@ -5951,14 +6067,7 @@ func javaScriptFileBaseDir(snapshot *APIConfigSnapshot) (string, error) {
 		return filepath.Abs(filepath.Dir(apiPath))
 	}
 	// Match the default api.json location used at startup when no config is loaded.
-	execDir, err := filepath.Abs(filepath.Dir(os.Args[0]))
-	if err != nil {
-		return "", err
-	}
-	if isTemporaryDirectory(execDir) {
-		return os.Getwd()
-	}
-	return execDir, nil
+	return executableBaseDir()
 }
 
 func newNyanGetFile(vm *goja.Runtime, filePath func(string) string) func(call goja.FunctionCall) goja.Value {
@@ -6036,16 +6145,10 @@ func handleJSONRPC(c *gin.Context) {
 	}
 
 	// 実行ディレクトリの取得
-	execDir, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	execDir, err := executableBaseDir()
 	if err != nil {
 		respondJSONRPCError(c, rpcReq.ID, -32603, "Internal error: cannot get execPath", err)
 		return
-	}
-	if isTemporaryDirectory(execDir) {
-		if execDir, err = os.Getwd(); err != nil {
-			respondJSONRPCError(c, rpcReq.ID, -32603, "Internal error: cannot get working directory", err)
-			return
-		}
 	}
 	execDir = apiBaseDir(execDir)
 
@@ -6255,6 +6358,26 @@ func respondJSONRPCError(c *gin.Context, id interface{}, code int, message strin
 	})
 }
 
+// writeMIMEBase64 writes RFC 2045 base64 with at most 76 characters per line.
+func writeMIMEBase64(w io.Writer, data []byte) error {
+	var line [78]byte
+	for len(data) > 0 {
+		size := min(len(data), 57)
+		encodedSize := base64.StdEncoding.EncodedLen(size)
+		base64.StdEncoding.Encode(line[:encodedSize], data[:size])
+		line[encodedSize], line[encodedSize+1] = '\r', '\n'
+		n, err := w.Write(line[:encodedSize+2])
+		if err != nil {
+			return err
+		}
+		if n != encodedSize+2 {
+			return io.ErrShortWrite
+		}
+		data = data[size:]
+	}
+	return nil
+}
+
 // sendMail は config.json の SMTP 設定でメールを送り、attachments があれば添付する。
 func sendMail(
 	to, cc, bcc []string, // 宛先
@@ -6321,10 +6444,13 @@ func sendMail(
 	}
 	partHdr.Set("Content-Transfer-Encoding", "base64")
 
-	bp, _ := mp.CreatePart(partHdr)
-	encBody := base64.NewEncoder(base64.StdEncoding, bp)
-	encBody.Write([]byte(body))
-	encBody.Close()
+	bp, err := mp.CreatePart(partHdr)
+	if err != nil {
+		return err
+	}
+	if err := writeMIMEBase64(bp, []byte(body)); err != nil {
+		return err
+	}
 
 	// 3-3 添付パート
 	for _, a := range attachments {
@@ -6345,12 +6471,17 @@ func sendMail(
 			fmt.Sprintf(`attachment; filename=%q`, a.FileName))
 		attHdr.Set("Content-Transfer-Encoding", "base64")
 
-		ap, _ := mp.CreatePart(attHdr)
-		encAtt := base64.NewEncoder(base64.StdEncoding, ap)
-		encAtt.Write(a.Data)
-		encAtt.Close()
+		ap, err := mp.CreatePart(attHdr)
+		if err != nil {
+			return err
+		}
+		if err := writeMIMEBase64(ap, a.Data); err != nil {
+			return err
+		}
 	}
-	mp.Close() // --boundary-- を書く
+	if err := mp.Close(); err != nil { // --boundary-- を書く
+		return err
+	}
 
 	serviceLog(slog.LevelDebug, "mail_message_prepared", "attachments", len(attachments), "bytes", msg.Len())
 
@@ -6365,6 +6496,7 @@ func sendMail(
 		if err != nil {
 			return err
 		}
+		defer conn.Close()
 		c, err := smtp.NewClient(conn, s.Host)
 		if err != nil {
 			return err
@@ -6382,7 +6514,10 @@ func sendMail(
 				return err
 			}
 		}
-		w, _ := c.Data()
+		w, err := c.Data()
+		if err != nil {
+			return err
+		}
 		if _, err := w.Write(msg.Bytes()); err != nil {
 			return err
 		}
@@ -6434,7 +6569,6 @@ type MCPOAuthConfig struct {
 	Authorize                   string `json:"authorize"`
 	Token                       string `json:"token"`
 	Register                    string `json:"register"`
-	AdminUser                   string `json:"adminUser,omitempty"`
 	VerifyAccess                string `json:"verifyAccess"`
 
 	// The state directory and supported scopes are derived while the complete
@@ -6442,6 +6576,42 @@ type MCPOAuthConfig struct {
 	// configuration.
 	StateDirectory string   `json:"-"`
 	Scopes         []string `json:"-"`
+}
+
+// Explicit zero disables the deadline; a nil value preserves the default.
+type scriptTimeoutDuration time.Duration
+
+func (duration *scriptTimeoutDuration) UnmarshalJSON(data []byte) error {
+	var raw interface{}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&raw); err != nil {
+		return err
+	}
+	value, err := parseScriptTimeout(raw, "oauthRuntime.timeout")
+	if err != nil {
+		return err
+	}
+	*duration = scriptTimeoutDuration(value)
+	return nil
+}
+
+func (duration scriptTimeoutDuration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(duration).String())
+}
+
+type MCPOAuthRuntimeConfig struct {
+	Timeout *scriptTimeoutDuration `json:"timeout,omitempty"`
+}
+
+func (mcp *MCPServerConfig) oauthTimeout() time.Duration {
+	if mcp != nil && mcp.OAuthRuntime != nil && mcp.OAuthRuntime.Timeout != nil {
+		return time.Duration(*mcp.OAuthRuntime.Timeout)
+	}
+	if globalConfig.MCPOAuthRuntime.Timeout != nil {
+		return time.Duration(*globalConfig.MCPOAuthRuntime.Timeout)
+	}
+	return 15 * time.Second
 }
 
 type MCPToolConfig struct {
@@ -6459,18 +6629,19 @@ type MCPToolConfig struct {
 // snapshot. Public paths come from API names and public URLs are derived from
 // each validated request; neither is duplicated in api.json.
 type MCPServerConfig struct {
-	Name                       string         `json:"-"`
-	SourcePath                 string         `json:"-"`
-	Type                       string         `json:"type"`
-	Transport                  string         `json:"transport"`
-	ProtocolVersions           []string       `json:"protocolVersions,omitempty"`
-	AllowedOrigins             []string       `json:"allowedOrigins"`
-	RedirectURIAllowedPrefixes []string       `json:"redirectURIAllowedPrefixes,omitempty"`
-	RateLimit                  *MCPRateLimit  `json:"rateLimit,omitempty"`
-	MaxConcurrent              int            `json:"maxConcurrent,omitempty"`
-	OAuth                      MCPOAuthConfig `json:"oauth,omitempty"`
-	ToolAPIs                   []string       `json:"tools"`
-	Instructions               string         `json:"instructions,omitempty"`
+	OAuthRuntime               *MCPOAuthRuntimeConfig `json:"oauthRuntime,omitempty"`
+	Name                       string                 `json:"-"`
+	SourcePath                 string                 `json:"-"`
+	Type                       string                 `json:"type"`
+	Transport                  string                 `json:"transport"`
+	ProtocolVersions           []string               `json:"protocolVersions,omitempty"`
+	AllowedOrigins             []string               `json:"allowedOrigins"`
+	RedirectURIAllowedPrefixes []string               `json:"redirectURIAllowedPrefixes,omitempty"`
+	RateLimit                  *MCPRateLimit          `json:"rateLimit,omitempty"`
+	MaxConcurrent              int                    `json:"maxConcurrent,omitempty"`
+	OAuth                      MCPOAuthConfig         `json:"oauth,omitempty"`
+	ToolAPIs                   []string               `json:"tools"`
+	Instructions               string                 `json:"instructions,omitempty"`
 
 	Path  string          `json:"-"`
 	Tools []MCPToolConfig `json:"-"`
@@ -6505,7 +6676,13 @@ func buildMCPServerConfigs(rootPath string, definitions map[string]interface{}, 
 	result := make(map[string]*MCPServerConfig)
 	for _, name := range sortedDefinitionNames(definitions) {
 		raw, ok := definitions[name].(map[string]interface{})
-		if !ok || getAPIType(raw) != apiTypeMCP {
+		if !ok {
+			continue
+		}
+		if getAPIType(raw) != apiTypeMCP {
+			if raw["oauthRuntime"] != nil {
+				return nil, fmt.Errorf("definition %q: oauthRuntime is only allowed for type:mcp", name)
+			}
 			continue
 		}
 		encoded, err := json.Marshal(raw)
@@ -6612,6 +6789,9 @@ func resolveAndValidateMCPConfig(mcp *MCPServerConfig, definitions map[string]in
 	}
 
 	oauthEnabled := mcpOAuthConfigured(mcp.OAuth)
+	if mcp.OAuthRuntime != nil && !oauthEnabled {
+		return fmt.Errorf("oauthRuntime requires oauth configuration")
+	}
 	if oauthEnabled && !httpEnabled {
 		return fmt.Errorf("oauth requires the streamable_http transport")
 	}
@@ -6783,7 +6963,7 @@ func isReservedNyanAPIName(apiName string) bool {
 }
 
 func mcpOAuthConfigured(config MCPOAuthConfig) bool {
-	return config.AuthorizationServerMetadata != "" || config.ProtectedResourceMetadata != "" || config.Authorize != "" || config.Token != "" || config.Register != "" || config.AdminUser != "" || config.VerifyAccess != ""
+	return config.AuthorizationServerMetadata != "" || config.ProtectedResourceMetadata != "" || config.Authorize != "" || config.Token != "" || config.Register != "" || config.VerifyAccess != ""
 }
 
 func resolveAndValidateMCPOAuthAPIs(mcp *MCPServerConfig, definitions map[string]interface{}) error {
@@ -6822,23 +7002,6 @@ func resolveAndValidateMCPOAuthAPIs(mcp *MCPServerConfig, definitions map[string
 			if info, err := os.Stat(getAPIString(entry, "script")); err != nil || !info.Mode().IsRegular() {
 				return fmt.Errorf("oauth.%s API %q must have a regular JavaScript file", label, apiName)
 			}
-		}
-	}
-	if mcp.OAuth.AdminUser != "" {
-		mcp.OAuth.AdminUser = strings.TrimSpace(mcp.OAuth.AdminUser)
-		apiName := mcp.OAuth.AdminUser
-		if _, err := canonicalAPIEndpointPath(apiName); err != nil {
-			return fmt.Errorf("oauth.adminUser: %w", err)
-		}
-		entry, ok := definitions[apiName].(map[string]interface{})
-		if !ok || getAPIType(entry) != apiTypeAPI {
-			return fmt.Errorf("oauth.adminUser references invalid API %q", apiName)
-		}
-		if info, err := os.Stat(getAPIString(entry, "script")); err != nil || !info.Mode().IsRegular() {
-			return fmt.Errorf("oauth.adminUser API %q must have a regular JavaScript file", apiName)
-		}
-		if previous, exists := seen[apiName]; exists {
-			return fmt.Errorf("oauth.adminUser and oauth.%s reference the same API %q", previous, apiName)
 		}
 	}
 	verifyDefinition, ok := definitions[mcp.OAuth.VerifyAccess].(map[string]interface{})
@@ -6935,9 +7098,6 @@ func mcpPublicOAuthAPINames(mcp *MCPServerConfig) []string {
 		mcp.OAuth.Token,
 		mcp.OAuth.Register,
 	}
-	if mcp.OAuth.AdminUser != "" {
-		result = append(result, mcp.OAuth.AdminUser)
-	}
 	return result
 }
 
@@ -7019,10 +7179,11 @@ type APIConfigSnapshot struct {
 }
 
 type APIFileState struct {
-	Path   string
-	Exists bool
-	Hash   [sha256.Size]byte
-	Error  string
+	Path     string // Configured path, retained so symlink replacements are observed.
+	Identity string // Resolved path, also used independently for include cycle detection.
+	Exists   bool
+	Hash     [sha256.Size]byte
+	Error    string
 }
 
 type apiConfigLoadResult struct {
@@ -7080,8 +7241,8 @@ func readAPIConfigFileAttempt(apiFilePath, apiBaseDir string) (*apiConfigLoadRes
 	if err != nil {
 		return nil, nil, err
 	}
-	identity, state, data, err := inspectAPIFile(normalizedPath)
-	discovered := map[string]APIFileState{identity: state}
+	_, state, data, err := inspectAPIFile(normalizedPath)
+	discovered := map[string]APIFileState{normalizedPath: state}
 	if err != nil {
 		return nil, discovered, fmt.Errorf("read api file %s: %w", normalizedPath, err)
 	}
@@ -7180,6 +7341,7 @@ type apiGraphLoader struct {
 	definitions map[string]interface{}
 	sources     map[string]string
 	fileStates  map[string]APIFileState
+	identities  map[string]APIFileState
 }
 
 func expandAPIFileGraph(rootPath string, rootData []byte) (map[string]interface{}, error) {
@@ -7205,6 +7367,7 @@ func expandAPIFileGraphWithMetadata(rootPath string, rootData []byte) (map[strin
 		definitions: make(map[string]interface{}),
 		sources:     make(map[string]string),
 		fileStates:  make(map[string]APIFileState),
+		identities:  make(map[string]APIFileState),
 	}
 	if err := loader.loadFile(normalizedRoot, rootIdentity, rootData, "", nil); err != nil {
 		return nil, nil, loader.fileStates, err
@@ -7217,7 +7380,9 @@ func (loader *apiGraphLoader) loadFile(filePath, identity string, data []byte, m
 		return includeCycleError(stack, filePath)
 	}
 	stack = append(stack, apiIncludeFrame{path: filePath, identity: identity})
-	loader.fileStates[identity] = APIFileState{Path: identity, Exists: true, Hash: sha256.Sum256(data)}
+	if err := loader.recordFileState(APIFileState{Path: filePath, Identity: identity, Exists: true, Hash: sha256.Sum256(data)}); err != nil {
+		return err
+	}
 	rawDefinitions, err := decodeRawAPIDefinitions(data)
 	if err != nil {
 		return fmt.Errorf("API file %s: %w", filePath, err)
@@ -7255,7 +7420,9 @@ func (loader *apiGraphLoader) loadFile(filePath, identity string, data []byte, m
 			return fmt.Errorf("include %q in %s: %w", name, filePath, err)
 		}
 		includeIdentity, includeState, includeData, err := inspectAPIFile(includePath)
-		loader.fileStates[includeIdentity] = includeState
+		if stateErr := loader.recordFileState(includeState); stateErr != nil {
+			return stateErr
+		}
 		if err != nil {
 			return fmt.Errorf("include %q in %s: %w", name, filePath, err)
 		}
@@ -7264,6 +7431,31 @@ func (loader *apiGraphLoader) loadFile(filePath, identity string, data []byte, m
 		}
 		if err := loader.loadFile(includePath, includeIdentity, includeData, joinAPIName(mountPrefix, name), stack); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// Every mount of a file must use the same generation. Keep the first observed
+// state on conflict, and mark it for retry even if the file is restored before
+// the next poll. Logical paths stay separate so symlink changes remain visible.
+func (loader *apiGraphLoader) recordFileState(state APIFileState) error {
+	previous, seen := loader.fileStates[state.Path]
+	changed := seen && previous != state
+	if !changed && state.Error == "" && state.Identity != "" {
+		if first, exists := loader.identities[state.Identity]; exists && first.Hash != state.Hash {
+			previous, changed = first, true
+		}
+	}
+	if changed {
+		previous.Error = "changed_during_load"
+		loader.fileStates[previous.Path] = previous
+		return fmt.Errorf("API file %s changed while the configuration was being loaded", state.Path)
+	}
+	loader.fileStates[state.Path] = state
+	if state.Error == "" && state.Identity != "" {
+		if _, exists := loader.identities[state.Identity]; !exists {
+			loader.identities[state.Identity] = state
 		}
 	}
 	return nil
@@ -7307,6 +7499,22 @@ func decodeAPIDefinition(name string, rawDefinition json.RawMessage, sourceDir s
 	var definition map[string]interface{}
 	if err := json.Unmarshal(rawDefinition, &definition); err != nil {
 		return nil, fmt.Errorf("decode api JSON: definition %q: %w", name, err)
+	}
+	for _, field := range []string{"runtime", "oauthRuntime"} {
+		if _, exists := definition[field]; !exists {
+			continue
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(rawDefinition, &fields); err != nil {
+			return nil, err
+		}
+		var value interface{}
+		decoder := json.NewDecoder(bytes.NewReader(fields[field]))
+		decoder.UseNumber()
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		definition[field] = value
 	}
 	if sourceDir == "" {
 		return definition, nil
@@ -7475,10 +7683,10 @@ func inspectAPIFile(path string) (string, APIFileState, []byte, error) {
 	}
 	data, err := os.ReadFile(normalizedPath)
 	if err != nil {
-		state := APIFileState{Path: identity, Exists: true, Error: "read_error"}
+		state := APIFileState{Path: normalizedPath, Identity: identity, Exists: true, Error: "read_error"}
 		return identity, state, nil, fmt.Errorf("file cannot be read: %s: %w", normalizedPath, err)
 	}
-	state := APIFileState{Path: identity, Exists: true, Hash: sha256.Sum256(data)}
+	state := APIFileState{Path: normalizedPath, Identity: identity, Exists: true, Hash: sha256.Sum256(data)}
 	return identity, state, data, nil
 }
 
@@ -7797,6 +8005,8 @@ func apiFileStatesFingerprint(states map[string]APIFileState) [sha256.Size]byte 
 		_, _ = hasher.Write([]byte{0})
 		_, _ = io.WriteString(hasher, state.Path)
 		_, _ = hasher.Write([]byte{0})
+		_, _ = io.WriteString(hasher, state.Identity)
+		_, _ = hasher.Write([]byte{0})
 		if state.Exists {
 			_, _ = hasher.Write([]byte{1})
 		} else {
@@ -7868,21 +8078,22 @@ func reloadAPIConfigGraphIfChanged(apiFilePath, apiBaseDir string, lastObservedS
 		return lastObservedStates, false, nil
 	}
 	loaded, discoveredStates, err := readAPIConfigFileAttempt(apiFilePath, apiBaseDir)
+	return finishAPIConfigReload(loaded, discoveredStates, err)
+}
+
+func finishAPIConfigReload(loaded *apiConfigLoadResult, discoveredStates map[string]APIFileState, err error) (map[string]APIFileState, bool, error) {
+	if err == nil {
+		err = verifyAPIFileStates(loaded.Snapshot.FileStates)
+	}
 	if err != nil {
 		var activeStates map[string]APIFileState
 		if snapshot := currentAPISnapshot(); snapshot != nil {
 			activeStates = snapshot.FileStates
 		}
-		watched := mergeAPIFileStates(activeStates, discoveredStates)
-		return observeAPIFileStates(watched), false, err
-	}
-	if err := verifyAPIFileStates(loaded.Snapshot.FileStates); err != nil {
-		var activeStates map[string]APIFileState
-		if snapshot := currentAPISnapshot(); snapshot != nil {
-			activeStates = snapshot.FileStates
-		}
-		watched := mergeAPIFileStates(activeStates, discoveredStates)
-		return observeAPIFileStates(watched), false, err
+		// Retain the candidate states actually read, including failures. Recording
+		// newer, unvalidated contents here would suppress the next reload attempt.
+		watched := mergeAPIFileStates(observeAPIFileStates(activeStates), discoveredStates)
+		return watched, false, err
 	}
 	configChanged := publishLoadedAPIConfig(loaded)
 	return cloneAPIFileStates(loaded.Snapshot.FileStates), configChanged, nil
@@ -7928,11 +8139,12 @@ type backgroundRuntimeManager struct {
 }
 
 type scheduleRuntime struct {
-	mu      sync.Mutex
-	desired *scheduleJobConfig
-	wake    chan struct{}
-	done    chan struct{}
-	stopped bool
+	mu        sync.Mutex
+	desired   *scheduleJobConfig
+	wake      chan struct{}
+	done      chan struct{}
+	stopped   bool
+	mcpCancel context.CancelFunc
 }
 
 type wsClientRuntime struct {
@@ -8021,11 +8233,108 @@ func (manager *backgroundRuntimeManager) runWSClient(name string, runtime *wsCli
 	manager.mu.Unlock()
 }
 
+// Only schedule definitions may opt into an execution deadline. Numeric values
+// retain their JSON spelling so exponent notation and overflow are not rounded.
+func parseScheduleTimeout(entry map[string]interface{}) (time.Duration, error) {
+	raw := entry["runtime"]
+	if raw == nil {
+		return 0, nil
+	}
+	settings, ok := raw.(map[string]interface{})
+	if !ok {
+		if getAPIType(entry) != apiTypeSchedule {
+			return 0, nil
+		}
+		return 0, errors.New("schedule runtime must be an object")
+	}
+	raw = settings["timeout"]
+	if raw == nil {
+		return 0, nil
+	}
+	if getAPIType(entry) != apiTypeSchedule {
+		return 0, errors.New("runtime.timeout is only allowed for type:schedule")
+	}
+	return parseScriptTimeout(raw, "runtime.timeout")
+}
+
+func parseScriptTimeout(raw interface{}, setting string) (time.Duration, error) {
+	var text string
+	switch value := raw.(type) {
+	case string:
+		text = strings.TrimSpace(value)
+	case json.Number:
+		text = value.String()
+	case float64:
+		text = strconv.FormatFloat(value, 'f', -1, 64)
+	default:
+		return 0, fmt.Errorf("%s requires seconds or a duration string", setting)
+	}
+	if text != "" && strings.Trim(text, "+-.0123456789") == "" {
+		text += "s"
+	}
+	duration, err := time.ParseDuration(text)
+	if err != nil || duration < 0 || strings.HasPrefix(text, "-") {
+		return 0, fmt.Errorf("%s requires non-negative seconds or a duration such as 5m or 0s (exponent notation is not supported)", setting)
+	}
+	if duration == 0 && strings.ContainsAny(text, "123456789") {
+		return 0, fmt.Errorf("%s must be zero or at least 1ns", setting)
+	}
+	return duration, nil
+}
+
+type scheduleScriptContextKey struct{}
+
+func scheduleScriptContext(ginCtx *gin.Context) context.Context {
+	ctx, _ := nyanMCPGinParent(ginCtx).Value(scheduleScriptContextKey{}).(context.Context)
+	return ctx
+}
+
+func interruptJavaScriptOnCancellation(ctx context.Context, vm *goja.Runtime) func() {
+	if ctx == nil {
+		return func() {}
+	}
+	if err := ctx.Err(); err != nil {
+		vm.Interrupt(err)
+		return vm.ClearInterrupt
+	}
+	finished, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-ctx.Done():
+			vm.Interrupt(ctx.Err())
+		case <-finished:
+		}
+	}()
+	return func() { close(finished); <-done; vm.ClearInterrupt() }
+}
+
+func runScheduleScriptWithSnapshot(snapshot *APIConfigSnapshot, job scheduleJobConfig, params map[string]interface{}, parent context.Context) (string, error) {
+	if job.timeout > 0 {
+		// Removing a job keeps the existing MCP cancellation behavior; it does
+		// not introduce a new cancellation rule for an already-running JS job.
+		ctx, cancel := context.WithTimeout(context.Background(), job.timeout)
+		defer cancel()
+		deadline, _ := ctx.Deadline()
+		mcpCtx, mcpCancel := context.WithDeadline(parent, deadline)
+		defer mcpCancel()
+		parent = context.WithValue(mcpCtx, scheduleScriptContextKey{}, ctx)
+	}
+	return runJavaScriptWithSnapshot(snapshot, job.scriptPath, params, nyanMCPGinWithContext(nil, parent))
+}
+
 func buildScheduleJobConfigs(files map[string]interface{}, execDir string) (map[string]scheduleJobConfig, error) {
 	configs := make(map[string]scheduleJobConfig)
 	for name, raw := range files {
 		entry, ok := raw.(map[string]interface{})
-		if !ok || getAPIType(entry) != apiTypeSchedule {
+		if !ok {
+			continue
+		}
+		timeout, err := parseScheduleTimeout(entry)
+		if err != nil {
+			return nil, fmt.Errorf("definition %q: %w", name, err)
+		}
+		if getAPIType(entry) != apiTypeSchedule {
 			continue
 		}
 		scriptPath := getAPIString(entry, "script")
@@ -8044,7 +8353,7 @@ func buildScheduleJobConfigs(files map[string]interface{}, execDir string) (map[
 		if err != nil {
 			return nil, fmt.Errorf("schedule %s: invalid script path %s: %w", name, scriptPath, err)
 		}
-		configs[name] = scheduleJobConfig{name: name, scriptPath: scriptAbs, trigger: trigger, description: getAPIString(entry, "description"), schedule: schedule}
+		configs[name] = scheduleJobConfig{name: name, scriptPath: scriptAbs, trigger: trigger, description: getAPIString(entry, "description"), schedule: schedule, timeout: timeout}
 	}
 	return configs, nil
 }
@@ -8087,7 +8396,7 @@ func sameScheduleTiming(a, b scheduleJobConfig) bool {
 }
 
 func sameScheduleJobConfig(a, b scheduleJobConfig) bool {
-	return sameScheduleTiming(a, b) && a.description == b.description
+	return sameScheduleTiming(a, b) && a.description == b.description && a.timeout == b.timeout
 }
 
 func signalRuntime(ch chan struct{}) {
@@ -8109,6 +8418,9 @@ func (runtime *scheduleRuntime) update(cfg *scheduleJobConfig) (bool, bool) {
 			return true, false
 		}
 		runtime.desired = nil
+		if runtime.mcpCancel != nil {
+			runtime.mcpCancel()
+		}
 		runtime.mu.Unlock()
 		signalRuntime(runtime.wake)
 		return true, true
@@ -8191,7 +8503,9 @@ func (runtime *scheduleRuntime) run() {
 			"nyan_schedule_time":         next.Format(time.RFC3339),
 			"nyan_schedule_description":  latest.description,
 		}
-		result, err := runJavaScriptWithSnapshot(snapshot, latest.scriptPath, allParams, nil)
+		mcpContext, mcpDone := runtime.beginMCPExecution()
+		result, err := runScheduleScriptWithSnapshot(snapshot, latest, allParams, mcpContext)
+		mcpDone()
 		if err != nil {
 			logServiceError(slog.LevelError, "schedule_failed", err, "job", latest.name)
 			continue
@@ -8634,4 +8948,1128 @@ func receiveLimitH2CHandler(next http.Handler, timeouts HTTPTimeoutsConfig) http
 		}
 		handler.ServeHTTP(w, r)
 	})
+}
+
+// BEGIN shared nyanCallMCP contract. Review contract changes across products.
+// SDK v1.7.0 owns protocol negotiation; raw responses are retained at the wire
+// boundary because typed SDK results can omit extension fields and explicit null.
+type nyanMCPToolPolicy struct {
+	ReadOnly bool `json:"readOnly"`
+}
+type nyanMCPConnectionConfig struct {
+	Transport        string                       `json:"transport"`
+	URL              string                       `json:"url,omitempty"`
+	Executable       string                       `json:"executable,omitempty"`
+	Args             []string                     `json:"args,omitempty"`
+	Directory        string                       `json:"directory,omitempty"`
+	EnvironmentFiles map[string]string            `json:"environmentFiles,omitempty"`
+	BearerTokenFile  string                       `json:"bearerTokenFile,omitempty"`
+	CredentialMode   string                       `json:"credentialMode"`
+	AllowedScripts   []string                     `json:"allowedScripts"`
+	Tools            map[string]nyanMCPToolPolicy `json:"tools"`
+	ProtocolVersions []string                     `json:"protocolVersions"`
+	AllowedCIDRs     []string                     `json:"allowedCIDRs,omitempty"`
+	AllowHTTP        bool                         `json:"allowHTTP,omitempty"`
+	AllowQLRead      bool                         `json:"allowQLRead,omitempty"`
+	TimeoutMs        int                          `json:"timeoutMs,omitempty"`
+	MaxTimeoutMs     int                          `json:"maxTimeoutMs,omitempty"`
+	MaxInputBytes    int                          `json:"maxInputBytes,omitempty"`
+	MaxResultBytes   int                          `json:"maxResultBytes,omitempty"`
+	MaxConcurrent    int                          `json:"maxConcurrent,omitempty"`
+}
+type nyanMCPConfig struct {
+	Connections map[string]nyanMCPConnectionConfig `json:"connections"`
+}
+
+// Validate the MCP section strictly without changing the decoding rules for
+// unrelated config.json settings. The limit applies only to this section.
+func (cfg *nyanMCPConfig) UnmarshalJSON(data []byte) error {
+	type configValue nyanMCPConfig
+	var value configValue
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if len(data) > 1<<20 || dec.Decode(&value) != nil || dec.Decode(new(any)) != io.EOF || value.Connections == nil || len(value.Connections) > 64 {
+		return errors.New("invalid config.json mcpClient; see README.md")
+	}
+	*cfg = nyanMCPConfig(value)
+	return nil
+}
+
+type nyanMCPEndpoint struct {
+	config   nyanMCPConnectionConfig
+	slots    chan struct{}
+	networks []*net.IPNet
+}
+type nyanMCPManager struct {
+	endpoints map[string]*nyanMCPEndpoint
+	context   context.Context
+	cancel    context.CancelFunc
+	slots     chan struct{}
+}
+
+func newNyanMCPManager() *nyanMCPManager {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &nyanMCPManager{endpoints: map[string]*nyanMCPEndpoint{}, context: ctx, cancel: cancel, slots: make(chan struct{}, 32)}
+}
+
+// Enabled only when MCP is configured. Cancel in-flight MCP I/O, then restore
+// the application's original signal termination behaviour (no persistent daemon).
+func watchNyanMCPShutdown(manager *nyanMCPManager) {
+	if len(manager.endpoints) == 0 {
+		return
+	}
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-signals
+		manager.cancel()
+		deadline := time.NewTimer(2 * time.Second)
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer deadline.Stop()
+		defer ticker.Stop()
+	wait:
+		for len(manager.slots) > 0 {
+			select {
+			case <-ticker.C:
+			case <-deadline.C:
+				break wait
+			}
+		}
+		signal.Stop(signals)
+		signal.Reset(sig)
+		// Windows cannot deliver os.Interrupt back to the current process.
+		if runtime.GOOS == "windows" {
+			os.Exit(130)
+		}
+		process, err := os.FindProcess(os.Getpid())
+		if err == nil {
+			_ = process.Signal(sig)
+		}
+	}()
+}
+
+var nyanMCPClient = newNyanMCPManager()
+var nyanMCPSequence atomic.Uint64
+
+type nyanMCPError struct {
+	Code           string
+	ExecutionState string
+	RPCCode        int64
+	HTTPStatus     int
+}
+
+func (e *nyanMCPError) Error() string { return "nyanCallMCP: " + e.Code }
+func nyanMCPFailure(code string) *nyanMCPError {
+	return &nyanMCPError{Code: code, ExecutionState: "not_sent"}
+}
+
+func loadNyanMCPConfig(cfg *nyanMCPConfig) (*nyanMCPManager, error) {
+	manager := newNyanMCPManager()
+	if cfg == nil {
+		return manager, nil
+	}
+	fail := func() (*nyanMCPManager, error) {
+		manager.cancel()
+		return nil, errors.New("invalid config.json mcpClient; see README.md")
+	}
+	if cfg.Connections == nil || len(cfg.Connections) > 64 {
+		return fail()
+	}
+	for id, c := range cfg.Connections {
+		if !regexp.MustCompile(`^[A-Za-z0-9_-]{1,80}$`).MatchString(id) || c.CredentialMode != "service" || len(c.Tools) == 0 || len(c.Tools) > 256 || len(c.AllowedScripts) == 0 || len(c.ProtocolVersions) == 0 {
+			return fail()
+		}
+		if c.TimeoutMs == 0 {
+			c.TimeoutMs = 30000
+		}
+		if c.MaxTimeoutMs == 0 {
+			c.MaxTimeoutMs = 120000
+		}
+		if c.MaxInputBytes == 0 {
+			c.MaxInputBytes = 1 << 20
+		}
+		if c.MaxResultBytes == 0 {
+			c.MaxResultBytes = 8 << 20
+		}
+		if c.MaxConcurrent == 0 {
+			c.MaxConcurrent = 4
+		}
+		if c.TimeoutMs < 1 || c.TimeoutMs > c.MaxTimeoutMs || c.MaxTimeoutMs > 120000 || c.MaxInputBytes < 1 || c.MaxInputBytes > 1<<20 || c.MaxResultBytes < 256 || c.MaxResultBytes > 8<<20 || c.MaxConcurrent < 1 || c.MaxConcurrent > 32 {
+			return fail()
+		}
+		for name := range c.Tools {
+			if name == "" || len(name) > 128 {
+				return fail()
+			}
+		}
+		for _, version := range c.ProtocolVersions {
+			if version != "2026-07-28" && version != "2025-06-18" {
+				return fail()
+			}
+		}
+		for i, script := range c.AllowedScripts {
+			if !filepath.IsAbs(script) {
+				return fail()
+			}
+			canonical, err := filepath.EvalSymlinks(script)
+			if err != nil {
+				return fail()
+			}
+			info, err := os.Stat(canonical)
+			if err != nil || !info.Mode().IsRegular() {
+				return fail()
+			}
+			c.AllowedScripts[i] = canonical
+		}
+		endpoint := &nyanMCPEndpoint{slots: make(chan struct{}, c.MaxConcurrent)}
+		for _, cidr := range c.AllowedCIDRs {
+			_, network, err := net.ParseCIDR(cidr)
+			if err != nil {
+				return fail()
+			}
+			endpoint.networks = append(endpoint.networks, network)
+		}
+		switch c.Transport {
+		case "streamable_http":
+			u, err := url.Parse(c.URL)
+			if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" || u.RawQuery != "" || (u.Scheme != "https" && !(u.Scheme == "http" && c.AllowHTTP)) || c.Executable != "" || len(c.Args) > 0 || c.Directory != "" || len(c.EnvironmentFiles) > 0 {
+				return fail()
+			}
+			if c.BearerTokenFile != "" {
+				if _, err := nyanMCPSecret(c.BearerTokenFile); err != nil {
+					return fail()
+				}
+			}
+		case "stdio":
+			if c.URL != "" || c.BearerTokenFile != "" || c.AllowHTTP || len(c.AllowedCIDRs) > 0 || !filepath.IsAbs(c.Executable) || !filepath.IsAbs(c.Directory) {
+				return fail()
+			}
+			executable, err := filepath.EvalSymlinks(c.Executable)
+			if err != nil {
+				return fail()
+			}
+			c.Executable = executable
+			info, err := os.Stat(executable)
+			if err != nil || !info.Mode().IsRegular() {
+				return fail()
+			}
+			if runtime.GOOS != "windows" && (info.Mode()&0111 == 0 || info.Mode().Perm()&0022 != 0) {
+				return fail()
+			}
+			if runtime.GOOS == "windows" && !strings.EqualFold(filepath.Ext(executable), ".exe") {
+				return fail()
+			}
+			switch strings.TrimSuffix(strings.ToLower(filepath.Base(executable)), ".exe") {
+			case "sh", "bash", "zsh", "fish", "cmd", "cmd.exe", "powershell", "pwsh", "npx", "npm", "yarn", "pnpm", "go", "python", "python3", "node", "ruby", "perl", "env", "osascript":
+				return fail()
+			}
+			if info, err := os.Stat(c.Directory); err != nil || !info.IsDir() {
+				return fail()
+			}
+			if len(c.Args) > 64 || len(c.EnvironmentFiles) > 32 {
+				return fail()
+			}
+			for key, file := range c.EnvironmentFiles {
+				if !regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`).MatchString(key) || strings.HasPrefix(key, "LD_") || strings.HasPrefix(key, "DYLD_") || key == "PATH" || key == "HOME" || key == "NODE_OPTIONS" || key == "PYTHONPATH" {
+					return fail()
+				}
+				if _, err := nyanMCPSecret(file); err != nil {
+					return fail()
+				}
+			}
+		default:
+			return fail()
+		}
+		endpoint.config = c
+		manager.endpoints[id] = endpoint
+	}
+	return manager, nil
+}
+
+// Windows file access is enforced by the OS without inspecting ACLs. On Unix,
+// retain the requirement that credentials have no group or other permissions.
+func nyanMCPSecret(path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		return "", nyanMCPFailure("AUTH_REQUIRED")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", nyanMCPFailure("AUTH_REQUIRED")
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return "", nyanMCPFailure("AUTH_REQUIRED")
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0 {
+		return "", nyanMCPFailure("AUTH_REQUIRED")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, 8193))
+	token := strings.TrimSuffix(string(data), "\n")
+	if err != nil || len(data) > 8192 || token == "" || strings.ContainsAny(token, "\x00\r\n") {
+		return "", nyanMCPFailure("AUTH_REQUIRED")
+	}
+	return token, nil
+}
+
+func (e *nyanMCPEndpoint) permitsIP(ip net.IP) bool {
+	// Metadata and link-local addresses are never enabled by a broad private CIDR.
+	if ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.Equal(net.ParseIP("100.100.100.200")) {
+		return false
+	}
+	if len(e.networks) > 0 {
+		for _, network := range e.networks {
+			if network.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() {
+		return false
+	}
+	for _, cidr := range []string{"100.64.0.0/10", "192.0.0.0/24", "198.18.0.0/15", "240.0.0.0/4", "2002::/16", "2001::/32", "64:ff9b::/96", "64:ff9b:1::/48"} {
+		_, network, _ := net.ParseCIDR(cidr)
+		if network.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+// One isolated session per call; no cache, queue, retry or credential sharing.
+type nyanMCPWire struct {
+	mu        sync.Mutex
+	callID    string
+	currentID string
+	rpcCode   int64
+	raw       json.RawMessage
+	sent      bool
+	failure   *nyanMCPError
+}
+
+func (w *nyanMCPWire) outgoing(data []byte) error {
+	var req struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+	}
+	if json.Unmarshal(data, &req) != nil || len(req.ID) == 0 {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if req.Method == "tools/call" {
+		if w.sent {
+			return nyanMCPFailure("RETRY_FORBIDDEN")
+		}
+		w.callID = string(req.ID)
+		w.sent = true
+	}
+	w.currentID = string(req.ID)
+	w.rpcCode = 0
+	w.failure = nil
+	return nil
+}
+func (w *nyanMCPWire) incoming(data []byte) {
+	message, err := mcpjsonrpc.DecodeMessage(data)
+	if err != nil {
+		return
+	}
+	response, ok := message.(*mcpjsonrpc.Response)
+	if !ok {
+		return
+	}
+	encodedID, _ := json.Marshal(response.ID.Raw())
+	id := string(encodedID)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if id == w.currentID {
+		var rpc *mcpjsonrpc.Error
+		if errors.As(response.Error, &rpc) {
+			w.rpcCode = rpc.Code
+		}
+	}
+	if id == w.callID && w.callID != "" && len(w.raw) == 0 && response.Error == nil {
+		w.raw = append(json.RawMessage(nil), response.Result...)
+	}
+}
+func (w *nyanMCPWire) setFailure(err *nyanMCPError) {
+	w.mu.Lock()
+	if w.failure == nil {
+		w.failure = err
+	}
+	w.mu.Unlock()
+}
+func (w *nyanMCPWire) classify(ctx context.Context, err error) *nyanMCPError {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := nyanMCPFailure("TRANSPORT")
+	var own *nyanMCPError
+	if errors.As(err, &own) {
+		*out = *own
+	} else if w.rpcCode != 0 {
+		out.Code = "MCP_RPC"
+		out.RPCCode = w.rpcCode
+		if w.rpcCode == mcpsdk.CodeUnsupportedProtocolVersion {
+			out.Code = "PROTOCOL_VERSION"
+		}
+	}
+	// SDK v1.7.0 does not export its legacy unsupported-version error type.
+	if err != nil && strings.HasPrefix(err.Error(), "unsupported protocol version:") {
+		out.Code = "PROTOCOL_VERSION"
+	}
+	if w.failure != nil {
+		*out = *w.failure
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		out.Code = "TIMEOUT"
+	} else if ctx.Err() != nil {
+		out.Code = "CANCELLED"
+	}
+	if w.sent {
+		out.ExecutionState = "unknown"
+	}
+	return out
+}
+
+type nyanMCPHTTP struct {
+	base        *http.Transport
+	endpoint    *nyanMCPEndpoint
+	wire        *nyanMCPWire
+	token       string
+	callContext context.Context
+}
+
+func (t *nyanMCPHTTP) RoundTrip(request *http.Request) (*http.Response, error) {
+	target, _ := url.Parse(t.endpoint.config.URL)
+	if request.URL.Scheme != target.Scheme || request.URL.Host != target.Host || request.URL.EscapedPath() != target.EscapedPath() || request.URL.RawQuery != "" {
+		return nil, nyanMCPFailure("TRANSPORT")
+	}
+	// The SDK detaches session-close DELETE requests from the Connect context.
+	// Bind every exchange, including response-body reads, to the whole call while
+	// retaining the SDK request's context values and its own cancellation.
+	ctx, cancel := context.WithCancel(request.Context())
+	defer cancel()
+	stopCallCancel := context.AfterFunc(t.callContext, cancel)
+	defer stopCallCancel()
+	if err := t.callContext.Err(); err != nil {
+		return nil, err
+	}
+	// SDK builds all requests. Ignore environment proxies and never forward inbound headers.
+	request = request.Clone(ctx)
+	if request.GetBody != nil {
+		body, err := request.GetBody()
+		if err != nil {
+			return nil, err
+		}
+		data, err := io.ReadAll(io.LimitReader(body, int64(t.endpoint.config.MaxInputBytes)+(64<<10)))
+		body.Close()
+		if err != nil {
+			return nil, err
+		}
+		if err := t.wire.outgoing(data); err != nil {
+			return nil, err
+		}
+	}
+	if t.token != "" {
+		request.Header.Set("Authorization", "Bearer "+t.token)
+	}
+	response, err := t.base.RoundTrip(request)
+	if err != nil {
+		failure := nyanMCPFailure("TRANSPORT")
+		var own *nyanMCPError
+		if errors.As(err, &own) {
+			*failure = *own
+		}
+		t.wire.setFailure(failure)
+		return nil, err
+	}
+	// Bound the decompressed JSON/SSE response before SDK decoding. SSE is buffered
+	// until the response stream completes; progress is deliberately not exposed.
+	data, err := io.ReadAll(io.LimitReader(response.Body, int64(t.endpoint.config.MaxResultBytes)+1))
+	response.Body.Close()
+	if len(data) > t.endpoint.config.MaxResultBytes {
+		e := nyanMCPFailure("RESULT_TOO_LARGE")
+		t.wire.setFailure(e)
+		return nil, e
+	}
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		code := "TRANSPORT"
+		if response.StatusCode == 401 || response.StatusCode == 403 {
+			code = "AUTH_REQUIRED"
+		}
+		failure := nyanMCPFailure(code)
+		failure.HTTPStatus = response.StatusCode
+		// Preserve JSON-RPC error codes even when delivered with HTTP 400/500.
+		if message, decodeErr := mcpjsonrpc.DecodeMessage(data); decodeErr == nil {
+			if rpcResponse, ok := message.(*mcpjsonrpc.Response); ok {
+				var rpcError *mcpjsonrpc.Error
+				if errors.As(rpcResponse.Error, &rpcError) {
+					failure.Code = "MCP_RPC"
+					failure.RPCCode = rpcError.Code
+				}
+			}
+		}
+		t.wire.mu.Lock()
+		sent := t.wire.sent
+		t.wire.mu.Unlock()
+		if sent || response.StatusCode == 401 || response.StatusCode == 403 {
+			t.wire.setFailure(failure)
+		}
+	}
+	mediaType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
+	if mediaType == "text/event-stream" {
+		// SSE data fields can span lines; comments and notifications are not results.
+		var event strings.Builder
+		eventName := ""
+		for _, line := range strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n") {
+			if line == "" {
+				if event.Len() > 0 && (eventName == "" || eventName == "message") {
+					t.wire.incoming([]byte(strings.TrimSuffix(event.String(), "\n")))
+				}
+				event.Reset()
+				eventName = ""
+				continue
+			}
+			if strings.HasPrefix(line, "event:") {
+				eventName = strings.TrimPrefix(strings.TrimPrefix(line, "event:"), " ")
+			}
+			if strings.HasPrefix(line, "data:") {
+				event.WriteString(strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+				event.WriteByte('\n')
+			}
+		}
+	} else {
+		t.wire.incoming(data)
+	}
+	response.Body = io.NopCloser(bytes.NewReader(data))
+	return response, nil
+}
+
+// Bounded newline reader prevents the SDK from allocating an unbounded stdio frame.
+type nyanMCPLineReader struct {
+	source    io.ReadCloser
+	scan      *bufio.Scanner
+	pending   []byte
+	wire      *nyanMCPWire
+	remaining int
+}
+
+func (r *nyanMCPLineReader) Read(p []byte) (int, error) {
+	if len(r.pending) == 0 {
+		if !r.scan.Scan() {
+			if r.scan.Err() != nil {
+				code := "TRANSPORT"
+				if errors.Is(r.scan.Err(), bufio.ErrTooLong) {
+					code = "RESULT_TOO_LARGE"
+				}
+				e := nyanMCPFailure(code)
+				r.wire.setFailure(e)
+				return 0, e
+			}
+			return 0, io.EOF
+		}
+		line := r.scan.Bytes()
+		r.remaining -= len(line)
+		if r.remaining < 0 {
+			e := nyanMCPFailure("RESULT_TOO_LARGE")
+			r.wire.setFailure(e)
+			return 0, e
+		}
+		r.wire.incoming(line)
+		r.pending = append(append([]byte(nil), line...), '\n')
+	}
+	n := copy(p, r.pending)
+	r.pending = r.pending[n:]
+	return n, nil
+}
+func (r *nyanMCPLineReader) Close() error { return r.source.Close() }
+
+type nyanMCPWriter struct {
+	io.WriteCloser
+	wire *nyanMCPWire
+}
+
+func (w *nyanMCPWriter) Write(p []byte) (int, error) {
+	if err := w.wire.outgoing(bytes.TrimSpace(p)); err != nil {
+		return 0, err
+	}
+	return w.WriteCloser.Write(p)
+}
+
+func (e *nyanMCPEndpoint) transport(ctx context.Context, wire *nyanMCPWire) (mcpsdk.Transport, func(), error) {
+	c := e.config
+	if c.Transport == "streamable_http" {
+		token := ""
+		var err error
+		if c.BearerTokenFile != "" {
+			token, err = nyanMCPSecret(c.BearerTokenFile)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		target, _ := url.Parse(c.URL)
+		base := &http.Transport{Proxy: nil, ForceAttemptHTTP2: true, MaxResponseHeaderBytes: 32 << 10, TLSHandshakeTimeout: 5 * time.Second, ResponseHeaderTimeout: time.Duration(c.MaxTimeoutMs) * time.Millisecond, IdleConnTimeout: time.Second, DisableKeepAlives: true}
+		base.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil || host != target.Hostname() {
+				return nil, nyanMCPFailure("TRANSPORT")
+			}
+			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			if len(ips) == 0 {
+				return nil, nyanMCPFailure("TRANSPORT")
+			}
+			for _, ip := range ips {
+				if !e.permitsIP(ip.IP) {
+					return nil, nyanMCPFailure("CONNECTION_NOT_ALLOWED")
+				}
+			}
+			dialer := net.Dialer{Timeout: 5 * time.Second}
+			// Dial the verified literal IP, avoiding a second DNS lookup (rebinding).
+			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+		}
+		client := &http.Client{Transport: &nyanMCPHTTP{base: base, endpoint: e, wire: wire, token: token, callContext: ctx}, Timeout: time.Duration(c.MaxTimeoutMs) * time.Millisecond, CheckRedirect: func(*http.Request, []*http.Request) error { return nyanMCPFailure("TRANSPORT") }}
+		return &mcpsdk.StreamableClientTransport{Endpoint: c.URL, HTTPClient: client, MaxRetries: -1, DisableStandaloneSSE: true}, base.CloseIdleConnections, nil
+	}
+	cmd := exec.CommandContext(ctx, c.Executable, c.Args...)
+	cmd.Dir = c.Directory
+	cmd.Env = []string{}
+	cmd.Stderr = io.Discard
+	cmd.WaitDelay = 250 * time.Millisecond
+	cmd.SysProcAttr = &syscall.SysProcAttr{}
+	group := reflect.ValueOf(cmd.SysProcAttr).Elem().FieldByName("Setpgid")
+	if group.IsValid() && group.CanSet() {
+		group.SetBool(true)
+	}
+	kill := func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		if group.IsValid() {
+			if process, err := os.FindProcess(-cmd.Process.Pid); err == nil {
+				_ = process.Signal(syscall.SIGKILL)
+			}
+		}
+		return cmd.Process.Kill()
+	}
+	cmd.Cancel = kill
+	for key, file := range c.EnvironmentFiles {
+		value, err := nyanMCPSecret(file)
+		if err != nil {
+			return nil, nil, err
+		}
+		cmd.Env = append(cmd.Env, key+"="+value)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		stdout.Close()
+		return nil, nil, err
+	}
+	if err = cmd.Start(); err != nil {
+		stdout.Close()
+		stdin.Close()
+		return nil, nil, err
+	}
+	scan := bufio.NewScanner(stdout)
+	scan.Buffer(make([]byte, 4096), c.MaxResultBytes+1)
+	reader := &nyanMCPLineReader{source: stdout, scan: scan, wire: wire, remaining: 4 * c.MaxResultBytes}
+	cleanup := func() {
+		stdin.Close()
+		stdout.Close()
+		if cmd.Process != nil {
+			_ = kill()
+		}
+		_ = cmd.Wait()
+	}
+	return &mcpsdk.IOTransport{Reader: reader, Writer: &nyanMCPWriter{WriteCloser: stdin, wire: wire}}, cleanup, nil
+}
+
+type nyanMCPNoExternalSchema struct{}
+
+func (nyanMCPNoExternalSchema) Load(string) (any, error) {
+	return nil, errors.New("external schema references disabled")
+}
+func nyanMCPSchema(schema any, value any) error {
+	compiler := jsonschema.NewCompiler()
+	compiler.DefaultDraft(jsonschema.Draft2020)
+	compiler.UseLoader(nyanMCPNoExternalSchema{})
+	if err := compiler.AddResource("urn:nyan:mcp:schema", schema); err != nil {
+		return err
+	}
+	compiled, err := compiler.Compile("urn:nyan:mcp:schema")
+	if err != nil {
+		return err
+	}
+	return compiled.Validate(value)
+}
+func nyanMCPDecode(data []byte) (any, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var value any
+	if err := dec.Decode(&value); err != nil {
+		return nil, nyanMCPFailure("UNSUPPORTED_RESULT")
+	}
+	if dec.Decode(new(any)) != io.EOF {
+		return nil, nyanMCPFailure("UNSUPPORTED_RESULT")
+	}
+	count := 0
+	var walk func(any, int) error
+	walk = func(v any, depth int) error {
+		count++
+		if depth > 64 || count > 100000 {
+			return nyanMCPFailure("RESULT_TOO_LARGE")
+		}
+		switch v := v.(type) {
+		case json.Number:
+			number, err := strconv.ParseFloat(string(v), 64)
+			if err != nil || math.IsInf(number, 0) || math.IsNaN(number) || math.Abs(number) > 9007199254740991 {
+				return nyanMCPFailure("NUMBER_RANGE")
+			}
+		case map[string]any:
+			for _, child := range v {
+				if err := walk(child, depth+1); err != nil {
+					return err
+				}
+			}
+		case []any:
+			for _, child := range v {
+				if err := walk(child, depth+1); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := walk(value, 0); err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+type nyanMCPModeKey struct{}
+type nyanMCPCorrelationKey struct{}
+
+type nyanMCPCall struct {
+	Connection string         `json:"connection"`
+	Tool       string         `json:"tool"`
+	Arguments  map[string]any `json:"arguments"`
+	Options    struct {
+		TimeoutMs int `json:"timeoutMs"`
+	} `json:"options"`
+}
+
+func (m *nyanMCPManager) call(parent context.Context, caller, mode string, data []byte) (result []byte, failure *nyanMCPError) {
+	if inherited, ok := parent.Value(nyanMCPModeKey{}).(string); ok && (inherited == "ql" || inherited == "render") {
+		mode = inherited
+	}
+	req := nyanMCPCall{}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	dec.UseNumber()
+	if dec.Decode(&req) != nil || req.Connection == "" || req.Tool == "" {
+		return nil, nyanMCPFailure("INVALID_ARGUMENT")
+	}
+	endpoint := m.endpoints[req.Connection]
+	if endpoint == nil {
+		return nil, nyanMCPFailure("CONNECTION_NOT_ALLOWED")
+	}
+	c := endpoint.config
+	if len(data) > c.MaxInputBytes {
+		return nil, nyanMCPFailure("INVALID_ARGUMENT")
+	}
+	absoluteCaller, err := filepath.Abs(caller)
+	if err != nil {
+		return nil, nyanMCPFailure("CALLER_NOT_ALLOWED")
+	}
+	canonical, err := filepath.EvalSymlinks(absoluteCaller)
+	if err != nil {
+		return nil, nyanMCPFailure("CALLER_NOT_ALLOWED")
+	}
+	allowed := false
+	for _, script := range c.AllowedScripts {
+		if script == canonical {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return nil, nyanMCPFailure("CALLER_NOT_ALLOWED")
+	}
+	policy, ok := c.Tools[req.Tool]
+	if !ok {
+		return nil, nyanMCPFailure("TOOL_NOT_ALLOWED")
+	}
+	if mode == "ql" && (!c.AllowQLRead || !policy.ReadOnly) {
+		return nil, nyanMCPFailure("QL_TRANSACTION")
+	}
+	if mode == "render" && !policy.ReadOnly {
+		return nil, nyanMCPFailure("RENDER_WRITE_FORBIDDEN")
+	}
+	timeout := c.TimeoutMs
+	if req.Options.TimeoutMs != 0 {
+		timeout = req.Options.TimeoutMs
+	}
+	if timeout < 1 || timeout > c.MaxTimeoutMs {
+		return nil, nyanMCPFailure("INVALID_ARGUMENT")
+	}
+	if mode == "ql" && timeout > 3000 {
+		timeout = 3000
+	}
+	ctx, cancel := context.WithTimeout(parent, time.Duration(timeout)*time.Millisecond)
+	defer cancel()
+	stopApplicationCancel := context.AfterFunc(m.context, cancel)
+	defer stopApplicationCancel()
+	if m.context.Err() != nil {
+		cancel()
+	}
+	if ctx.Err() != nil {
+		return nil, (&nyanMCPWire{}).classify(ctx, ctx.Err())
+	}
+	select {
+	case m.slots <- struct{}{}:
+		defer func() { <-m.slots }()
+	default:
+		return nil, nyanMCPFailure("BUSY")
+	}
+	select {
+	case endpoint.slots <- struct{}{}:
+		defer func() { <-endpoint.slots }()
+	default:
+		return nil, nyanMCPFailure("BUSY")
+	}
+	wire := &nyanMCPWire{}
+	version := ""
+	started := time.Now()
+	defer func() {
+		code := "RESULT"
+		state := "unknown"
+		if failure != nil {
+			code = failure.Code
+			state = failure.ExecutionState
+		}
+		serviceLog(slog.LevelInfo, "mcp_client_audit", "correlation_id", parent.Value(nyanMCPCorrelationKey{}), "product", nyanMCPProduct, "connection", req.Connection, "tool", req.Tool, "caller", canonical, "protocol", version, "code", code, "execution_state", state, "elapsed_ms", time.Since(started).Milliseconds())
+	}()
+	transport, cleanup, err := endpoint.transport(ctx, wire)
+	if err != nil {
+		return nil, wire.classify(ctx, err)
+	}
+	defer cleanup()
+	client := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "nyanCallMCP", Version: "1"}, &mcpsdk.ClientOptions{MultiRoundTrip: &mcpsdk.MultiRoundTripOptions{Disabled: true}, Capabilities: &mcpsdk.ClientCapabilities{}, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	session, err := client.Connect(ctx, transport, nil)
+	if err != nil {
+		return nil, wire.classify(ctx, err)
+	}
+	defer session.Close()
+	version = session.InitializeResult().ProtocolVersion
+	allowed = false
+	for _, v := range c.ProtocolVersions {
+		if v == version {
+			allowed = true
+		}
+	}
+	if !allowed {
+		return nil, nyanMCPFailure("PROTOCOL_VERSION")
+	}
+	// Fresh list per isolated authentication/session. Reject duplicates and loops.
+	var tool *mcpsdk.Tool
+	cursor := ""
+	seen := map[string]bool{}
+	names := map[string]bool{}
+	for page := 0; ; page++ {
+		if page >= 32 {
+			return nil, nyanMCPFailure("UNSUPPORTED_RESULT")
+		}
+		list, err := session.ListTools(ctx, &mcpsdk.ListToolsParams{Cursor: cursor})
+		if err != nil {
+			return nil, wire.classify(ctx, err)
+		}
+		for _, candidate := range list.Tools {
+			if candidate == nil || names[candidate.Name] || len(names) >= 4096 {
+				return nil, nyanMCPFailure("UNSUPPORTED_RESULT")
+			}
+			names[candidate.Name] = true
+			if candidate.Name == req.Tool {
+				tool = candidate
+			}
+		}
+		cursor = list.NextCursor
+		if cursor == "" {
+			break
+		}
+		if seen[cursor] {
+			return nil, nyanMCPFailure("UNSUPPORTED_RESULT")
+		}
+		seen[cursor] = true
+	}
+	if tool == nil {
+		return nil, nyanMCPFailure("TOOL_NOT_ALLOWED")
+	}
+	if req.Arguments == nil {
+		req.Arguments = map[string]any{}
+	}
+	if tool.InputSchema == nil || nyanMCPSchema(tool.InputSchema, req.Arguments) != nil {
+		return nil, nyanMCPFailure("INPUT_SCHEMA")
+	}
+	_, err = session.CallTool(ctx, &mcpsdk.CallToolParams{Name: req.Tool, Arguments: req.Arguments})
+	if err != nil {
+		wire.mu.Lock()
+		hasResult := len(wire.raw) > 0
+		wire.mu.Unlock()
+		if hasResult {
+			return nil, wire.classify(ctx, nyanMCPFailure("UNSUPPORTED_RESULT"))
+		}
+		return nil, wire.classify(ctx, err)
+	}
+	wire.mu.Lock()
+	raw := append([]byte(nil), wire.raw...)
+	wire.mu.Unlock()
+	parsed, err := nyanMCPDecode(raw)
+	if err != nil {
+		return nil, wire.classify(ctx, err)
+	}
+	object, ok := parsed.(map[string]any)
+	if !ok {
+		return nil, wire.classify(ctx, nyanMCPFailure("UNSUPPORTED_RESULT"))
+	}
+	resultType, _ := object["resultType"].(string)
+	if rt, present := object["resultType"]; present && rt != "complete" && rt != "input_required" {
+		return nil, wire.classify(ctx, nyanMCPFailure("UNSUPPORTED_RESULT"))
+	}
+	isError := false
+	if v, present := object["isError"]; present {
+		var valid bool
+		isError, valid = v.(bool)
+		if !valid {
+			return nil, wire.classify(ctx, nyanMCPFailure("UNSUPPORTED_RESULT"))
+		}
+	}
+	if resultType == "input_required" {
+		_, validRequests := object["inputRequests"].(map[string]any)
+		if !validRequests {
+			return nil, wire.classify(ctx, nyanMCPFailure("UNSUPPORTED_RESULT"))
+		}
+		if version != "2026-07-28" {
+			return nil, wire.classify(ctx, nyanMCPFailure("UNSUPPORTED_RESULT"))
+		}
+		return raw, nil
+	}
+	content, ok := object["content"].([]any)
+	if !ok {
+		return nil, wire.classify(ctx, nyanMCPFailure("UNSUPPORTED_RESULT"))
+	}
+	for _, entry := range content {
+		block, ok := entry.(map[string]any)
+		if !ok || !nyanMCPContentValid(block) {
+			return nil, wire.classify(ctx, nyanMCPFailure("UNSUPPORTED_RESULT"))
+		}
+	}
+	structured, present := object["structuredContent"]
+	if present && version == "2025-06-18" {
+		if _, ok := structured.(map[string]any); !ok {
+			return nil, wire.classify(ctx, nyanMCPFailure("UNSUPPORTED_RESULT"))
+		}
+	}
+	if !isError && tool.OutputSchema != nil && (!present || nyanMCPSchema(tool.OutputSchema, structured) != nil) {
+		return nil, wire.classify(ctx, nyanMCPFailure("OUTPUT_SCHEMA"))
+	}
+	return raw, nil
+}
+
+func nyanMCPContentValid(block map[string]any) bool {
+	text := func(key string) bool { _, ok := block[key].(string); return ok }
+	switch block["type"] {
+	case "text":
+		return text("text")
+	case "image", "audio":
+		data, ok := block["data"].(string)
+		if !ok || !text("mimeType") {
+			return false
+		}
+		_, err := base64.StdEncoding.DecodeString(data)
+		return err == nil
+	case "resource_link":
+		return text("uri") && text("name")
+	case "resource":
+		resource, ok := block["resource"].(map[string]any)
+		if !ok {
+			return false
+		}
+		if _, ok := resource["uri"].(string); !ok {
+			return false
+		}
+		if _, ok := resource["text"].(string); ok {
+			return true
+		}
+		if blob, ok := resource["blob"].(string); ok {
+			_, err := base64.StdEncoding.DecodeString(blob)
+			return err == nil
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// The copier inspects descriptors, never getters/toJSON. Builtins are captured
+// before user code runs. Host objects, proxies, sparse arrays and symbols fail.
+const nyanMCPJSONCopier = `(function(guard){
+ const own=Reflect.ownKeys, desc=Object.getOwnPropertyDescriptor, proto=Object.getPrototypeOf, create=Object.create, arr=Array.isArray, OP=Object.prototype, AP=Array.prototype, stringify=JSON.stringify, finite=Number.isFinite, integer=Number.isInteger, setProto=Object.setPrototypeOf;
+ return function(value){
+  let count=0,bytes=0;const stack=setProto([],null);
+  function copy(v,depth){
+   if(++count>100000 || depth>64)throw 0;
+   if(v===null || typeof v==='boolean')return v;
+   if(typeof v==='string'){bytes+=v.length;if(bytes>1048576)throw 0;return v;}
+   if(typeof v==='number'){if(!finite(v)||(v>9007199254740991||v< -9007199254740991))throw 0;return v;}
+   if(typeof v!=='object'||!guard(v))throw 0;
+   const p=proto(v),isArray=arr(v);if(p!==null && p!==(isArray?AP:OP))throw 0;
+   for(let i=0;i<stack.length;i++){if(stack[i]===v)throw 0;}stack[stack.length]=v;
+   const out=isArray?setProto([],null):create(null),keys=own(v);
+   if(keys.length>100000)throw 0;
+   for(let ki=0;ki<keys.length;ki++){const key=keys[ki];
+    if(typeof key!=='string')throw 0;if(isArray&&key==='length')continue;
+    if(key==='toJSON')throw 0;
+    const d=desc(v,key);if(!d || !desc(d,'value'))throw 0;
+    if(isArray && (!integer(+key)||+key<0||''+(+key)!==key||+key>=v.length))throw 0;
+    bytes+=key.length;if(bytes>1048576)throw 0;out[key]=copy(d.value,depth+1);
+   }
+   if(isArray && keys.length!==v.length+1)throw 0;
+   stack.length--;return out;
+  }
+  const clean=copy(value,0);if(clean===null||arr(clean)||typeof clean!=='object')throw 0;
+  if(desc(clean,'arguments') && (clean.arguments===null||arr(clean.arguments)||typeof clean.arguments!=='object'))throw 0;
+  if(desc(clean,'options')){
+   const o=clean.options;if(o===null||arr(o)||typeof o!=='object')throw 0;
+   if(desc(o,'timeoutMs') && (!integer(o.timeoutMs)||o.timeoutMs<=0))throw 0;
+  }
+  return stringify(clean);
+ };
+})`
+
+func registerNyanMCP(vm *goja.Runtime, manager *nyanMCPManager, ctx context.Context, caller, mode string) {
+	factoryValue, err := vm.RunString(nyanMCPJSONCopier)
+	if err != nil {
+		panic(err)
+	}
+	factory, _ := goja.AssertFunction(factoryValue)
+	guard := vm.ToValue(func(v goja.Value) bool {
+		obj, ok := v.(*goja.Object)
+		if !ok {
+			return true
+		}
+		typ := obj.ExportType()
+		return typ == reflect.TypeOf(map[string]interface{}{}) || typ == reflect.TypeOf([]interface{}{})
+	})
+	copyValue, err := factory(goja.Undefined(), guard)
+	if err != nil {
+		panic(err)
+	}
+	copyJSON, _ := goja.AssertFunction(copyValue)
+	parseJSON, _ := goja.AssertFunction(vm.Get("JSON").ToObject(vm).Get("parse"))
+	vm.Set("nyanCallMCP", func(call goja.FunctionCall) goja.Value {
+		correlation := fmt.Sprintf("mcp-%d", nyanMCPSequence.Add(1))
+		started := time.Now()
+		connection, tool := "", ""
+		raise := func(e *nyanMCPError) goja.Value {
+			object := vm.NewGoError(e)
+			object.Set("name", "NyanMCPError")
+			object.Set("kind", "infrastructure")
+			object.Set("code", e.Code)
+			object.Set("executionState", e.ExecutionState)
+			object.Set("correlationId", correlation)
+			object.Set("connection", connection)
+			object.Set("tool", tool)
+			if e.RPCCode != 0 {
+				object.Set("rpcCode", e.RPCCode)
+			}
+			if e.HTTPStatus != 0 {
+				object.Set("httpStatus", e.HTTPStatus)
+			}
+			serviceLog(slog.LevelInfo, "mcp_client_completed", "correlation_id", correlation, "code", e.Code, "execution_state", e.ExecutionState, "elapsed_ms", time.Since(started).Milliseconds())
+			panic(object)
+		}
+		if len(call.Arguments) != 1 {
+			return raise(nyanMCPFailure("INVALID_ARGUMENT"))
+		}
+		copied, err := copyJSON(goja.Undefined(), call.Argument(0))
+		if err != nil {
+			return raise(nyanMCPFailure("INVALID_ARGUMENT"))
+		}
+		data := []byte(copied.String())
+		if len(data) > 1<<20 {
+			return raise(nyanMCPFailure("INVALID_ARGUMENT"))
+		}
+		var req nyanMCPCall
+		if json.Unmarshal(data, &req) == nil {
+			connection = req.Connection
+			tool = req.Tool
+		}
+		result, failure := manager.call(context.WithValue(ctx, nyanMCPCorrelationKey{}, correlation), caller, mode, data)
+		if failure != nil {
+			return raise(failure)
+		}
+		value, err := parseJSON(goja.Undefined(), vm.ToValue(string(result)))
+		if err != nil {
+			return raise(&nyanMCPError{Code: "UNSUPPORTED_RESULT", ExecutionState: "unknown"})
+		}
+		serviceLog(slog.LevelInfo, "mcp_client_completed", "correlation_id", correlation, "code", "RESULT", "elapsed_ms", time.Since(started).Milliseconds())
+		return value
+	})
+}
+
+// END shared nyanCallMCP contract.
+
+// beginMCPExecution binds background calls to removal of this schedule.
+func (runtime *scheduleRuntime) beginMCPExecution() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	runtime.mu.Lock()
+	if runtime.desired == nil || runtime.stopped {
+		cancel()
+	} else {
+		runtime.mcpCancel = cancel
+	}
+	runtime.mu.Unlock()
+	return ctx, func() { cancel(); runtime.mu.Lock(); runtime.mcpCancel = nil; runtime.mu.Unlock() }
+}
+
+const nyanMCPProduct = "Nyan8"
+
+// Carry cancellation for background work without inventing HTTP request data.
+const nyanMCPGinContextKey = "nyan.internal.mcp.context"
+
+func nyanMCPGinParent(source *gin.Context) context.Context {
+	if source != nil {
+		if source.Request != nil {
+			return source.Request.Context()
+		}
+		if value, ok := source.Get(nyanMCPGinContextKey); ok {
+			if ctx, ok := value.(context.Context); ok {
+				return ctx
+			}
+		}
+	}
+	return context.Background()
+}
+func nyanMCPGinWithContext(source *gin.Context, ctx context.Context) *gin.Context {
+	copied := &gin.Context{}
+	if source != nil {
+		copied = source.Copy()
+		copied.Writer = source.Writer
+	}
+	if copied.Request != nil {
+		copied.Request = copied.Request.Clone(ctx)
+	} else {
+		copied.Set(nyanMCPGinContextKey, ctx)
+	}
+	return copied
 }
