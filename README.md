@@ -113,6 +113,8 @@ JavaScriptの `nyanGetFile` / `nyanReadFileB64` / `nyanSendMailAttachment` と `
 
 ### 3‑1  `config.json`
 
+通常のHTTP/HTTPS起動では、`certPath`・`keyPath` は環境変数の展開後の値で判定します。両方を省略するか両方が空文字列ならHTTP、両方にファイルパスがあればHTTPSを使用します。片方だけにパスがある場合、または指定ファイルが存在しない・通常ファイルでない場合は起動エラーです。証明書・秘密鍵の内容が不正な場合もHTTPS起動時にエラーとなり、HTTPへ切り替えません。従来、片方だけ指定してHTTPで起動していた設定は、HTTPを使うなら両方を省略または空に、HTTPSを使うなら両方を正しく指定してください。
+
 以下のJSONCは各項目を説明する例です。実際のconfig.jsonはコメントなしのJSONにし、TLSファイル・共通JSを用意するか、HTTPで試す場合はcertPath/keyPathを空文字、javascript_includeを空配列にします。まず動かす場合は[最小起動例](#quickstart)を使ってください。
 
 ```jsonc
@@ -528,6 +530,9 @@ console.log(nyanAllParams.nyan_schedule_time);
 
 従来、空文字列・`null`・空の環境変数でチェックを無効化していた設定は修正が必要です。チェックを使わない場合は項目そのものを削除してください。正式名に有効なパスがあっても、併記した互換名に空値があれば拒否します。起動時の設定エラーは起動を中止し、ホットリロード時は新設定全体を拒否して直前の正常な設定を維持します。チェックファイルが存在しない場合の実行時エラーは従来どおりです。
 
+この設定値の検証は、実行時にチェックを適用しない `schedule`・`ws_client` の定義にも行います。これらに不要なチェック項目を空値で残さないでください。
+
+環境変数を使う場合は、たとえば起動前に `export CHECK_SCRIPT="/app/checks/permission.js"` と設定し、API定義に `"paramCheck": "${CHECK_SCRIPT}"` と書きます。これは対応するパス項目での展開であり、JSON内の任意の項目を置き換える機能ではありません。`.env` は自動で読み込みません。起動済みプロセスに外部からの `export` の変更は反映されないため、環境変数を変更した場合は再起動が必要です。
 
 ```jsonc
 "secure_add": {

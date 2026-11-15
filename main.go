@@ -531,6 +531,11 @@ func main() {
 	if err := initLogger(configBaseDir); err != nil {
 		fatalServiceError("invalid_log_level", err, "expected", "debug, info, warn, or error")
 	}
+	if !mcpStdio {
+		if err := validateTLSPaths(config.CertFile, config.KeyFile); err != nil {
+			fatalServiceError("tls_config_invalid", err)
+		}
+	}
 	nyanMCPClient, err = loadNyanMCPConfig(globalConfig.MCPClient)
 	if err != nil {
 		fatalServiceError("mcp_client_config_failed", err)
@@ -1079,6 +1084,26 @@ func loadConfig(filename string) (Config, error) {
 		return config, err
 	}
 	return config, nil
+}
+
+// Both empty paths select HTTP. HTTPS requires both files before startup.
+func validateTLSPaths(certPath, keyPath string) error {
+	if certPath == "" && keyPath == "" {
+		return nil
+	}
+	if certPath == "" || keyPath == "" {
+		return fmt.Errorf("certPath and keyPath must both be configured or both be empty")
+	}
+	for _, field := range []struct{ name, path string }{{"certPath", certPath}, {"keyPath", keyPath}} {
+		info, err := os.Stat(field.path)
+		if err != nil {
+			return fmt.Errorf("invalid %s: %w", field.name, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("%s must refer to a regular file", field.name)
+		}
+	}
+	return nil
 }
 
 func adjustConfigPaths(configBaseDir string, config *Config) error {

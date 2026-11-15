@@ -17161,3 +17161,108 @@ func TestConfigurationCheckPathCompatibility(t *testing.T) {
 		}
 	}
 }
+
+func TestTLSPathConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"cert.pem", "key.pem"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("existence check fixture"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("NYAN_TEST_TLS_CERT", "cert.pem")
+	t.Setenv("NYAN_TEST_TLS_KEY", "key.pem")
+	t.Setenv("NYAN_TEST_TLS_BLANK", "")
+	t.Setenv("NYAN_TEST_TLS_UNSET", "")
+	if err := os.Unsetenv("NYAN_TEST_TLS_UNSET"); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, config       string
+		wantTLS, wantError bool
+	}{
+		{"omitted", `{}`, false, false},
+		{"empty", `{"certPath":"","keyPath":""}`, false, false},
+		{"null", `{"certPath":null,"keyPath":null}`, false, false},
+		{"empty environment", `{"certPath":"${NYAN_TEST_TLS_BLANK}","keyPath":"$NYAN_TEST_TLS_BLANK"}`, false, false},
+		{"unset environment", `{"certPath":"${NYAN_TEST_TLS_UNSET}","keyPath":"$NYAN_TEST_TLS_UNSET"}`, false, false},
+		{"relative pair", `{"certPath":"cert.pem","keyPath":"key.pem"}`, true, false},
+		{"environment pair", `{"certPath":"${NYAN_TEST_TLS_CERT}","keyPath":"$NYAN_TEST_TLS_KEY"}`, true, false},
+		{"cert only", `{"certPath":"cert.pem"}`, false, true},
+		{"key only", `{"keyPath":"key.pem"}`, false, true},
+		{"empty key", `{"certPath":"cert.pem","keyPath":""}`, false, true},
+		{"empty cert", `{"certPath":"","keyPath":"key.pem"}`, false, true},
+		{"environment key empty", `{"certPath":"${NYAN_TEST_TLS_CERT}","keyPath":"${NYAN_TEST_TLS_UNSET}"}`, false, true},
+		{"environment cert empty", `{"certPath":"${NYAN_TEST_TLS_UNSET}","keyPath":"${NYAN_TEST_TLS_KEY}"}`, false, true},
+		{"missing cert", `{"certPath":"missing.pem","keyPath":"key.pem"}`, false, true},
+		{"missing key", `{"certPath":"cert.pem","keyPath":"missing.pem"}`, false, true},
+		{"both missing", `{"certPath":"missing-cert.pem","keyPath":"missing-key.pem"}`, false, true},
+		{"directory", `{"certPath":".","keyPath":"key.pem"}`, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg Config
+			if err := json.Unmarshal([]byte(tc.config), &cfg); err != nil {
+				t.Fatal(err)
+			}
+			if err := adjustConfigPaths(dir, &cfg); err != nil {
+				t.Fatal(err)
+			}
+			err := validateTLSPaths(cfg.CertFile, cfg.KeyFile)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("error=%v wantError=%t", err, tc.wantError)
+			}
+			if err == nil && (cfg.CertFile != "" && cfg.KeyFile != "") != tc.wantTLS {
+				t.Fatal("wrong HTTP/HTTPS selection")
+			}
+		})
+	}
+}
+
+// Run main in a subprocess so a fatal configuration error cannot end the test runner.
+func TestTLSStartupCommandHelper(t *testing.T) {
+	if os.Getenv("NYAN_TLS_STARTUP_HELPER") != "1" {
+		return
+	}
+	for i, arg := range os.Args {
+		if arg == "--" {
+			os.Args = append([]string{os.Args[0]}, os.Args[i+1:]...)
+			main()
+			os.Exit(0)
+		}
+	}
+	os.Exit(2)
+}
+
+func TestTLSInvalidPathsStopStartup(t *testing.T) {
+	for _, fields := range []string{
+		`"certPath":"cert.pem"`,
+		`"keyPath":"key.pem"`,
+		`"certPath":"cert.pem","keyPath":"${NYAN_TEST_TLS_STARTUP_EMPTY}"`,
+		`"certPath":"missing.pem","keyPath":"key.pem"`,
+		`"certPath":"cert.pem","keyPath":"missing.pem"`,
+	} {
+		t.Run(fields, func(t *testing.T) {
+			t.Setenv("NYAN_TEST_TLS_STARTUP_EMPTY", "")
+			dir := t.TempDir()
+			configPath, apiPath := filepath.Join(dir, "config.json"), filepath.Join(dir, "api.json")
+			for name, body := range map[string]string{
+				"cert.pem": "existence check fixture", "key.pem": "existence check fixture",
+				"api.json": `{}`, "config.json": `{"Port":8080,"log":{"EnableLogging":false},` + fields + `}`,
+			} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestTLSStartupCommandHelper$", "--", "--config", configPath, "--api", apiPath)
+			cmd.Env = append(os.Environ(), "NYAN_TLS_STARTUP_HELPER=1")
+			output, err := cmd.CombinedOutput()
+			if err == nil || ctx.Err() != nil || !strings.Contains(string(output), "tls_config_invalid") {
+				t.Fatalf("startup did not reject invalid TLS: err=%v output=%s", err, output)
+			}
+			if strings.Contains(string(output), "http_server_starting") || strings.Contains(string(output), "api_config_loaded") {
+				t.Fatalf("runtime started before TLS validation: %s", output)
+			}
+		})
+	}
+}
