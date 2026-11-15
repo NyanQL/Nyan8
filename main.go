@@ -7495,7 +7495,32 @@ func rawAPIDefinitionType(rawDefinition json.RawMessage) (string, error) {
 	return strings.TrimSpace(typeOnly.Type), nil
 }
 
+// An explicitly configured check must not silently become an absent check.
+func validateCheckPaths(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, name := range []string{"paramCheck", "paramcheck", "check", "outCheck", "outcheck"} {
+		raw, exists := fields[name]
+		if !exists {
+			continue
+		}
+		var path string
+		if err := json.Unmarshal(raw, &path); err != nil {
+			return fmt.Errorf("%s must be a non-empty file path: %w", name, err)
+		}
+		if strings.TrimSpace(os.ExpandEnv(path)) == "" {
+			return fmt.Errorf("%s must be a non-empty file path after environment expansion; omit it to disable the check", name)
+		}
+	}
+	return nil
+}
+
 func decodeAPIDefinition(name string, rawDefinition json.RawMessage, sourceDir string) (map[string]interface{}, error) {
+	if err := validateCheckPaths(rawDefinition); err != nil {
+		return nil, fmt.Errorf("decode api JSON: definition %q: %w", name, err)
+	}
 	var definition map[string]interface{}
 	if err := json.Unmarshal(rawDefinition, &definition); err != nil {
 		return nil, fmt.Errorf("decode api JSON: definition %q: %w", name, err)

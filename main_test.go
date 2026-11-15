@@ -17003,3 +17003,161 @@ func TestRepeatedIncludeRejectsMixedGenerations(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigurationEnvironmentRejectsBlankChecks(t *testing.T) {
+	for _, field := range []string{"paramCheck", "paramcheck", "check", "outCheck", "outcheck"} {
+		for _, value := range []string{`""`, `"  "`, `null`, `false`, `0`, `[]`, `{}`, `"${NYAN_TEST_EMPTY_CHECK}"`, `"$NYAN_TEST_EMPTY_CHECK"`} {
+			for _, unset := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/unset=%t", field, value, unset), func(t *testing.T) {
+					t.Setenv("NYAN_TEST_EMPTY_CHECK", "")
+					if unset {
+						if err := os.Unsetenv("NYAN_TEST_EMPTY_CHECK"); err != nil {
+							t.Fatal(err)
+						}
+					}
+					dir := t.TempDir()
+					rootPath := filepath.Join(dir, "api.json")
+					writeHotReloadTestFile(t, rootPath, `{"sub":{"type":"include","path":"child.json"}}`)
+					writeHotReloadTestFile(t, filepath.Join(dir, "child.json"), `{"item":{"script":"main.js","`+field+`":`+value+`}}`)
+					if _, err := readAPIConfigFile(rootPath, dir); err == nil || !strings.Contains(err.Error(), field) {
+						t.Fatalf("invalid check accepted or error lost field: %v", err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestConfigurationEnvironmentParamCheckReload(t *testing.T) {
+	initTestLogger()
+	t.Setenv("NYAN_TEST_EMPTY_CHECK", "")
+	dir := t.TempDir()
+	rootPath := filepath.Join(dir, "api.json")
+	writeHotReloadTestFile(t, rootPath, `{"item":{"description":"active"}}`)
+	initial, err := readAPIConfigFile(rootPath, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSnapshot, oldManager := currentAPISnapshot(), backgroundRuntimes
+	publishAPISnapshot(initial.Snapshot)
+	backgroundRuntimes = nil
+	t.Cleanup(func() { publishAPISnapshot(oldSnapshot); backgroundRuntimes = oldManager })
+	writeHotReloadTestFile(t, rootPath, `{"item":{"paramCheck":"${NYAN_TEST_EMPTY_CHECK}"}}`)
+	observed, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, dir, initial.Snapshot.FileStates)
+	if err == nil || reloaded || currentAPISnapshot() != initial.Snapshot {
+		t.Fatalf("invalid check replaced active snapshot: reload=%t err=%v", reloaded, err)
+	}
+	writeHotReloadTestFile(t, rootPath, `{"item":{"paramCheck":"check.js"}}`)
+	_, reloaded, err = reloadAPIConfigGraphIfChanged(rootPath, dir, observed)
+	if err != nil || !reloaded {
+		t.Fatalf("recovery failed: reload=%t err=%v", reloaded, err)
+	}
+}
+
+func TestConfigurationEnvironmentOutCheckReload(t *testing.T) {
+	initTestLogger()
+	t.Setenv("NYAN_TEST_EMPTY_CHECK", "")
+	dir := t.TempDir()
+	rootPath := filepath.Join(dir, "api.json")
+	writeHotReloadTestFile(t, rootPath, `{"item":{"description":"active"}}`)
+	initial, err := readAPIConfigFile(rootPath, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSnapshot, oldManager := currentAPISnapshot(), backgroundRuntimes
+	publishAPISnapshot(initial.Snapshot)
+	backgroundRuntimes = nil
+	t.Cleanup(func() { publishAPISnapshot(oldSnapshot); backgroundRuntimes = oldManager })
+	writeHotReloadTestFile(t, rootPath, `{"item":{"outCheck":"${NYAN_TEST_EMPTY_CHECK}"}}`)
+	observed, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, dir, initial.Snapshot.FileStates)
+	if err == nil || reloaded || currentAPISnapshot() != initial.Snapshot {
+		t.Fatalf("invalid check replaced active snapshot: reload=%t err=%v", reloaded, err)
+	}
+	writeHotReloadTestFile(t, rootPath, `{"item":{"outCheck":"check.js"}}`)
+	_, reloaded, err = reloadAPIConfigGraphIfChanged(rootPath, dir, observed)
+	if err != nil || !reloaded {
+		t.Fatalf("recovery failed: reload=%t err=%v", reloaded, err)
+	}
+}
+
+func TestConfigurationEnvironmentChecksHTTP(t *testing.T) {
+	for _, field := range []string{"paramCheck", "outCheck"} {
+		t.Run(field, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			initTestLogger()
+			previous := currentAPISnapshot()
+			t.Cleanup(func() { publishAPISnapshot(previous) })
+			dir := t.TempDir()
+			check := filepath.Join(dir, "check.js")
+			writeHotReloadTestFile(t, check, `({success:false,status:403,result:{message:"env-check"}});`)
+			writeHotReloadTestFile(t, filepath.Join(dir, "body.js"), `({status:200,body:"body-result"});`)
+			t.Setenv("NYAN_TEST_HTTP_CHECK", check)
+			writeHotReloadTestFile(t, filepath.Join(dir, "api.json"), `{"item":{"script":"body.js","`+field+`":"${NYAN_TEST_HTTP_CHECK}"}}`)
+			router := gin.New()
+			if err := registerDynamicEndpoints(router, dir); err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodGet, "/item", nil)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "env-check") {
+				t.Fatalf("check did not run: HTTP %d %s", response.Code, response.Body.String())
+			}
+			if err := os.Remove(check); err != nil {
+				t.Fatal(err)
+			}
+			response = httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("missing check did not fail: HTTP %d %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestConfigurationCheckPathCompatibility(t *testing.T) {
+	t.Setenv("NYAN_TEST_RELATIVE_CHECK", "checks/permission.js")
+	t.Setenv("NYAN_TEST_EMPTY_PREFIX", "")
+	for _, field := range []string{"paramCheck", "paramcheck", "check", "outCheck", "outcheck"} {
+		t.Run(field, func(t *testing.T) {
+			dir := t.TempDir()
+			rootPath := filepath.Join(dir, "api.json")
+			for _, value := range []string{"checks/permission.js", "${NYAN_TEST_RELATIVE_CHECK}", "${NYAN_TEST_EMPTY_PREFIX}/checks/permission.js"} {
+				writeHotReloadTestFile(t, rootPath, `{"item":{"script":"body.js","`+field+`":`+fmt.Sprintf("%q", value)+`}}`)
+				loaded, err := readAPIConfigFile(rootPath, dir)
+				if err != nil {
+					t.Fatalf("valid check rejected: %v", err)
+				}
+				entry := loaded.Snapshot.Definitions["item"].(map[string]interface{})
+				got := getAPIString(entry, field)
+				want := filepath.Join(dir, "checks", "permission.js")
+				if strings.Contains(value, "EMPTY_PREFIX") {
+					want = filepath.FromSlash("/checks/permission.js")
+					if !filepath.IsAbs(want) {
+						want = filepath.Join(dir, want)
+					}
+				}
+				if got != want {
+					t.Fatalf("check path=%q want=%q", got, want)
+				}
+			}
+			// Omission is the supported way to disable either check.
+			writeHotReloadTestFile(t, rootPath, `{"item":{"script":"body.js"}}`)
+			if _, err := readAPIConfigFile(rootPath, dir); err != nil {
+				t.Fatalf("omitted checks rejected: %v", err)
+			}
+		})
+	}
+	for _, definition := range []string{
+		`{"paramCheck":"good.js","paramcheck":""}`,
+		`{"paramCheck":"good.js","check":null}`,
+		`{"outCheck":"good.js","outcheck":"${NYAN_TEST_EMPTY_PREFIX}"}`,
+	} {
+		dir := t.TempDir()
+		rootPath := filepath.Join(dir, "api.json")
+		writeHotReloadTestFile(t, rootPath, `{"item":`+definition+`}`)
+		if _, err := readAPIConfigFile(rootPath, dir); err == nil {
+			t.Fatal("empty alias was hidden by a valid primary field")
+		}
+	}
+}
